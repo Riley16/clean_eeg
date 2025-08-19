@@ -94,6 +94,7 @@ Thumbs.db
 
 # --- Project-specific ignores ---
 # Add here if you generate data, figures, logs, or large artifacts
-data/
+**/data/
+**/test_data/
 logs/
 *.log
