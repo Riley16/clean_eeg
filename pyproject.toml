@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=70", "wheel", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clean_eeg"
+dynamic = ["version"]  # <-- version comes from git tags
+description = "Package for de-identifying clinical EEG"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Riley DeHaan"}]
+dependencies = [
+    "numpy>=2.3.2",
+    "mne==1.10.1",
+    "pyedflib>=0.1.37",
+    "edfio==0.4.9",
+    "lunapi==1.2.3",
+    "pytest",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# setuptools-scm config
+[tool.setuptools_scm]
+# Require tags like v1.2.3
+tag_regex = "^v(?P<version>\\d+\\.\\d+\\.\\d+)$"
+version_scheme = "post-release"
+local_scheme = "no-local-version"
