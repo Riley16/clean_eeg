@@ -1,0 +1,12 @@
+name: clean_eeg
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - mne==1.4.2
+  - pyedflib==0.1.37
+  - pytest
+  - pip:
+      - edfio==0.4.9
+      - lunapi==1.2.3
+      - numpy==2.2.6
