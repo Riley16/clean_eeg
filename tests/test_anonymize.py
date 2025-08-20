@@ -1,6 +1,6 @@
 import pytest
 
-from clean_eeg.anonymize import redact_patient_name  # adjust import
+from clean_eeg.anonymize import redact_subject_name  # adjust import
 
 
 PATIENT_NAME = "John P. O'Connor"
@@ -70,7 +70,7 @@ HYPHENATED_PATIENT_NAME = "John Smith-Jones"
 
 
 def test_redaction_variants(text, expected):
-    assert redact_patient_name(text, PATIENT_NAME) == expected
+    assert redact_subject_name(text, PATIENT_NAME) == expected
 
 
 def test_hyphenated_name_variants():
@@ -82,4 +82,4 @@ def test_hyphenated_name_variants():
         ("SmithJones presented.", "[REDACTED-NAME] presented."),        # dropped hyphen
     ]
     for text, expected in cases:
-        assert redact_patient_name(text, patient) == expected
+        assert redact_subject_name(text, patient) == expected

@@ -70,18 +70,18 @@ def build_deny_variants(tokens: List[str]) -> Set[str]:
 
 
 # ---------- fuzzy recognizer (len >= 3); normalize both sides ----------
-class FuzzyPatientNameRecognizer(EntityRecognizer):
-    def __init__(self, patient_tokens: List[str]):
-        super().__init__(supported_entities=["PATIENT_NAME"], supported_language="en")
+class FuzzySubjectNameRecognizer(EntityRecognizer):
+    def __init__(self, subject_tokens: List[str]):
+        super().__init__(supported_entities=["SUBJECT_NAME"], supported_language="en")
         # store both original and punctuation-stripped forms
-        self.targets_raw = [t for t in patient_tokens if len(t) >= 3]
+        self.targets_raw = [t for t in subject_tokens if len(t) >= 3]
         self.targets_norm = [strip_punct(t).lower() for t in self.targets_raw]
 
     def load(self):  # no-op
         pass
 
     def analyze(self, text, entities, nlp_artifacts=None):
-        if "PATIENT_NAME" not in entities or not self.targets_raw:
+        if "SUBJECT_NAME" not in entities or not self.targets_raw:
             return []
 
         results = []
@@ -99,7 +99,7 @@ class FuzzyPatientNameRecognizer(EntityRecognizer):
                 if (Levenshtein.distance(lc_raw, tgt_raw.lower()) <= 1 or
                     Levenshtein.distance(lc_norm, tgt_norm) <= 1):
                     score = 1.0 if (lc_raw == tgt_raw.lower() or lc_norm == tgt_norm) else 0.9
-                    results.append(RecognizerResult("PATIENT_NAME", m.start(), m.end(), score))
+                    results.append(RecognizerResult("SUBJECT_NAME", m.start(), m.end(), score))
                     matched = True
                     break
             if matched:
@@ -145,7 +145,7 @@ def build_title_name_pattern(tokens: List[str]) -> str:
     - spacing between parts can be zero or more (handles 'DrJohnPOConnor')
     """
     if len(tokens) < 2:
-        return ""  # need at least first & last from the patient name
+        return ""  # need at least first & last from the subject name
 
     first_pat = make_token_regex_allow_optional_punct(tokens[0])
     last_pat  = make_token_regex_allow_optional_punct(tokens[-1])
@@ -183,7 +183,7 @@ class TitleAndInitialsRecognizer(PatternRecognizer):
     def __init__(self, tokens: List[str]):
         pat = build_title_name_pattern(tokens)
         patterns = [Pattern(name="title_first_midinit_last", regex=pat, score=0.9)] if pat else []
-        super().__init__(supported_entity="PATIENT_NAME", name="patient_title_initials", patterns=patterns)
+        super().__init__(supported_entity="SUBJECT_NAME", name="subject_title_initials", patterns=patterns)
 
 
 # ---------- build & run ----------
@@ -195,42 +195,42 @@ def build_presidio():
     registry.load_predefined_recognizers(nlp_engine=nlp_engine)
     return AnalyzerEngine(nlp_engine=nlp_engine, registry=registry), AnonymizerEngine(), registry
 
-def add_patient_name_detectors(registry: RecognizerRegistry, patient_full_name: str):
-    tokens = normalize_name_tokens(patient_full_name)
+def add_subject_name_detectors(registry: RecognizerRegistry, subject_full_name: str):
+    tokens = normalize_name_tokens(subject_full_name)
     if not tokens:
         return
 
     # 1) exact matches + punctuation-dropped mirrors (incl. possessives)
     deny_variants = list(build_deny_variants(tokens))
     registry.add_recognizer(PatternRecognizer(
-        supported_entity="PATIENT_NAME",
+        supported_entity="SUBJECT_NAME",
         deny_list=deny_variants,
-        name="patient_name_denylist",
+        name="subject_name_denylist",
     ))
 
     # 2) title + initials + last (regex) to eat "Dr." and middle initials in span
     registry.add_recognizer(TitleAndInitialsRecognizer(tokens))
 
     # 3) fuzzy token matcher (len >= 3), Levenshtein <= 1 on raw and punctuation-dropped
-    registry.add_recognizer(FuzzyPatientNameRecognizer(tokens))
+    registry.add_recognizer(FuzzySubjectNameRecognizer(tokens))
 
 
-def redact_patient_name(text: str, patient_full_name: str, replacement: str = "[REDACTED-NAME]") -> str:
+def redact_subject_name(text: str, subject_full_name: str, replacement: str = "[REDACTED-NAME]") -> str:
     analyzer, anonymizer, registry = build_presidio()
-    add_patient_name_detectors(registry, patient_full_name)
-    results = analyzer.analyze(text=text, entities=["PATIENT_NAME"], language="en")
-    operators = {"PATIENT_NAME": OperatorConfig("replace", {"new_value": replacement})}
+    add_subject_name_detectors(registry, subject_full_name)
+    results = analyzer.analyze(text=text, entities=["SUBJECT_NAME"], language="en")
+    operators = {"SUBJECT_NAME": OperatorConfig("replace", {"new_value": replacement})}
     return anonymizer.anonymize(text=text, analyzer_results=results, operators=operators).text
 
 
 # ---------- example ----------
 if __name__ == "__main__":
-    patient = "John P. O'Connor"
+    subject = "John P. O'Connor"
     sample = (
         "Smith-Jones examined the patient Dr. John P. O'Connor. O’Connor's note mentions follow-up. "
         "The lab mislabeled it as OConor yesterday. Also saw John alone. Then I Drove home"
     )
-    print(redact_patient_name(sample, patient))
+    print(redact_subject_name(sample, subject))
     # Expected redactions:
     # - "Dr. John P. O'Connor"  (includes Dr. and P.)
     # - "O’Connor's"
