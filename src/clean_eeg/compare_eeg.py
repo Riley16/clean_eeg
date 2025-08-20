@@ -1,11 +1,11 @@
 import numpy as np
-from load_edf import load_edf
+from clean_eeg.load_eeg import load_edf
 
 
 # compare EDF files for equality
 def compare_edf_files(file1, file2,
                       load_method='pyedflib',
-                      physical_range_rel_tol=1e-03,
+                      physical_range_rel_tol=0.0,
                       compare_signals=True,
                       verbosity=0):
     """
@@ -179,4 +179,5 @@ if __name__ == "__main__":
     compare_edf_files(args.path1, args.path2,
                       load_method=args.load_method,
                       compare_signals=not args.lazy_load,
+                      physical_range_rel_tol=1e-3,
                       verbosity=args.verbosity)
