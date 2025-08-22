@@ -39,6 +39,23 @@ def load_edf(filename, load_method='edfio', preload=False, read_digital=False):
         raise ValueError("Invalid load method specified. Use 'edfio', 'pyedflib', 'mne'.")
     
 
+def write_edf_pyedflib(data, filename):
+    """
+    Write EDF data using pyedflib.
+
+    Parameters:
+        data (dict): Data dictionary containing 'signals', 'header', 'signal_headers', and 'annotations'.
+        filename (str): Path to save the EDF file.
+    """
+    import pyedflib
+    with pyedflib.EdfWriter(filename, len(data['signals']), file_type=pyedflib.FILETYPE_EDFPLUS) as f:
+        f.setHeader(data['header'])
+        f.setSignalHeaders(data['signal_headers'])
+        f.writeSamples(data['signals'])
+        for time, duration, text in zip(*data['annotations']):
+            f.writeAnnotation(time, duration, text)
+    
+
 def print_edf(data, load_method='edfio', verbosity=1):
     # Print the contents of an EDF file loaded by load_edf()
     if load_method == 'edfio':

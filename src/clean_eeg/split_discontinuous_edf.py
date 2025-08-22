@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import os
 import sys
@@ -292,22 +291,6 @@ def main():
 
         if args.dry_run:
             continue
-
-        # 4) Convert to edfio annotations (rebased so segment starts at t=0)
-        # print('luna annotations:')
-        # print(ann_df)
-        # anns = df_to_edfio_annotations(ann_df, seg_start=start, seg_stop=stop)
-        # print('edfio annotations:')
-        # print(anns)
-        # print('mne annotations:')
-        # print(inp)
-        # mne_anns, _ = load_edf_annotations_mne(inp, preload=False, verbose=False)
-        # print(mne_anns)
-
-        # 5) Embed annotations into the segment EDF (EDF+)
-        # edf_file = edf_file_no_extension + args.ext
-        # embed_annots_with_edfio(edf_file, anns)
-        # print(f"[{i}/{len(segments)}] embedded {len(anns)} annotation(s) into {edf_file_no_extension}")
 
     print(f"Done. Outputs in: {output_dir}")
 

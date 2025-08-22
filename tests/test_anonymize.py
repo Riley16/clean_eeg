@@ -1,10 +1,14 @@
 import pytest
 
-from clean_eeg.anonymize import redact_subject_name  # adjust import
+from clean_eeg.anonymize import redact_subject_name, PersonalName
 
 
-PATIENT_NAME = "John P. O'Connor"
-HYPHENATED_PATIENT_NAME = "John Smith-Jones"
+PATIENT_NAME = PersonalName(first_name='John',
+                            middle_names=['P.'],
+                            last_name="O'Connor")
+HYPHENATED_PATIENT_NAME = PersonalName(first_name='John',
+                                       middle_names=[],
+                                       last_name='Smith-Jones')
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -17,12 +21,14 @@ HYPHENATED_PATIENT_NAME = "John Smith-Jones"
     # --- First + last only ---
     ("John O'Connor signed.", "[REDACTED-NAME] signed."),
     ("John Connor signed.", "[REDACTED-NAME] signed."),  # Connor is edit distance 1 from O'Connor excluding apostrophe
+    ("J. O'Connor is here.", "[REDACTED-NAME] is here."),  # initial variant
 
     # --- Prefixes ---
     ("Mr. John O'Connor signed.", "[REDACTED-NAME] signed."),
     ("Mrs John O'Connor signed.", "[REDACTED-NAME] signed."),
     ("Prof O'Connor lectured.", "[REDACTED-NAME] lectured."),
     ("Mx O'Connor presented.", "[REDACTED-NAME] presented."),
+    ("Dr. J. O'Connor is here.", "[REDACTED-NAME] is here."),  # initial variant
 
     # --- Middle initials ---
     ("John P O'Connor spoke.", "[REDACTED-NAME] spoke."),
@@ -73,13 +79,35 @@ def test_redaction_variants(text, expected):
     assert redact_subject_name(text, PATIENT_NAME) == expected
 
 
-def test_hyphenated_name_variants():
-    patient = "John Smith-Jones"  # <- different patient for these tests
+def test_nickname_variants():
+    # Test nickname variants (e.g., "John" -> "Johnny", "Jack")
+    cases = [
+        ("John is here.", "[REDACTED-NAME] is here."),
+        ("Johnny is here.", "[REDACTED-NAME] is here."),
+        ("Jonathan is here.", "[REDACTED-NAME] is here."),
+        ("Jack is here.", "[REDACTED-NAME] is here."),
+    ]
+    for text, expected in cases:
+        assert redact_subject_name(text, PATIENT_NAME) == expected
 
+
+# def test_names_without_boundaries():
+#     cases = [
+#         # --- surrounding spaces dropped ---
+#         ("thenOConnortestified.", "then[REDACTED-NAME]testified."),
+#         ("then O'Connertestified.", "then [REDACTED-NAME]testified."),
+#         ("thenO'Conner testified.", "then[REDACTED-NAME] testified."),
+#         ("then O'Conner testified.", "then [REDACTED-NAME] testified."),  # should also handle cases with boundaries
+#     ]
+#     for text, expected in cases:
+#         assert redact_subject_name(text, PATIENT_NAME) == expected
+
+
+def test_hyphenated_name_variants():
     cases = [
         ("John Smith-Jones presented.", "[REDACTED-NAME] presented."),  # full name
         ("Smith-Jones presented.", "[REDACTED-NAME] presented."),       # last alone
         ("SmithJones presented.", "[REDACTED-NAME] presented."),        # dropped hyphen
     ]
     for text, expected in cases:
-        assert redact_subject_name(text, patient) == expected
+        assert redact_subject_name(text, HYPHENATED_PATIENT_NAME) == expected

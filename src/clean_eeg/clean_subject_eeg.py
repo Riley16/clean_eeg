@@ -1,13 +1,18 @@
 import re
 import os
+import numpy as np
 from copy import deepcopy
 import numpy as np
+from typing import Union
 from datetime import datetime
-from clean_eeg.anonymize import redact_subject_name
+from clean_eeg.anonymize import redact_subject_name, PersonalName
+from clean_eeg.load_eeg import load_edf
 
 BASE_START_DATE = datetime(1985, 1, 1)
-
-from clean_eeg.load_eeg import load_edf, get_edf_start_time_from_mne
+DEFAULT_REDACT_HEADER_KEYS = ['patientname', 'sex', 'gender',
+                              'patient_additional', 'birthdate',
+                              'admincode','technician']
+REDACT_REPLACEMENT = 'REDACTED'
 
 
 def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_start_time):
@@ -32,7 +37,7 @@ def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_star
         cleaned = deidentify_edf_header(signal_header,
                                         subject_name=subject_name,
                                         subject_code=subject_code,
-                                        earliest_recording_start_time=earliest_recording_start_time,
+                                        earliest_recording_start_time=None,  # signal headers do not have a start time
                                         redact_keys=list()  # check all
                                         )
         clean_signal_headers.append(cleaned)
@@ -41,18 +46,19 @@ def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_star
     return edf_data
 
 
-def deidentify_edf_header(header,
-                          subject_code,
-                          earliest_recording_start_time,
-                          subject_name,  # require manual entry in case patient name gets stored in non-standard fields
-                          redact_keys=['patientname', 'sex', 'gender',
-                                       'patient_additional', 'birthdate',
-                                       'admincode','technician']):
+def deidentify_edf_header(header: dict,
+                          subject_code: str,
+                          subject_name: PersonalName,
+                          earliest_recording_start_time: Union[datetime,None]=None,
+                          redact_keys: list[str]=DEFAULT_REDACT_HEADER_KEYS):
     header = deepcopy(header)
-    clean_start_time = deidentify_start_date_time(header['startdate'], earliest_recording_start_time)
-    header['startdate'] = clean_start_time
+    if earliest_recording_start_time is None:
+        assert 'startdate' not in header
+    else:
+        header['startdate'] = deidentify_start_date_time(header['startdate'],
+                                                         earliest_recording_start_time)
     for key in redact_keys:
-        header[key] = 'REDACTED'
+        header[key] = REDACT_REPLACEMENT
     header['patientcode'] = subject_code
     # check for patient name, gendered pronouns in all other fields
     for key, val in header.items():
@@ -62,20 +68,20 @@ def deidentify_edf_header(header,
             header[key] = redact_string(val,
                                         field_name=key,
                                         subject_name=subject_name)
-        elif isinstance(val, (int, float)):
+        elif isinstance(val, (int, float, datetime)):
             pass
         else:
             raise ValueError(f'Unknown type in header field {key}: type: {type(val)}; value: {val}')
     return header
 
 
-def deidentify_edf_annotations(annotations, subject_name):
+def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: PersonalName):
     clean_start_times = list()
     clean_durations = list()
     clean_descriptions = list()
     for (start_time, duration, text) in zip(*annotations):
         assert isinstance(text, str)
-        redacted_text = redact_string(text,
+        redacted_text = redact_string(str(text),
                                       field_name='annotation',
                                       subject_name=subject_name)
         clean_start_times.append(start_time)
@@ -110,7 +116,7 @@ def deidentify_start_date_time(recording_start_time, earliest_recording_start_ti
     return shifted_time
 
 
-def redact_string(text, field_name, subject_name):
+def redact_string(text: str, field_name: str, subject_name: PersonalName) -> str:
     redacted = redact_subject_name(text, subject_full_name=subject_name)
     redacted = remove_gendered_pronouns(redacted)
     if text != redacted:
@@ -124,12 +130,13 @@ _GENDERED_PRONOUNS = [
     "he", "him", "his", "himself",
     "she", "her", "hers", "herself",
 ]
+REDACT_PRONOUN_REPLACEMENT = "[REDACTED_PRONOUN]"
 
 # \b-boundaries ensure we don't hit substrings (e.g., "her" in "other").
 PRONOUN_RE = re.compile(r"\b(" + "|".join(map(re.escape, _GENDERED_PRONOUNS)) + r")\b",
                            flags=re.IGNORECASE | re.UNICODE)
 
-def remove_gendered_pronouns(text: str, replacement: str = "REDACTED_PRONOUN") -> str:
+def remove_gendered_pronouns(text: str, replacement: str = REDACT_PRONOUN_REPLACEMENT) -> str:
     """
     Remove (or replace) gendered pronouns. Default behavior is deletion.
     Pass replacement='[REDACTED-PRONOUN]' if you prefer explicit redaction.
@@ -142,28 +149,52 @@ def remove_gendered_pronouns(text: str, replacement: str = "REDACTED_PRONOUN") -
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Rename and clean meta-data for all clinical EEG EDF files after mass export by Nihon Kohden.")
-    parser.add_argument("--path", type=str, required=True, help="Path to all EDF files")
+    from clean_eeg.load_eeg import write_edf_pyedflib
+    parser = argparse.ArgumentParser(description="Rename and clean meta-data for all clinical EEG EDF "
+                                                 "files after mass export by Nihon Kohden.")
+    parser.add_argument("--input_path", type=str, required=True, help="Path to all EDF files")
+    parser.add_argument("--output_path", type=str, required=True, help="Path to all EDF files")
     parser.add_argument("--subject-code", type=str, required=True, help="Subject code (e.g., R1755A)")
-    parser.add_argument("--subject-name", type=str, required=True, help="Subject name (e.g., John P. Smith)")
-    parser.add_argument("--load-method", type=str, default="edfio", help="Method to load EDF files: 'edfio', 'pyedflib', or 'mne'")
-    parser.add_argument("--raise-errors", action="store_true", help="Raise errors instead of warnings for debugging")
+    parser.add_argument("--first-name", type=str, required=True, help="Subject first name (e.g., John)")
+    parser.add_argument("--middle-name", type=list, default='NOT_SPECIFIED',
+                        help='Subject middle name or initial (e.g., Paul or P). Can be left blank with "".')
+    parser.add_argument("--last-name", type=str, required=True, help="Subject last name (e.g., Smith)")
+    parser.add_argument("--load-method", type=str, default="edfio",
+                        help="Method to load EDF files: 'edfio', 'pyedflib', or 'mne'")
+    parser.add_argument("--raise-errors", action="store_true",
+                        help="Raise errors instead of warnings for debugging")
     parser.add_argument("--verbosity", type=int, default=1, help="Enable verbose output")
     args = parser.parse_args()
 
-    print('Loading EDF files from path:', args.path)
+    if args.output_path == args.input_path:
+        raise ValueError("Output path must be different from input path to avoid overwriting original EDF files.")
+    if not os.path.exists(args.input_path):
+        raise ValueError(f"Input path does not exist: {args.input_path}")
+    if not os.path.exists(args.output_path):
+        os.makedirs(args.output_path)
+
+    if args.middle_name == 'NOT_SPECIFIED':
+        raise ValueError('Middle name must be specified with --middle-name argument. '
+                         'If subject has no middle name, use --middle-name "" to leave blank. '
+                         'If subject has only a middle initial, provide the initial instead. '
+                         'Separate multiple middle names with underscores (e.g., Paul_Angelina)')
+
+    print('Loading EDF files from path:', args.input_path)
     is_valid_subject_code(args.subject_code)
+
+    subject_name = PersonalName(first_name=args.first_name,
+                                middle_names=args.middle_name.split('_') if args.middle_name else [],
+                                last_name=args.last_name)
 
     # load the meta-data for each EEG EDF file
     EDF_meta_data = dict()
-    for filename in os.listdir(args.path):
+    for filename in os.listdir(args.input_path):
         try:
             if filename.lower().endswith('.edf'):
-                full_path = os.path.join(args.path, filename)
+                full_path = os.path.join(args.input_path, filename)
                 if args.verbosity > 0:
                     print(f"Loading {filename}...")
-                data = load_edf(full_path, load_method=args.load_method, preload=True)
-
+                data = load_edf(full_path, load_method=args.load_method, preload=False)
                 EDF_meta_data[filename] = {'data': data}
         except Exception as e:
             if args.raise_errors:
@@ -184,18 +215,17 @@ if __name__ == "__main__":
         print(f"Earliest recording start time across all files: {min_start_time}")
     
     # de-identify EDF files and save out
-    for filename, edf in EDF_meta_data.items():
-        edf['data'] = deidentify_edf(edf_data=edf['data'],
-                                     subject_name=args.subject_name,
-                                     subject_code=args.subject_code,
-                                     earliest_recording_start_time=min_start_time)
-        clean_start_time = edf['data']['header']['startdate']
+    for filename, _ in EDF_meta_data.items():
+        # reload data with preload=True here to load only a single file into memory at once
+        edf = load_edf(os.path.join(args.input_path, filename), load_method='pyedflib', preload=True)
+        edf = deidentify_edf(edf_data=edf,
+                             subject_name=subject_name,
+                             subject_code=args.subject_code,
+                             earliest_recording_start_time=min_start_time)
+        clean_start_time = edf['header']['startdate']
         clean_filename = f"{args.subject}_{clean_start_time.strftime('%Y.%m.%d__%H:%M:%S')}.edf"
-        new_path = os.path.join(args.path, clean_filename)
+        clean_full_path = os.path.join(args.output_path, clean_filename)
+        # save the cleaned EDF file with pyedflib
+        # write_edf_pyedflib(edf, clean_full_path)
         print(f"Saved cleaned EDF file as {clean_filename}")
     
-    # for filename, edf in EDF_meta_data.items():
-    #     data = edf['data']
-    #     print(filename)
-    #     print(data)
-    #     print(data.info)
