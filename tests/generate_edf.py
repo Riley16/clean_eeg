@@ -34,6 +34,8 @@ def generate_test_edf(header, signal_headers, filename='sinusoidal_continuous_fi
             (0.5, -1, "SEGMENT 1"),
             (1.0, -1, "SEGMENT 2"),
             (1.5, -1, "SEGMENT 3"),
+            (3.5, -1, "SEGMENT 4"),
+            (4.5, -1, "SEGMENT 5"),
         ]
         for time, duration, text in annotations:
             f.writeAnnotation(time, duration, text)
