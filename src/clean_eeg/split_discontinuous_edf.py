@@ -1,10 +1,47 @@
 import argparse
 import os
-import sys
 from typing import List, Tuple, Optional
 
 import lunapi as lp
 from edfio import Edf, EdfAnnotation
+
+
+def convert_edf_to_continuous_segments(input_file: str, output_dir: str, verbosity: int = 1) -> None:
+    inst, segments = luna_open_and_segments(input_file)
+
+    if verbosity > 0:
+        print(f"Detected {len(segments)} segment(s).")
+
+    base_filename = os.path.splitext(os.path.basename(input_file))[0]
+
+    for i, (start, stop) in enumerate(segments, start=1):
+        # compute gap to previous segment
+        if i > 1:
+            gap = start - segments[i-2][1]
+            if verbosity > 0:
+                print(f"  Gap before segment {i}: {gap:.2f} sec")
+        tag = base_filename[:]
+        if len(segments) > 1:
+            tag += f"__seg{i:02d}"
+        
+        edf_file_no_extension = os.path.join(output_dir, f"{tag}")
+
+        # 1) Mask and write EDF+C for this segment
+        print('start:', start, 'stop:', stop)
+        luna_write_segment(inst, start, stop, edf_file_no_extension)
+
+        # 2) Still masked — pull annotations directly from Luna
+        ann_df = luna_fetch_segment_annots(inst)
+
+        print(ann_df)
+
+        # 3) Clear mask for next iteration
+        luna_clear_mask(inst)
+        if verbosity > 0:
+            print(f"[{i}/{len(segments)}] wrote {edf_file_no_extension}.edf ; "\
+                f"{len(ann_df) if ann_df is not None else 0} annotations in-memory")
+    if verbosity > 0:
+        print(f"Done. Outputs in: {output_dir}")
 
 
 # -------------------- CLI --------------------
@@ -37,13 +74,7 @@ def luna_open_and_segments(edf_path: str) -> Tuple[lp.inst, List[Tuple[float, fl
     inst.proc("SEGMENTS")  # populate segment table
     segs = inst.table("SEGMENTS", "SEG")
 
-    # raise NotImplementedError("luna_open_and_segments is not fully implemented yet.")
-    if len(segs) == 1:
-        # if only one segment, use the entire recording as a single segment
-        start = float(segs.iloc[0]["START"])
-        stop = float(segs.iloc[0]["STOP"])
-        return inst, [(start, stop)]
-    elif segs is None or segs.empty:
+    if segs is None or segs.empty:
         # print annotations for debugging
         inst.proc("ANNOTS")
 
@@ -56,10 +87,10 @@ def luna_open_and_segments(edf_path: str) -> Tuple[lp.inst, List[Tuple[float, fl
         message = 'Press "Y/y" to continue if the annotations indicate the '\
                   'file is already continuous to proceed with processing...'
         if input(message) in ("Y", "y"):
-            # use start/stop of entire recording to save a single EDF+C (continuous) file
+            # use start/stop of entire recording
             start = float(inst.get("START"))
             stop = float(inst.get("STOP"))
-            return inst, [start, stop]
+            return inst, [(start, stop)]
         else:
             raise RuntimeError("No segments detected (file may already be continuous or lacks TAL timing).")
 
@@ -252,47 +283,34 @@ def load_edf_annotations_mne(edf_path, preload=False, verbose=False):
     return df, raw
 
 
+def overwrite_edfD_to_edfC(input_file: str, require_continuous_data: bool = True) -> None:
+    """
+    Overwrite the reserved field of an EDF+D file to make it EDF+C.
+    This does not change the data, just the header field.
+    """
+    from clean_eeg.load_eeg import RESERVED_FIELD_EDF_HEADER_BYTE_OFFSET, is_edf_continuous, validate_edf_file_path
+
+    if require_continuous_data and not is_edf_continuous(input_file):
+        raise ValueError("Input EDF+D file contains discontinuous data; not overwriting to EDF+C. "
+                         "Override by setting require_continuous_data=False.")
+
+    validate_edf_file_path(input_file)
+    with open(input_file, 'r+b') as f:
+        f.seek(RESERVED_FIELD_EDF_HEADER_BYTE_OFFSET)
+        f.write(b'EDF+C   ')
+
+
 def main():
     import os
     args = parse_args()
-    input_dir = os.path.abspath(args.input)
+    input_file = os.path.abspath(args.input)
     output_dir = os.path.abspath(args.outdir)
     os.makedirs(output_dir, exist_ok=True)
 
+    input_dir = os.path.dirname(input_file)
     assert input_dir != output_dir, "Input and output recording directories must be different."
 
-    inst, segments = luna_open_and_segments(input_dir)
-    print(f"Detected {len(segments)} segment(s).")
-
-    base_filename = os.path.splitext(os.path.basename(input_dir))[0]
-
-    for i, (start, stop) in enumerate(segments, start=1):
-        # compute gap to previous segment
-        if i > 1:
-            gap = start - segments[i-2][1]
-            print(f"  Gap before segment {i}: {gap:.2f} sec")
-        tag = base_filename[:]
-        if len(segments) > 1:
-            tag += f"__seg{i:02d}"
-        
-        edf_file_no_extension = os.path.join(output_dir, f"{tag}")
-
-        # 1) Mask and write EDF+C for this segment
-        luna_write_segment(inst, start, stop, edf_file_no_extension)
-
-        # 2) Still masked — pull annotations directly from Luna
-        ann_df = luna_fetch_segment_annots(inst)
-
-        # 3) Clear mask for next loop
-        luna_clear_mask(inst)
-
-        print(f"[{i}/{len(segments)}] wrote {edf_file_no_extension}.edf ; "\
-              f"{len(ann_df) if ann_df is not None else 0} annotations in-memory")
-
-        if args.dry_run:
-            continue
-
-    print(f"Done. Outputs in: {output_dir}")
+    convert_edf_to_continuous_segments(input_file, output_dir)
 
 
 if __name__ == "__main__":
@@ -300,5 +318,3 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         raise e
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(1)

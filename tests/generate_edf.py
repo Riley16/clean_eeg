@@ -2,6 +2,10 @@ import numpy as np
 import os
 import pyedflib
 from datetime import datetime
+import lunapi as lp
+
+from clean_eeg.paths import TEST_SUBJECT_DATA_DIR
+from clean_eeg.load_eeg import RESERVED_FIELD_EDF_HEADER_BYTE_OFFSET
 
 
 def generate_test_edf(header, signal_headers, filename='sinusoidal_continuous_file.edf'):
@@ -62,6 +66,27 @@ def generate_test_edf_from_config(config_dict, path, n_signals=2):
     generate_test_edf(header, signal_headers, path)
     return None
 
+def generate_discontinuous_edf_from_config(edf_config):
+    assert edf_config['type'] == 'drop_intervals'
+
+    proj = lp.proj()
+    inst = proj.inst('temp')
+    epoch_length_s = 1
+    input_edf_path = str(TEST_DATA_DIR / edf_config['input_file'])
+    inst.attach_edf(input_edf_path)
+    inst.proc(f"EPOCH len={epoch_length_s}")
+    luna_mask_command = edf_config['luna_mask_command']
+    path = str(TEST_DATA_DIR / edf_config['filename'])
+    file_no_extension = os.path.splitext(path)[0]
+    if luna_mask_command:
+        inst.eval(f"{luna_mask_command} & RE & WRITE edf={file_no_extension} EDF+D")
+    else:
+        inst.eval(f"WRITE edf={file_no_extension} EDF+D")
+        # lunapi does not write continuous files with "EDF+D" in the file 
+        # version header field even with the "EDF+D" option to force EDF+D, so overwrite the field manually
+        with open(path, 'r+b') as f:
+            f.seek(RESERVED_FIELD_EDF_HEADER_BYTE_OFFSET)
+            f.write(b'EDF+D   ')
 
 def format_edf_config_json(config_json):
     """
@@ -87,11 +112,10 @@ def format_edf_config_json(config_json):
 if __name__ == "__main__":
     import json
     import argparse
-    parser = argparse.ArgumentParser(description="Generate a simple EDF file for testing purposes.")
+    parser = argparse.ArgumentParser(description="Generate simple EDF files for testing purposes.")
     parser.add_argument("--output", type=str, default='', help="Output path for the generated EDF file")
     args = parser.parse_args()
 
-    from clean_eeg.load_eeg import load_edf
     from clean_eeg.paths import TEST_DATA_DIR, TEST_CONFIG_FILE
 
     if not os.path.exists(TEST_DATA_DIR):
@@ -113,17 +137,16 @@ if __name__ == "__main__":
         print(f"EDF file generated at: {path}")
 
         # merge existing EDF files into a test discontinuous EDF+D file
-        edf_config = test_config.get('basic_EDF+D')
-        assert edf_config['type'] == 'drop_intervals'
+        generate_discontinuous_edf_from_config(edf_config=test_config.get('basic_EDF+D'))
 
-        import lunapi as lp
-        proj = lp.proj()
-        inst = proj.inst('temp')
-        epoch_length_s = 1
-        input_edf_path = str(TEST_DATA_DIR / edf_config['input_file'])
-        inst.attach_edf(input_edf_path)
-        inst.proc(f"EPOCH len={epoch_length_s}")
-        luna_mask_command = edf_config['luna_mask_command']
-        path = str(TEST_DATA_DIR / edf_config['filename'])
-        file_no_extension = os.path.splitext(path)[0]
-        inst.eval(f"{luna_mask_command} & RE & WRITE edf={file_no_extension} EDF+D")
+        generate_discontinuous_edf_from_config(edf_config=test_config.get('continuous_EDF+D'))
+
+        # generate subject-specific test EDF files representing multiple recordings from the same subject
+        if not os.path.exists(TEST_SUBJECT_DATA_DIR):
+            os.makedirs(TEST_SUBJECT_DATA_DIR)
+
+        for config_key in ['subject_EDF+C_1', 'subject_EDF+C_2']:
+            edf_config = test_config.get(config_key)
+            path = TEST_SUBJECT_DATA_DIR / edf_config['filename']
+            generate_test_edf_from_config(edf_config, path=path)
+
