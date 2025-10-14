@@ -10,7 +10,12 @@ De-identification operations:
 Installation:
 >> git clone git@github.com:Riley16/clean_eeg.git
 >> cd clean_eeg
+>> pip install .
+
+To run tests (from a current working directory of the clean_eeg/ install directory), instead install in editable mode:
 >> pip install -e .
+>> python tests/generate_edf.py
+>> pytest
 
 Dependencies:
 - [pyedflib](https://github.com/holgern/pyedflib)
