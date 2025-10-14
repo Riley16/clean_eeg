@@ -165,7 +165,7 @@ def clean_subject_edf_files(
     min_start_time = _get_start_time_earliest_recording(EDF_meta_data, verbosity=verbosity)
 
     # de-identify EDF files and save out
-    for tqdm(filename, _ in EDF_meta_data.items()):
+    for filename, _ in tqdm(EDF_meta_data.items()):
         edf = load_edf(os.path.join(input_path, filename), load_method='pyedflib', preload=True)
         assert isinstance(edf, dict)
         edf = deidentify_edf(
