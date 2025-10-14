@@ -121,6 +121,11 @@ def print_edf_mne(data, verbosity=1):
     if verbosity > 2:
         print('Annotations:')
         print(data.annotations)
+        print(data.times)
+        print(data.duration)
+        print(data.annotations.extras)
+        print(data.annotations.orig_time)
+        print(data.annotations.__dict__)
 
 
 def get_edf_start_time_from_mne(raw):

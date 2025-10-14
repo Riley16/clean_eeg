@@ -2,11 +2,10 @@ import re
 import os
 import numpy as np
 from copy import deepcopy
-import numpy as np
 from typing import Union
 from datetime import datetime
 from clean_eeg.anonymize import redact_subject_name, PersonalName
-from clean_eeg.load_eeg import load_edf
+from clean_eeg.load_eeg import load_edf, write_edf_pyedflib
 
 BASE_START_DATE = datetime(1985, 1, 1)
 DEFAULT_REDACT_HEADER_KEYS = ['patientname', 'sex', 'gender',
@@ -147,9 +146,78 @@ def remove_gendered_pronouns(text: str, replacement: str = REDACT_PRONOUN_REPLAC
         return PRONOUN_RE.sub(replacement, text)
 
 
-if __name__ == "__main__":
+def clean_subject_edf_files(
+    input_path: str,
+    output_path: str,
+    subject_code: str,
+    subject_name: Union[PersonalName, None] = None,
+    load_method: str = "edfio",
+    raise_errors: bool = False,
+    verbosity: int = 1,
+):
+    EDF_meta_data = _load_edf_metadata(input_path=input_path,
+                                       load_method=load_method,
+                                       verbosity=verbosity,
+                                       raise_errors=raise_errors)
+
+    min_start_time = _get_start_time_earliest_recording(EDF_meta_data, verbosity=verbosity)
+
+    # de-identify EDF files and save out
+    for filename, _ in EDF_meta_data.items():
+        edf = load_edf(os.path.join(input_path, filename), load_method='pyedflib', preload=True)
+        edf = deidentify_edf(
+            edf_data=edf,
+            subject_name=subject_name,
+            subject_code=subject_code,
+            earliest_recording_start_time=min_start_time
+        )
+        clean_start_time = edf['header']['startdate']
+        filename_no_ext = os.path.splitext(filename)[0]
+        # subject argument is not always present, fallback to subject_code if not provided
+        # subject_val = subject if subject is not None else subject_code
+        subject_val = subject_code
+        clean_filename = f"{filename_no_ext}_{subject_val}_{clean_start_time.strftime('%Y.%m.%d__%H:%M:%S')}.edf"
+        # clean_full_path = os.path.join(output_path, clean_filename)
+        # write_edf_pyedflib(edf, clean_full_path)
+        print(f"Saved cleaned EDF file as {clean_filename}")
+    print("Done cleaning EDF files.")
+
+
+def _load_edf_metadata(input_path: str, load_method: str = "edfio", verbosity: int = 1, raise_errors: bool = False):
+    EDF_meta_data = dict()
+    for filename in os.listdir(input_path):
+        try:
+            if filename.lower().endswith('.edf'):
+                full_path = os.path.join(input_path, filename)
+                if verbosity > 0:
+                    print(f"Loading {filename}...")
+                data = load_edf(full_path, load_method=load_method, preload=False)
+                EDF_meta_data[filename] = {'data': data}
+        except Exception as e:
+            if raise_errors:
+                raise e
+            print(f"ERROR: Failed to load EDF file {filename}:\n\n{e}\n\nCheck if the file is corrupted. Skipping this file...\n")
+    return EDF_meta_data
+
+
+def _get_start_time_earliest_recording(EDF_meta_data: dict, verbosity: int = 0) -> datetime:
+    # compute the relative start times of all recordings with respect to the earliest recording
+    start_times = list()
+    for filename, edf in EDF_meta_data.items():
+        data = edf['data']
+        print(data)
+        start_time = data['header']['startdate']
+        if verbosity > 1:
+            print(f"Start time for {filename}: {start_time}")
+        start_times.append(start_time)
+    min_start_time = min(start_times)
+    if verbosity > -1:
+        print(f"Earliest recording start time across all files: {min_start_time}")
+    return min_start_time
+
+
+def get_clean_eeg_cli_arguments():
     import argparse
-    from clean_eeg.load_eeg import write_edf_pyedflib
     parser = argparse.ArgumentParser(description="Rename and clean meta-data for all clinical EEG EDF "
                                                  "files after mass export by Nihon Kohden.")
     parser.add_argument("--input_path", type=str, required=True, help="Path to all EDF files")
@@ -165,7 +233,10 @@ if __name__ == "__main__":
                         help="Raise errors instead of warnings for debugging")
     parser.add_argument("--verbosity", type=int, default=1, help="Enable verbose output")
     args = parser.parse_args()
+    return args
 
+
+def validate_cli_arguments(args):
     if args.output_path == args.input_path:
         raise ValueError("Output path must be different from input path to avoid overwriting original EDF files.")
     if not os.path.exists(args.input_path):
@@ -182,50 +253,22 @@ if __name__ == "__main__":
     print('Loading EDF files from path:', args.input_path)
     is_valid_subject_code(args.subject_code)
 
-    subject_name = PersonalName(first_name=args.first_name,
-                                middle_names=args.middle_name.split('_') if args.middle_name else [],
-                                last_name=args.last_name)
 
-    # load the meta-data for each EEG EDF file
-    EDF_meta_data = dict()
-    for filename in os.listdir(args.input_path):
-        try:
-            if filename.lower().endswith('.edf'):
-                full_path = os.path.join(args.input_path, filename)
-                if args.verbosity > 0:
-                    print(f"Loading {filename}...")
-                data = load_edf(full_path, load_method=args.load_method, preload=False)
-                EDF_meta_data[filename] = {'data': data}
-        except Exception as e:
-            if args.raise_errors:
-                raise e
-            print(f"ERROR: Failed to load EDF file {filename}:\n\n{e}\n\nCheck if the file is corrupted. Skipping this file...\n")
-    
-    # compute the relative start times of all recordings with respect to the earliest recording
-    # remove absolute timing information to maintain privacy while preserving relative timing information
-    start_times = list()
-    for filename, edf in EDF_meta_data.items():
-        data = edf['data']
-        start_time = data['header']['startdate']
-        if args.verbosity > 1:
-            print(f"Start time for {filename}: {start_time}")
-        start_times.append(start_time)
-    min_start_time = min(start_times)
-    if args.verbosity > -1:
-        print(f"Earliest recording start time across all files: {min_start_time}")
-    
-    # de-identify EDF files and save out
-    for filename, _ in EDF_meta_data.items():
-        # reload data with preload=True here to load only a single file into memory at once
-        edf = load_edf(os.path.join(args.input_path, filename), load_method='pyedflib', preload=True)
-        edf = deidentify_edf(edf_data=edf,
-                             subject_name=subject_name,
-                             subject_code=args.subject_code,
-                             earliest_recording_start_time=min_start_time)
-        clean_start_time = edf['header']['startdate']
-        clean_filename = f"{args.subject}_{clean_start_time.strftime('%Y.%m.%d__%H:%M:%S')}.edf"
-        clean_full_path = os.path.join(args.output_path, clean_filename)
-        # save the cleaned EDF file with pyedflib
-        # write_edf_pyedflib(edf, clean_full_path)
-        print(f"Saved cleaned EDF file as {clean_filename}")
-    
+if __name__ == "__main__":
+    args = get_clean_eeg_cli_arguments()
+    validate_cli_arguments(args)
+    subject_name = PersonalName(
+        first_name=args.first_name,
+        middle_names=args.middle_name.split('_') if args.middle_name else [],
+        last_name=args.last_name
+    )
+
+    clean_subject_edf_files(
+        input_path=args.input_path,
+        output_path=args.output_path,
+        subject_code=args.subject_code,
+        subject_name=subject_name,
+        load_method=args.load_method,
+        raise_errors=args.raise_errors,
+        verbosity=args.verbosity,
+    )
