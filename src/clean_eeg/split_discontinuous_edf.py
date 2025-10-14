@@ -27,13 +27,10 @@ def convert_edf_to_continuous_segments(input_file: str, output_dir: str, verbosi
         edf_file_no_extension = os.path.join(output_dir, f"{tag}")
 
         # 1) Mask and write EDF+C for this segment
-        print('start:', start, 'stop:', stop)
         luna_write_segment(inst, start, stop, edf_file_no_extension)
 
         # 2) Still masked — pull annotations directly from Luna
         ann_df = luna_fetch_segment_annots(inst)
-
-        print(ann_df)
 
         # 3) Clear mask for next iteration
         luna_clear_mask(inst)
@@ -214,7 +211,6 @@ def embed_annots_with_edfio(edf_path: str, annotations: List[EdfAnnotation]) -> 
     from edfio import read_edf
     edf = read_edf(edf_path)
     # Rebuild an Edf object with the same content but new annotations
-    print(edf.__dict__.keys())
     edf = Edf(
         edf.signals,
         patient=edf.patient,

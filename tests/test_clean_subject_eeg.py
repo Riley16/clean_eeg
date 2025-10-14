@@ -12,6 +12,8 @@ import json
 with open(TEST_CONFIG_FILE, 'r') as f:
     TEST_CONFIG = json.load(f)
 BASIC_EDF_PATH = str(TEST_DATA_DIR / TEST_CONFIG["basic_EDF+C"]['filename'])
+SUBJECT_EDF_PATH1 = str(TEST_DATA_DIR / TEST_CONFIG["subject_EDF+C_1"]['filename'])
+SUBJECT_EDF_PATH2 = str(TEST_DATA_DIR / TEST_CONFIG["subject_EDF+C_2"]['filename'])
 
 
 def test_remove_gendered_pronouns_basic():
@@ -114,11 +116,12 @@ def test_clean_subject_edf_files():
                             output_path=str(output_path))
     
     # check that file was created
-    filename_no_ext = Path(BASIC_EDF_PATH).stem
-    clean_filename = f"{filename_no_ext}_{SUBJECT_CODE}_2023.01.01__00:00:00.edf"
-    clean_full_path = os.path.join(output_path, clean_filename)
-    assert os.path.exists(clean_full_path)
-
-    # cleanup
-    os.remove(clean_full_path)
+    filename_no_ext1 = Path(SUBJECT_EDF_PATH1).stem
+    clean_filename1 = f"{filename_no_ext1}_{SUBJECT_CODE}_1985.01.01__00:00:00.edf"
+    filename_no_ext2 = Path(SUBJECT_EDF_PATH2).stem
+    clean_filename2 = f"{filename_no_ext2}_{SUBJECT_CODE}_1985.01.01__01:00:00.edf"
+    for clean_filename in [clean_filename1, clean_filename2]:
+        clean_full_path = os.path.join(output_path, clean_filename)
+        assert os.path.exists(clean_full_path), 'Cleaned EDF file was not created: ' + clean_full_path
+        os.remove(clean_full_path)
     os.rmdir(output_path)

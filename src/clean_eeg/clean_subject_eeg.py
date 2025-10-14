@@ -4,14 +4,15 @@ import numpy as np
 from copy import deepcopy
 from typing import Union
 from datetime import datetime
+from tqdm import tqdm
 from clean_eeg.anonymize import redact_subject_name, PersonalName
 from clean_eeg.load_eeg import load_edf, write_edf_pyedflib
 
 BASE_START_DATE = datetime(1985, 1, 1)
 DEFAULT_REDACT_HEADER_KEYS = ['patientname', 'sex', 'gender',
-                              'patient_additional', 'birthdate',
+                              'patient_additional',
                               'admincode','technician']
-REDACT_REPLACEMENT = 'REDACTED'
+REDACT_REPLACEMENT = 'unknown'  # match pyedflib default for missing fields
 
 
 def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_start_time):
@@ -56,6 +57,7 @@ def deidentify_edf_header(header: dict,
     else:
         header['startdate'] = deidentify_start_date_time(header['startdate'],
                                                          earliest_recording_start_time)
+    header['birthdate'] = datetime(1900, 1, 1)
     for key in redact_keys:
         header[key] = REDACT_REPLACEMENT
     header['patientcode'] = subject_code
@@ -151,7 +153,7 @@ def clean_subject_edf_files(
     output_path: str,
     subject_code: str,
     subject_name: Union[PersonalName, None] = None,
-    load_method: str = "edfio",
+    load_method: str = "pyedflib",
     raise_errors: bool = False,
     verbosity: int = 1,
 ):
@@ -163,8 +165,9 @@ def clean_subject_edf_files(
     min_start_time = _get_start_time_earliest_recording(EDF_meta_data, verbosity=verbosity)
 
     # de-identify EDF files and save out
-    for filename, _ in EDF_meta_data.items():
+    for tqdm(filename, _ in EDF_meta_data.items()):
         edf = load_edf(os.path.join(input_path, filename), load_method='pyedflib', preload=True)
+        assert isinstance(edf, dict)
         edf = deidentify_edf(
             edf_data=edf,
             subject_name=subject_name,
@@ -177,13 +180,25 @@ def clean_subject_edf_files(
         # subject_val = subject if subject is not None else subject_code
         subject_val = subject_code
         clean_filename = f"{filename_no_ext}_{subject_val}_{clean_start_time.strftime('%Y.%m.%d__%H:%M:%S')}.edf"
-        # clean_full_path = os.path.join(output_path, clean_filename)
-        # write_edf_pyedflib(edf, clean_full_path)
+        clean_full_path = os.path.join(output_path, clean_filename)
+        write_edf_pyedflib(edf, clean_full_path)
         print(f"Saved cleaned EDF file as {clean_filename}")
     print("Done cleaning EDF files.")
 
 
-def _load_edf_metadata(input_path: str, load_method: str = "edfio", verbosity: int = 1, raise_errors: bool = False):
+def convert_edfC_to_edfD(input_file: str):
+    from clean_eeg.split_discontinuous_edf import overwrite_edfD_to_edfC
+    from clean_eeg.load_eeg import is_edfC, is_edfD
+    if is_edfD(input_file):
+        overwrite_edfD_to_edfC(input_file, require_continuous_data=True)
+        assert is_edfC(input_file)
+
+
+def _load_edf_metadata(input_path: str,
+                       load_method: str = "pyedflib",
+                       verbosity: int = 1,
+                       convert2edfC: bool = True,
+                       raise_errors: bool = False):
     EDF_meta_data = dict()
     for filename in os.listdir(input_path):
         try:
@@ -191,6 +206,8 @@ def _load_edf_metadata(input_path: str, load_method: str = "edfio", verbosity: i
                 full_path = os.path.join(input_path, filename)
                 if verbosity > 0:
                     print(f"Loading {filename}...")
+                if convert2edfC:
+                    convert_edfC_to_edfD(full_path)
                 data = load_edf(full_path, load_method=load_method, preload=False)
                 EDF_meta_data[filename] = {'data': data}
         except Exception as e:
@@ -205,7 +222,6 @@ def _get_start_time_earliest_recording(EDF_meta_data: dict, verbosity: int = 0) 
     start_times = list()
     for filename, edf in EDF_meta_data.items():
         data = edf['data']
-        print(data)
         start_time = data['header']['startdate']
         if verbosity > 1:
             print(f"Start time for {filename}: {start_time}")
