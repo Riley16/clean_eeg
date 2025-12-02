@@ -240,8 +240,8 @@ def get_clean_eeg_cli_arguments():
     parser.add_argument("--output_path", type=str, required=True, help="Path to all EDF files")
     parser.add_argument("--subject-code", type=str, required=True, help="Subject code (e.g., R1755A)")
     parser.add_argument("--first-name", type=str, required=True, help="Subject first name (e.g., John)")
-    parser.add_argument("--middle-name", type=list, default='NOT_SPECIFIED',
-                        help='Subject middle name or initial (e.g., Paul or P). Can be left blank with "".')
+    parser.add_argument("--middle-name", type=str, default='NOT_SPECIFIED',
+            help='Subject middle name or initial (e.g., Paul or P). Can be left blank with "". Multiple middle names should be separated by underscores')
     parser.add_argument("--last-name", type=str, required=True, help="Subject last name (e.g., Smith)")
     parser.add_argument("--load-method", type=str, default="edfio",
                         help="Method to load EDF files: 'edfio', 'pyedflib', or 'mne'")
