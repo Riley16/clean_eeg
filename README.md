@@ -8,14 +8,30 @@ De-identification operations:
 - Set recording start times to 1985-01-01 (with relative offsets from the time of the first recording if multiple EDF files from the same subject are processed together to preserve relative timing information)
 
 Installation:
->> git clone git@github.com:Riley16/clean_eeg.git
->> cd clean_eeg
->> pip install .
+```
+git clone git@github.com:Riley16/clean_eeg.git
+cd clean_eeg
+# create new conda environment
+conda create -n clean_eeg python=3.11
+conda activate clean_eeg
+pip install .
+```
 
 To run tests (from a current working directory of the clean_eeg/ install directory), instead install in editable mode:
->> pip install -e .
->> python tests/generate_edf.py
->> pytest
+```
+conda activate clean_eeg
+pip install -e .
+python tests/generate_edf.py
+pytest
+```
+
+To clean a directory of EEG files from a given subject:
+```
+cd clean_eeg
+conda activate clean_eeg
+python src/clean_eeg/clean_subject_eeg.py --input_path PATH/TO/ALL/SUBJECT/EEG/FILES --output_path OPTIONAL/PATH/TO/OUTPUT/DEIDENTIFIED/FILES --subject_code R1XXXY --first-name John --middle-name Paul --last-name Smith
+```
+The path to the de-identified files will be printed once the process finishes.
 
 Dependencies:
 - [pyedflib](https://github.com/holgern/pyedflib)
