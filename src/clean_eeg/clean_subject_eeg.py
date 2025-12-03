@@ -219,7 +219,7 @@ def _load_edf_metadata(input_path: str,
             if filename.lower().endswith('.edf'):
                 full_path = os.path.join(input_path, filename)
                 if verbosity > 0:
-                    print(f"Loading {filename}...")
+                    print(f"Loading meta-data for {filename}...")
                 if convert_to_edfC:
                     convert_edfC_to_edfD(full_path)
                 data = load_edf(full_path, load_method=load_method, preload=False)
@@ -290,10 +290,10 @@ def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0):
             print('This may indicate corrupted EDF files. Check with the data analysis team.')
             if gap.total_seconds() < MIN_RECORDING_GAP_ERROR_SECONDS:
                 confirm_continue = True
-        if confirm_continue:
-            continue_input = input("Continue? yes/no: ")
-        if continue_input.lower() not in ['yes', 'y']:
-            raise RuntimeError("Aborting EDF de-identification conversion due to recording gap.")
+    if confirm_continue:
+        continue_input = input("Continue? yes/no: ")
+    if continue_input.lower() not in ['yes', 'y']:
+        raise RuntimeError("Aborting EDF de-identification conversion due to recording gap.")
 
 
 def is_all_X_with_spaces(s: str) -> bool:
