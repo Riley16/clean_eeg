@@ -333,23 +333,21 @@ def _check_subject_name_consistency(EDF_meta_data: dict, command_line_subject_na
 
 
 def _check_signal_header_consistency(EDF_meta_data: dict, verbosity: int = 0):
-    signal_header_sets = dict()
+    signal_label_sets = dict()
     for filename, edf in EDF_meta_data.items():
         data = edf['data']
         signal_headers = data['signal_headers']
-        signal_header_sets[filename] = tuple(tuple((k, v) for k, v in signal_header.items())
-                                        for signal_header in signal_headers)
-    unique_signal_header_sets = {*list(signal_header_sets.values())}
-    if len(unique_signal_header_sets) > 1:
-        print("WARNING: Multiple unique signal header formats found across EDF files:")
-        for header in unique_signal_header_sets:
-            # header = list(header)
-            print(header)
-            files_with_header = [fname for fname, hkeys in signal_header_sets.items() if hkeys == header]
-            print(f'Signal header\n\n{header}\n\nfound in files:\n{files_with_header}')
-        print("\nThis may indicate inconsistent EDF file formats across recordings or multiple subjects across files in the EDF data folder.")
+        signal_label_sets[filename] = tuple(signal_header['label']
+                                            for signal_header in signal_headers)
+    unique_label_sets = {*list(signal_label_sets.values())}
+    if len(unique_label_sets) > 1:
+        print("WARNING: Multiple unique sets of signal header labels found across EDF files:")
+        for labels in unique_label_sets:
+            files_with_header = [fname for fname, label_keys in signal_label_sets.items() if label_keys == labels]
+            print(f'Signal header labels\n\n{labels}\n\nfound in files:\n{files_with_header}')
+        print("\nThis may indicate inconsistent EDF signal labels across recordings or multiple subjects across files in the EDF data folder.")
         print('Alternatively, this may be due to multiple recording montages during e.g., the same stay in the epilepsy monitoring unit.')
-        continue_input = input("Continue? (only continue if recordings come from the same subject and EMU stay for data integrity) yes/no: ")
+        continue_input = input("Continue? (only continue if recordings have been confirmed as coming from the same subject and EMU stay for data integrity) yes/no: ")
         if continue_input.lower() not in ['yes', 'y']:
             raise RuntimeError("Aborting EDF de-identification conversion due to inconsistent signal headers.")
 
