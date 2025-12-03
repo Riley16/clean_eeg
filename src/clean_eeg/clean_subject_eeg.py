@@ -214,12 +214,12 @@ def _load_edf_metadata(input_path: str,
                        convert_to_edfC: bool = True,
                        raise_errors: bool = False):
     EDF_meta_data = dict()
-    for filename in os.listdir(input_path):
+    if verbosity > 0:
+        print(f"Loading EDF meta-data...")
+    for filename in tqdm(os.listdir(input_path)):
         try:
             if filename.lower().endswith('.edf'):
                 full_path = os.path.join(input_path, filename)
-                if verbosity > 0:
-                    print(f"Loading meta-data for {filename}...")
                 if convert_to_edfC:
                     convert_edfC_to_edfD(full_path)
                 data = load_edf(full_path, load_method=load_method, preload=False)
