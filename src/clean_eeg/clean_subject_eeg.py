@@ -263,7 +263,7 @@ def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0):
         start_times.append((filename, start_time))
         file_duration_manual = data['header']['record_duration'] * data['header']['n_records']
         file_duration = data['header']['file_duration']
-        if not file_duration == file_duration_manual:
+        if not np.isclose(file_duration, file_duration_manual, atol=0.5):
             print(f"WARNING: EDF file {filename} has inconsistent file duration (pyedflib duration: "
                   f"{file_duration} s vs. manual calculation: {file_duration_manual} s).")
         end_time = start_time + timedelta(seconds=file_duration)
