@@ -203,14 +203,14 @@ def convert_edfC_to_edfD(input_file: str):
     from clean_eeg.split_discontinuous_edf import overwrite_edfD_to_edfC
     from clean_eeg.load_eeg import is_edfC, is_edfD
     if is_edfD(input_file):
-        overwrite_edfD_to_edfC(input_file, require_continuous_data=True)
+        overwrite_edfD_to_edfC(input_file, require_continuous_data=False)
         assert is_edfC(input_file)
 
 
 def _load_edf_metadata(input_path: str,
                        load_method: str = "pyedflib",
                        verbosity: int = 1,
-                       convert2edfC: bool = True,
+                       convert_to_edfC: bool = True,
                        raise_errors: bool = False):
     EDF_meta_data = dict()
     for filename in os.listdir(input_path):
@@ -219,7 +219,7 @@ def _load_edf_metadata(input_path: str,
                 full_path = os.path.join(input_path, filename)
                 if verbosity > 0:
                     print(f"Loading {filename}...")
-                if convert2edfC:
+                if convert_to_edfC:
                     convert_edfC_to_edfD(full_path)
                 data = load_edf(full_path, load_method=load_method, preload=False)
                 EDF_meta_data[filename] = {'data': data}
