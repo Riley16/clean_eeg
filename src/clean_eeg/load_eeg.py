@@ -31,6 +31,9 @@ def load_edf(filename, load_method='edfio', preload=False, read_digital=False):
         else:
             signals = None
         header = reader.getHeader()
+        header['record_duration'] = reader.datarecord_duration
+        header['n_records'] = reader.datarecords_in_file
+        header['file_duration'] = reader.file_duration
         signal_headers = reader.getSignalHeaders()
         annotations = reader.readAnnotations()
         reader.close()

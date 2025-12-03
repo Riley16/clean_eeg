@@ -4,7 +4,7 @@ import pyedflib
 from datetime import datetime
 import lunapi as lp
 
-from clean_eeg.paths import TEST_SUBJECT_DATA_DIR
+from clean_eeg.paths import TEST_DATA_DIR, TEST_SUBJECT_DATA_DIR, INCONSISTENT_SUBJECT_DATA_DIR
 from clean_eeg.load_eeg import RESERVED_FIELD_EDF_HEADER_BYTE_OFFSET
 
 
@@ -111,13 +111,8 @@ def format_edf_config_json(config_json):
     return formatted_config
 
 
-if __name__ == "__main__":
+def run_generate_test_edf(output=''):
     import json
-    import argparse
-    parser = argparse.ArgumentParser(description="Generate simple EDF files for testing purposes.")
-    parser.add_argument("--output", type=str, default='', help="Output path for the generated EDF file")
-    args = parser.parse_args()
-
     from clean_eeg.paths import TEST_DATA_DIR, TEST_CONFIG_FILE
 
     if not os.path.exists(TEST_DATA_DIR):
@@ -127,10 +122,10 @@ if __name__ == "__main__":
         test_config = json.load(f)
     edf_config = test_config.get('basic_EDF+C')
 
-    if args.output:
+    if output:
         print('Outputting basic EDF+C test file only... (do not specify --output to generate all test EDF files)')
-        generate_test_edf_from_config(edf_config, args.output)
-        print(f"EDF file generated at: {args.output}")
+        generate_test_edf_from_config(edf_config, output)
+        print(f"EDF file generated at: {output}")
     else:
         print('Outputting all EDF test files...')
 
@@ -140,7 +135,6 @@ if __name__ == "__main__":
 
         # merge existing EDF files into a test discontinuous EDF+D file
         generate_discontinuous_edf_from_config(edf_config=test_config.get('basic_EDF+D'))
-
         generate_discontinuous_edf_from_config(edf_config=test_config.get('continuous_EDF+D'))
 
         # generate subject-specific test EDF files representing multiple recordings from the same subject
@@ -152,3 +146,18 @@ if __name__ == "__main__":
             path = TEST_SUBJECT_DATA_DIR / edf_config['filename']
             generate_test_edf_from_config(edf_config, path=path)
 
+        if not os.path.exists(INCONSISTENT_SUBJECT_DATA_DIR):
+            os.makedirs(INCONSISTENT_SUBJECT_DATA_DIR)
+
+        for config_key in ['inconsistent_subject_EDF+C_1', 'inconsistent_subject_EDF+C_2']:
+            edf_config = test_config.get(config_key)
+            path = INCONSISTENT_SUBJECT_DATA_DIR / edf_config['filename']
+            generate_test_edf_from_config(edf_config, path=path)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate simple EDF files for testing purposes.")
+    parser.add_argument("--output", type=str, default='', help="Output path for the generated EDF file")
+    args = parser.parse_args()
+    run_generate_test_edf(output=args.output)

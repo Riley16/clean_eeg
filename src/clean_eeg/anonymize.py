@@ -179,7 +179,8 @@ class PersonalName():
         """
         Get the full name as a string.
         """
-        return f"{self.first_name} {' '.join(self.middle_names)} {self.last_name}".strip()
+        names = [self.first_name] + self.middle_names + [self.last_name]
+        return " ".join(names).strip()
     
     def get_normalized_tokens(self) -> List[str]:
         """

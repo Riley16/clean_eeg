@@ -3,7 +3,7 @@ import os
 import numpy as np
 from copy import deepcopy
 from typing import Union
-from datetime import datetime
+from datetime import datetime, timedelta
 from tqdm import tqdm
 from clean_eeg.anonymize import redact_subject_name, PersonalName
 from clean_eeg.load_eeg import load_edf, write_edf_pyedflib
@@ -13,6 +13,12 @@ DEFAULT_REDACT_HEADER_KEYS = ['patientname', 'sex', 'gender',
                               'patient_additional',
                               'admincode','technician']
 REDACT_REPLACEMENT = 'unknown'  # match pyedflib default for missing fields
+MAX_RECORDING_GAP_SECONDS = 60
+MIN_RECORDING_GAP_SECONDS = -2  # allow small overlaps in files
+SITE_CODE_TO_INCOMING_FOLDER = {'S': 'UTHSCSA',
+                                'A': 'CUDA',
+                                'H': 'harvard',
+                                'J': 'TJ'}
 
 
 def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_start_time):
@@ -22,7 +28,7 @@ def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_star
     # de-identification operations:
     # 1) rename subject to subject code and remove meta-data fields for gender, birthdate, patient hospital code
     # 2) replace recording start time with time relative to the earliest recording start time
-    # 3) remove any recording annotations containing regex patterns indicating PHI (name, gender, birthdate)
+    # 3) remove any recording annotations containing regex patterns indicating PHI (name, gender)
     # 4) save the modified EDF file with a new name in the format SUBJECT_CODE__RELATIVE.START.DATE_RELATIVE:START:TIME.edf
     #        RELATIVE.START.DATE_RELATIVE:START:TIME corresponds to YEAR.MONTH.DAY__HOUR:MINUTE:SECOND relative to the earliest recording start time
     #        relative times are offset by the EDF standard clipping date of 1985-01-01
@@ -162,6 +168,7 @@ def clean_subject_edf_files(
                                        verbosity=verbosity,
                                        raise_errors=raise_errors)
 
+    _validate_EDF_meta_data(EDF_meta_data, subject_name=subject_name, verbosity=verbosity)
     min_start_time = _get_start_time_earliest_recording(EDF_meta_data, verbosity=verbosity)
 
     # de-identify EDF files and save out
@@ -183,7 +190,13 @@ def clean_subject_edf_files(
         clean_full_path = os.path.join(output_path, clean_filename)
         write_edf_pyedflib(edf, clean_full_path)
         print(f"Saved cleaned EDF file as {clean_filename}")
-    print("Done cleaning EDF files.")
+    print("Done cleaning EDF files. Saved to output path:", output_path)
+    site_code = subject_code[-1]  # last character of subject code is site code
+    site_code_incoming_folder = SITE_CODE_TO_INCOMING_FOLDER.get(site_code, 'UNKNOWN_SITE')
+    remote_dir = f"/data10/RAM/incoming/{site_code_incoming_folder}/{subject_code}/all_clinical_eeg"
+    print("Example commands to transfer cleaned EDF files to the CML rhino server (make sure to change USER to appropriate username):")
+    print(f'ssh USER@rhino2.psych.upenn.edu "mkdir -p {remote_dir}"')
+    print(f"scp {os.path.join(output_path, '*.edf')} USER@rhino2.psych.upenn.edu:{remote_dir}")
 
 
 def convert_edfC_to_edfD(input_file: str):
@@ -232,23 +245,185 @@ def _get_start_time_earliest_recording(EDF_meta_data: dict, verbosity: int = 0) 
     return min_start_time
 
 
+def _validate_EDF_meta_data(EDF_meta_data: dict, subject_name: Union[PersonalName, None],
+                            verbosity: int = 0):
+    _check_recording_gaps(EDF_meta_data, verbosity=verbosity)
+    _check_subject_name_consistency(EDF_meta_data, command_line_subject_name=subject_name,
+                                    verbosity=verbosity)
+    _check_signal_header_consistency(EDF_meta_data, verbosity=verbosity)
+
+
+def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0):
+    # check for gaps between recordings greater than 1 hour
+    start_times = list()
+    end_times = dict()
+    for filename, edf in EDF_meta_data.items():
+        data = edf['data']
+        start_time = data['header']['startdate']
+        start_times.append((filename, start_time))
+        file_duration_manual = data['header']['record_duration'] * data['header']['n_records']
+        file_duration = data['header']['file_duration']
+        if not file_duration == file_duration_manual:
+            print(f"WARNING: EDF file {filename} has inconsistent file duration (pyedflib duration: "
+                  f"{file_duration} s vs. manual calculation: {file_duration_manual} s).")
+        end_time = start_time + timedelta(seconds=file_duration)
+        end_times[filename] = end_time
+    start_times.sort(key=lambda x: x[1])  # sort by datetime
+    for i in range(1, len(start_times)):
+        prev_filename, _ = start_times[i-1]
+        curr_filename, curr_start_time = start_times[i]
+        gap = curr_start_time - end_times[prev_filename]
+        end_time_prev = end_times[prev_filename]
+        continue_input = 'yes'
+        if gap.total_seconds() > MAX_RECORDING_GAP_SECONDS:
+            print(f"WARNING: Gap of {gap} between neighboring recordings:\n"
+                  f"{prev_filename} (end: {end_time_prev}) and\n"
+                  f"{curr_filename} (start: {curr_start_time}).")
+            print('This may indicate missing recording files. Double check no additional recording files are available.')
+            continue_input = input("Continue? yes/no: ")
+        elif gap.total_seconds() < 0:
+            print(f"WARNING: Overlap of {abs(gap.total_seconds())} seconds between neighboring recordings:\n"
+                  f"{prev_filename} (end: {end_time_prev}) and\n"
+                  f"{curr_filename} (start: {curr_start_time}).")
+            print('This may indicate corrupted EDF files. Check with the data analysis team.')
+            if gap.total_seconds() < MIN_RECORDING_GAP_SECONDS:
+                continue_input = input("Continue? yes/no: ")
+        if continue_input.lower() not in ['yes', 'y']:
+            raise RuntimeError("Aborting EDF de-identification conversion due to recording gap.")
+
+
+def is_all_X_with_spaces(s: str) -> bool:
+    return re.fullmatch(r"\s*X[\sX]*", s) is not None
+
+
+def _check_subject_name_consistency(EDF_meta_data: dict, command_line_subject_name: Union[PersonalName, None],
+                                    verbosity: int = 0):
+    subject_names = dict()
+    for filename, edf in EDF_meta_data.items():
+        data = edf['data']
+        header = data['header']
+        subject_name = header.get('patientname', 'unknown')
+        subject_names[filename] = subject_name
+    unique_names = set(subject_names.values())
+    if len(unique_names) > 1:
+        print("WARNING: Multiple unique subject names found across EDF files:")
+        for name in unique_names:
+            files_with_name = [fname for fname, sname in subject_names.items() if sname == name]
+            print(f'Subject name "{name}" found in files: {files_with_name}')
+        print("This may indicate multiple subjects are included in the same EDF data folder, which should not be the case.")
+        continue_input = input("Continue? (only continue if names are indeed from the same subject for data integrity) yes/no: ")
+        if continue_input.lower() not in ['yes', 'y']:
+            raise RuntimeError("Aborting EDF de-identification conversion due to inconsistent subject names.")
+    elif len(unique_names) < 1:
+        raise RuntimeError("No subject names found in EDF files.")
+    
+    if command_line_subject_name is not None:
+        command_line_subject_name_str = command_line_subject_name.get_full_name()
+        continue_input = 'yes'
+        if len(unique_names) == 1:
+            subject_name = unique_names.pop()
+            if (not is_all_X_with_spaces(subject_name)) and (subject_name != command_line_subject_name_str):
+                continue_input = input(f'Confirm that subject name in EDF files ("{subject_name}") matches '
+                                       f'subject name specified by command line ("{command_line_subject_name_str}"): yes/no: ')
+        elif (len(unique_names) > 1) and not all(is_all_X_with_spaces(subject_name) for subject_name in unique_names):
+            continue_input = input(f'Confirm that subject names in EDF files ({unique_names}) match '
+                                   f'subject name specified by command line ("{command_line_subject_name_str}"): yes/no: ')
+        if continue_input.lower() not in ['yes', 'y']:
+            raise RuntimeError("Aborting EDF de-identification conversion due to inconsistent subject names.")
+
+
+def _check_signal_header_consistency(EDF_meta_data: dict, verbosity: int = 0):
+    signal_header_sets = dict()
+    for filename, edf in EDF_meta_data.items():
+        data = edf['data']
+        signal_headers = data['signal_headers']
+        signal_header_sets[filename] = tuple(tuple((k, v) for k, v in signal_header.items())
+                                        for signal_header in signal_headers)
+    unique_signal_header_sets = {*list(signal_header_sets.values())}
+    if len(unique_signal_header_sets) > 1:
+        print("WARNING: Multiple unique signal header formats found across EDF files:")
+        for header in unique_signal_header_sets:
+            # header = list(header)
+            print(header)
+            files_with_header = [fname for fname, hkeys in signal_header_sets.items() if hkeys == header]
+            print(f'Signal header\n\n{header}\n\nfound in files:\n{files_with_header}')
+        print("\nThis may indicate inconsistent EDF file formats across recordings or multiple subjects across files in the EDF data folder.")
+        print('Alternatively, this may be due to multiple recording montages during e.g., the same stay in the epilepsy monitoring unit.')
+        continue_input = input("Continue? (only continue if recordings come from the same subject and EMU stay for data integrity) yes/no: ")
+        if continue_input.lower() not in ['yes', 'y']:
+            raise RuntimeError("Aborting EDF de-identification conversion due to inconsistent signal headers.")
+
+
 def get_clean_eeg_cli_arguments():
     import argparse
-    parser = argparse.ArgumentParser(description="Rename and clean meta-data for all clinical EEG EDF "
-                                                 "files after mass export by Nihon Kohden.")
-    parser.add_argument("--input_path", type=str, required=True, help="Path to all EDF files")
-    parser.add_argument("--output_path", type=str, required=True, help="Path to all EDF files")
-    parser.add_argument("--subject-code", type=str, required=True, help="Subject code (e.g., R1755A)")
-    parser.add_argument("--first-name", type=str, required=True, help="Subject first name (e.g., John)")
-    parser.add_argument("--middle-name", type=str, default='NOT_SPECIFIED',
-            help='Subject middle name or initial (e.g., Paul or P). Can be left blank with "". Multiple middle names should be separated by underscores')
-    parser.add_argument("--last-name", type=str, required=True, help="Subject last name (e.g., Smith)")
-    parser.add_argument("--load-method", type=str, default="edfio",
-                        help="Method to load EDF files: 'edfio', 'pyedflib', or 'mne'")
-    parser.add_argument("--raise-errors", action="store_true",
+    import os
+
+    def prompt_if_missing(args):
+        """Prompt the user interactively for any missing required arguments."""
+
+        # Required fields that must be non-empty
+        required_fields = {
+            "input_path":   "Enter path to all EDF files: ",
+            "subject_code": "Enter subject code (e.g., R1755A): ",
+            "first_name":   "Enter subject first name: ",
+            "last_name":    "Enter subject last name: ",
+        }
+
+        # Prompt for required arguments
+        for attr, prompt in required_fields.items():
+            if getattr(args, attr) in (None, ""):
+                value = input(prompt).strip()
+                setattr(args, attr, value)
+
+        # Middle name: optional, but still prompt if missing
+        # If user presses Enter, leave default "NOT_SPECIFIED"
+        if args.middle_name in (None, "", "NOT_SPECIFIED"):
+            mn = input(
+                "Enter subject middle name(s) "
+                "(use underscores between multiple names; press Enter to skip): "
+            ).strip()
+            if mn:  # Only override default if user typed something
+                args.middle_name = mn
+
+        return args
+
+    parser = argparse.ArgumentParser(
+        description="Rename and clean meta-data for clinical EEG EDF files "
+                    "after mass export by Nihon Kohden."
+    )
+
+    # ---- DO NOT mark required=True; we prompt manually ----
+    parser.add_argument("--input_path", type=str, default='',
+                        help="Path to all EDF files (required)")
+    parser.add_argument("--output_path", type=str, default='',
+                        help="Path to output de-identified EDF files. Must differ "
+                             "from input_path. If not specified, defaults to "
+                             "'deidentified_eeg_files' within input_path.")
+    parser.add_argument("--subject_code", type=str, default='',
+                        help="Subject code (e.g., R1755A) (required)")
+    parser.add_argument("--first_name", type=str, default='',
+                        help="Subject first name (required)")
+    parser.add_argument("--middle_name", type=str, default="NOT_SPECIFIED",
+                        help='Subject middle name(s). Use underscores between '
+                             'multiple middle names. If no middle name, use ""')
+    parser.add_argument("--last_name", type=str, default='',
+                        help="Subject last name (required)")
+    parser.add_argument("--load_method", type=str, default="pyedflib",
+                        help="Method to load EDF files: 'pyedflib', 'edfio', or 'mne'")
+    parser.add_argument("--raise_errors", action="store_true",
                         help="Raise errors instead of warnings for debugging")
-    parser.add_argument("--verbosity", type=int, default=1, help="Enable verbose output")
+    parser.add_argument("--verbosity", type=int, default=1,
+                        help="Enable verbose output")
+
     args = parser.parse_args()
+
+    # Prompt for anything missing (including middle name)
+    args = prompt_if_missing(args)
+
+    # Auto-generate output_path if not supplied
+    if not args.output_path:
+        args.output_path = os.path.join(args.input_path, "deidentified_eeg_files")
+
     return args
 
 
