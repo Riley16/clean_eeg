@@ -14,7 +14,8 @@ DEFAULT_REDACT_HEADER_KEYS = ['patientname', 'sex', 'gender',
                               'admincode','technician']
 REDACT_REPLACEMENT = 'unknown'  # match pyedflib default for missing fields
 MAX_RECORDING_GAP_SECONDS = 60
-MIN_RECORDING_GAP_SECONDS = -2  # allow small overlaps in files
+MIN_RECORDING_GAP_ERROR_SECONDS = -2  # allow small overlaps in files
+MIN_RECORDING_GAP_WARNING_SECONDS = -0.25
 SITE_CODE_TO_INCOMING_FOLDER = {'S': 'UTHSCSA',
                                 'A': 'CUDA',
                                 'H': 'harvard',
@@ -275,19 +276,22 @@ def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0):
         gap = curr_start_time - end_times[prev_filename]
         end_time_prev = end_times[prev_filename]
         continue_input = 'yes'
+        confirm_continue = False
         if gap.total_seconds() > MAX_RECORDING_GAP_SECONDS:
             print(f"WARNING: Gap of {gap} between neighboring recordings:\n"
                   f"{prev_filename} (end: {end_time_prev}) and\n"
                   f"{curr_filename} (start: {curr_start_time}).")
             print('This may indicate missing recording files. Double check no additional recording files are available.')
-            continue_input = input("Continue? yes/no: ")
-        elif gap.total_seconds() < 0:
+            confirm_continue = True
+        elif gap.total_seconds() < MIN_RECORDING_GAP_WARNING_SECONDS:
             print(f"WARNING: Overlap of {abs(gap.total_seconds())} seconds between neighboring recordings:\n"
                   f"{prev_filename} (end: {end_time_prev}) and\n"
                   f"{curr_filename} (start: {curr_start_time}).")
             print('This may indicate corrupted EDF files. Check with the data analysis team.')
-            if gap.total_seconds() < MIN_RECORDING_GAP_SECONDS:
-                continue_input = input("Continue? yes/no: ")
+            if gap.total_seconds() < MIN_RECORDING_GAP_ERROR_SECONDS:
+                confirm_continue = True
+        if confirm_continue:
+            continue_input = input("Continue? yes/no: ")
         if continue_input.lower() not in ['yes', 'y']:
             raise RuntimeError("Aborting EDF de-identification conversion due to recording gap.")
 
