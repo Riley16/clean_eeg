@@ -214,9 +214,7 @@ def _load_edf_metadata(input_path: str,
                        convert_to_edfC: bool = True,
                        raise_errors: bool = False):
     EDF_meta_data = dict()
-    if verbosity > 0:
-        print(f"Loading EDF meta-data...")
-    for filename in tqdm(os.listdir(input_path)):
+    for filename in tqdm(os.listdir(input_path), desc="Loading EDF meta-data..."):
         try:
             if filename.lower().endswith('.edf'):
                 full_path = os.path.join(input_path, filename)
@@ -270,13 +268,13 @@ def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0):
         end_time = start_time + timedelta(seconds=file_duration)
         end_times[filename] = end_time
     start_times.sort(key=lambda x: x[1])  # sort by datetime
+    continue_input = 'yes'
+    confirm_continue = False
     for i in range(1, len(start_times)):
         prev_filename, _ = start_times[i-1]
         curr_filename, curr_start_time = start_times[i]
         gap = curr_start_time - end_times[prev_filename]
         end_time_prev = end_times[prev_filename]
-        continue_input = 'yes'
-        confirm_continue = False
         if gap.total_seconds() > MAX_RECORDING_GAP_SECONDS:
             print(f"WARNING: Gap of {gap} between neighboring recordings:\n"
                   f"{prev_filename} (end: {end_time_prev}) and\n"
