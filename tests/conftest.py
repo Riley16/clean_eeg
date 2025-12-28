@@ -6,7 +6,6 @@ from clean_eeg.paths import TEST_DATA_DIR, TEST_CONFIG_FILE, TEST_SUBJECT_DATA_D
 
 @pytest.fixture(scope="session", autouse=True)
 def ensure_test_data():
-    print('Checking for test EDF data files...')
     TEST_DATA_DIR.mkdir(exist_ok=True)
     TEST_SUBJECT_DATA_DIR.mkdir(exist_ok=True)
     # Only regenerate if missing
@@ -24,7 +23,6 @@ def ensure_test_data():
             path = TEST_DATA_DIR / edf_config['filename']
         if not path.exists():
             from .generate_edf import run_generate_test_edf
-            print(path)
             print('Generating test EDF data files on first test run...')
             run_generate_test_edf()
             print('Finished generating test EDF data files on first test run.')

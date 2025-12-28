@@ -220,7 +220,7 @@ def print_edf_file_type(input_file: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Load an EDF file using pyedflib or MNE.")
     parser.add_argument("--path", type=str, required=True, help="Path to EDF file")
-    parser.add_argument("--load-method", type=str, default="edfio", help="Method to load EDF files: 'edfio', 'pyedflib', or 'mne'")
+    parser.add_argument("--load-method", type=str, default="pyedflib", help="Method to load EDF files: 'edfio', 'pyedflib', or 'mne'")
     parser.add_argument("--lazy-load", action="store_true", help="Preload EEG into memory")
     parser.add_argument("--raise-errors", action="store_true", help="Raise errors instead of warnings for debugging")
     parser.add_argument("--verbosity", type=int, default=1, help="Enable verbose output")

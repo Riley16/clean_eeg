@@ -101,10 +101,9 @@ def format_edf_config_json(config_json):
         dict: Formatted configuration with 'header' and 'signal_headers'.
     """
     formatted_config = {
-        'header': config_json.get('pyedflib_header'),
-        'signal_headers': config_json.get('pyedflib_signal_headers')
+        'header': config_json['pyedflib_header'],
+        'signal_headers': config_json['pyedflib_signal_headers']
     }
-
     startdate = formatted_config['header']['startdate']
     timestamp_format = config_json['timestamp_format']
     formatted_config['header']['startdate'] = datetime.strptime(startdate, timestamp_format)
@@ -133,6 +132,11 @@ def run_generate_test_edf(output=''):
         generate_test_edf_from_config(edf_config, path=path)
         print(f"EDF file generated at: {path}")
 
+        config_key = 'basic_EDF+C_modified'
+        edf_config = test_config.get(config_key)
+        path = TEST_DATA_DIR / edf_config['filename']
+        generate_test_edf_from_config(edf_config, path=path)
+
         # merge existing EDF files into a test discontinuous EDF+D file
         generate_discontinuous_edf_from_config(edf_config=test_config.get('basic_EDF+D'))
         generate_discontinuous_edf_from_config(edf_config=test_config.get('continuous_EDF+D'))
@@ -141,7 +145,8 @@ def run_generate_test_edf(output=''):
         if not os.path.exists(TEST_SUBJECT_DATA_DIR):
             os.makedirs(TEST_SUBJECT_DATA_DIR)
 
-        for config_key in ['subject_EDF+C_1', 'subject_EDF+C_2']:
+        for config_key in ['subject_EDF+C_1',
+                           'subject_EDF+C_2']:
             edf_config = test_config.get(config_key)
             path = TEST_SUBJECT_DATA_DIR / edf_config['filename']
             generate_test_edf_from_config(edf_config, path=path)
