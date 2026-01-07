@@ -3,6 +3,8 @@ from typing import Dict, List, Union
 from copy import deepcopy
 import datetime
 import os
+import re
+import numpy as np
 import pyedflib
 
 
@@ -121,16 +123,45 @@ def clean_header(header: dict, raise_errors: bool) -> dict:
     return header
 
 
-def update_edf_annotations_inplace(edf_path,
-                                   updated_annotations,
-                                   verbosity: int = 0):
-    # scan through EDF and overwrite annotation texts in place
-    # require annotation record length remains unchanged
+def create_annotations_only_edf(path: str,
+                                header: dict,
+                                annotations: tuple[List[float], List[float], List[str]],
+                                validate: bool = True) -> None:
+    """Create a minimal EDF file containing only annotations."""
+    with pyedflib.EdfWriter(file_name=path,
+                            n_channels=0,
+                            file_type=pyedflib.FILETYPE_EDFPLUS) as f:
+        f.setHeader(header)
+        for time, duration, text in zip(*annotations):
+            f.writeAnnotation(time, duration, text)
 
-    updated_ann_onsets, updated_ann_durations, updated_ann_texts = updated_annotations
+    if validate:
+        with pyedflib.EdfReader(path) as f:
+            annotations_rewrite = f.readAnnotations()
+            assert np.all(annotations_rewrite[0] == annotations[0]), "Annotation onsets mismatch after rewrite"
+            assert np.all(annotations_rewrite[1] == annotations[1]), "Annotation durations mismatch after rewrite"
+            assert np.all(np.logical_or(annotations_rewrite[2] == annotations[2], 
+                                        [bool(re.match(r'^[Xx]+$', ann)) for ann in annotations_rewrite[2]])), "Annotation texts mismatch after rewrite"
+            header_rewrite = f.getHeader()
+            # Compare headers field by field, allowing 'x*' patterns to match empty strings
+            for field in header:
+                original_value = header[field]
+                rewrite_value = header_rewrite[field]
+                
+                # For string fields, allow 'x*' pattern to match empty string
+                if isinstance(original_value, str) and isinstance(rewrite_value, str):
+                    if bool(re.match(r'^[Xx]+$', original_value)) and rewrite_value == '':
+                        continue
+                
+                if original_value != rewrite_value:
+                    raise AssertionError(f"Header field '{field}' mismatch: original='{original_value}', rewrite='{rewrite_value}'")
 
-    ann_signal_index = get_annotation_signal_header_index(edf_path)
-    signal_record_lengths = get_signal_header_fields(edf_path, field='num_samples')
+
+def clear_edf_annotations_inplace(path, validate: bool = True):
+    # blank out EDF annotation texts in-inplace
+
+    ann_signal_index = get_annotation_signal_header_index(path)
+    signal_record_lengths = get_signal_header_fields(path, field='num_samples')
     for i in range(len(signal_record_lengths)):
         signal_record_lengths[i] *= 2  # 2 bytes per sample
     ann_record_length = signal_record_lengths[ann_signal_index]
@@ -138,30 +169,33 @@ def update_edf_annotations_inplace(edf_path,
     total_records_length = sum(signal_record_lengths)
 
     n_signals = len(signal_record_lengths)
-    n_records = get_header_field(edf_path, 'num_data_records')
-
-    print(ann_record_length, total_records_length)
-    print(list(zip(updated_ann_onsets, updated_ann_durations, updated_ann_texts)))
+    n_records = get_header_field(path, 'num_data_records')
 
     # get annotation record bytes
-    with open(edf_path, "r+b") as f:
+    with open(path, "r+b") as f:
         for i in range(n_records):
-            f.seek(TOTAL_HEADER_BYTES + SIGNAL_HEADER_BYTES * n_signals + total_records_length * i + ann_record_offset)
+            annotation_record_offset = TOTAL_HEADER_BYTES + SIGNAL_HEADER_BYTES * n_signals + total_records_length * i + ann_record_offset
+            f.seek(annotation_record_offset)
             ann_record_bytes = f.read(ann_record_length)
-            print(f'Record {i}:')
-            print(ann_record_bytes)
-            # how can I parse bytes, even for unprintable characters out of ascii range for debugging?
-            print(ann_record_bytes.decode('ascii'))
-            ann_onsets, ann_durations, ann_texts = parse_edf_annotation_record(ann_record_bytes)
-            print('Parsed annotations:')
-            for onset, dur, text in zip(ann_onsets, ann_durations, ann_texts):
-                print(f'  {onset}, {dur}, {text}')
 
-    print(#f"EDF has {n_records} data records; "
-          f"annotation signal index = {ann_signal_index}; "
-        #   f"n_records = {n_records}; "
-        #   f"annotation record length = {ann_record_length}"
-    )
+            # blank out annotation texts after time-keeping annotations
+            # first annotation after time-keeping must be empty, so 2 x14 bytes in a row separate 
+            # time-keeping from first annotation in each record
+            EDF_TAL_TIMEKEEPING_DELIMITER = b'\x14\x14'
+            time_keeping_offset = ann_record_bytes.find(EDF_TAL_TIMEKEEPING_DELIMITER) + len(EDF_TAL_TIMEKEEPING_DELIMITER)
+            assert time_keeping_offset >= 4, "No time-keeping annotation found"
+            blanked_record_bytes = (ann_record_bytes[:time_keeping_offset] +
+                                    b'\x00' * (len(ann_record_bytes) - time_keeping_offset))
+            f.seek(annotation_record_offset)
+            f.write(blanked_record_bytes)
+    
+    # confirm the resulting EDF still loads and has no text annotations
+    if validate:
+        with pyedflib.EdfReader(path) as f:
+            _, _, ann_texts = f.readAnnotations()
+            assert len(ann_texts) == 0, "Annotations found after clearing"
+
+
 
 TOTAL_HEADER_BYTES = 256
 SIGNAL_HEADER_BYTES = 256
@@ -243,100 +277,6 @@ def get_annotation_signal_header_index(edf_path):
         if label.lower() == 'edf annotations':
             return i
     raise ValueError("No annotation signal found in EDF")
-
-
-def parse_edf_annotation_record(record_bytes):
-    """Parse EDF+ annotation record bytes into onsets, durations, and texts.
-    
-    According to EDF+ standard section 2.2.2:
-    - Each TAL (Time-stamped Annotation List) has format: +onset[\x15duration]\x14[annotation\x14]*\x00
-    - \x15 (byte 21) separates onset and duration (duration is optional)
-    - \x14 (byte 20) separates timestamp from annotations and between annotations
-    - \x00 (byte 0) ends each TAL
-    - Characters are stored as consecutive bytes
-    - One annotation record can contain multiple TALs
-    - Each TAL can contain multiple annotation texts sharing the same onset/duration
-    
-    Args:
-        record_bytes: Byte array containing one annotation data record
-        
-    Returns:
-        Tuple of (onsets, durations, texts) lists
-    """
-    ann_onsets = []
-    ann_durations = []
-    ann_texts = []
-    
-    # Convert bytes to string, stopping at first consecutive nulls (padding)
-    content = record_bytes.decode('latin-1')  # Use latin-1 to preserve all byte values
-    
-    # Find first null byte - everything after is padding
-    null_pos = content.find('\x00')
-    if null_pos == -1:
-        null_pos = len(content)
-
-    print('null_pos:', null_pos)
-    
-    i = 0
-    while i < null_pos:
-        # Each TAL starts with onset (+ or -)
-        if content[i] not in ('+', '-'):
-            break
-            
-        # Parse onset: +/- followed by digits and optional decimal point
-        onset_start = i
-        i += 1
-        while i < len(content) and content[i] not in ('\x14', '\x15', '\x00'):
-            i += 1
-        
-        if i >= len(content):
-            break
-            
-        onset_str = content[onset_start:i]
-        try:
-            onset = float(onset_str)
-        except ValueError:
-            break
-        
-        # Parse optional duration (after \x15)
-        duration = -1.0  # Default when duration not specified
-        if i < len(content) and content[i] == '\x15':
-            i += 1
-            duration_start = i
-            while i < len(content) and content[i] not in ('\x14', '\x00'):
-                i += 1
-            duration_str = content[duration_start:i]
-            if duration_str:
-                try:
-                    duration = float(duration_str)
-                except ValueError:
-                    duration = -1.0
-        
-        # Now we should be at \x14 before annotations
-        if i >= len(content) or content[i] != '\x14':
-            break
-            
-        # Parse all annotation texts in this TAL (until \x00)
-        # Format: \x14text1\x14text2\x14...\x00
-        while i < len(content) and content[i] == '\x14':
-            i += 1  # Skip \x14
-            text_start = i
-            while i < len(content) and content[i] not in ('\x14', '\x00'):
-                i += 1
-            text = content[text_start:i]
-            
-            # Add non-empty annotations (first annotation in TAL is often empty for time-keeping)
-            if text:
-                ann_onsets.append(onset)
-                ann_durations.append(duration)
-                ann_texts.append(text)
-            
-            # Check if TAL ends (\x00)
-            if i < len(content) and content[i] == '\x00':
-                i += 1  # Move past \x00 to next TAL
-                break
-
-    return ann_onsets, ann_durations, ann_texts
 
 
 def read_header_raw_bytes(edf_path):

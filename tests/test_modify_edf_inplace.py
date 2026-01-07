@@ -1,10 +1,13 @@
 import shutil
+from typing import Any
+import numpy as np
 
 import pyedflib
 import pytest
 
 from clean_eeg.modify_edf_inplace import (
-    update_edf_annotations_inplace,
+    clear_edf_annotations_inplace,
+    create_annotations_only_edf,
     update_edf_header_inplace,
     read_header_raw_bytes,
     # redact_edf_annotations_inplace,
@@ -48,8 +51,6 @@ def test_inplace_noop_header_and_annotations(base_edf, tmp_path):
                               orig_hdr,
                               signal_header_updates=orig_signal_headers)
 
-    # Apply in-place annotation redaction with identity function
-    # redact_edf_annotations_inplace(copy_path, redact_fn=lambda s: s, verbose=False)
 
     with open(orig_path, "rb") as f1, open(copy_path, "rb") as f2:
         orig_bytes = f1.read()
@@ -95,7 +96,7 @@ def _update_annotation_text(text: str) -> str:
 # Helper: rewrite EDF from scratch with pyedflib
 # ======================
 
-def rewrite_edf_with_updates(orig_path: str, new_path: str, header_updates: dict) -> None:
+def rewrite_edf_with_updates(orig_path: str, new_path: str, header_updates: dict) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """
     Read an EDF, apply simple transformations to header string fields
     and annotation texts, and write a new EDF from scratch using pyedflib.
@@ -157,6 +158,7 @@ def test_inplace_vs_rewrite_semantic_equality(base_edf, tmp_path, header_updates
     """
     orig = base_edf
     inplace_path = str(tmp_path / "inplace.edf")
+    annotation_edf_path = str(tmp_path / "annotations.edf")
     rewrite_path = str(tmp_path / "rewrite.edf")
 
     shutil.copyfile(orig, inplace_path)
@@ -173,10 +175,14 @@ def test_inplace_vs_rewrite_semantic_equality(base_edf, tmp_path, header_updates
                               signal_header_updates=signal_header_updates,
                               confirm_signals_unchanged=True)
     
-    # update_edf_annotations_inplace(inplace_path, updated_annotations)
+    create_annotations_only_edf(annotation_edf_path,
+                                header_updates,
+                                updated_annotations)
+    clear_edf_annotations_inplace(inplace_path)
 
     # ---- Compare semantic equality (header, signals, annotations) ----
     rin = pyedflib.EdfReader(inplace_path)
+    r_annotation = pyedflib.EdfReader(annotation_edf_path)
     rre = pyedflib.EdfReader(rewrite_path)
     rmodified = pyedflib.EdfReader(ORIGINAL_MODIFIED_EDF_PATH)
     try:
@@ -206,24 +212,24 @@ def test_inplace_vs_rewrite_semantic_equality(base_edf, tmp_path, header_updates
             assert all(sig_in == sig_modified)
 
         # Compare annotations (onset, duration, text)
-        o_in, d_in, t_in = rin.readAnnotations()
+        o_ann, d_ann, t_ann = r_annotation.readAnnotations()
         o_re, d_re, t_re = rre.readAnnotations()
 
-        o_in = list(o_in)
-        d_in = list(d_in)
-        t_in = list(t_in)
+        o_ann = list(o_ann)
+        d_ann = list(d_ann)
+        t_ann = list(t_ann)
         o_re = list(o_re)
         d_re = list(d_re)
         t_re = list(t_re)
 
-        assert o_in == o_re
-        assert d_in == d_re
-        assert t_in == t_re
+        assert o_ann == o_re
+        assert d_ann == d_re
+        assert t_ann == t_re
 
     finally:
         rin.close()
         rre.close()
-
+        r_annotation.close()
     # confirm signals of inplace and original (not rewritten) EDF are identical
     rin_orig = pyedflib.EdfReader(orig)
     rin_inplace = pyedflib.EdfReader(inplace_path)
