@@ -11,7 +11,7 @@ from clean_eeg.modify_edf_inplace import (
     # _EDF_HEADER_FIELDS,  # used for length checks
 )
 from clean_eeg.paths import TEST_DATA_DIR
-from .generate_edf import format_edf_config_json
+from .generate_edf import format_edf_config_json, DEFAULT_NUMBER_SIGNALS
 
 
 @pytest.fixture
@@ -22,6 +22,7 @@ def base_edf(tmp_path):
     shutil.copyfile(str(source_path), str(test_path))
     return str(test_path)
 
+ORIGINAL_MODIFIED_EDF_PATH = str(TEST_DATA_DIR / "basic_EDF_C_modified.edf")
 
 # ======================
 # Test 1: no-op rewrite
@@ -40,9 +41,12 @@ def test_inplace_noop_header_and_annotations(base_edf, tmp_path):
     # is a strict no-op.
     with pyedflib.EdfReader(orig_path) as f:
         orig_hdr = f.getHeader()
+        orig_signal_headers = [f.getSignalHeader(i) for i in range(f.signals_in_file)]
 
     # Apply in-place header rewrite (no-op content-wise)
-    update_edf_header_inplace(copy_path, orig_hdr)
+    update_edf_header_inplace(copy_path,
+                              orig_hdr,
+                              signal_header_updates=orig_signal_headers)
 
     # Apply in-place annotation redaction with identity function
     # redact_edf_annotations_inplace(copy_path, redact_fn=lambda s: s, verbose=False)
@@ -64,11 +68,23 @@ def load_edf_test_config(config_key):
 
 
 @pytest.fixture
-def field_mappings():
+def header_updates():
     """Test fixture providing input-output mappings for field modifications."""
     modified_edf_config = load_edf_test_config("basic_EDF+C_modified")
     modified_edf_config = format_edf_config_json(modified_edf_config)
     return modified_edf_config['header']
+
+@pytest.fixture
+def signal_header_updates():
+    modified_edf_config = load_edf_test_config("basic_EDF+C_modified")
+    modified_edf_config = format_edf_config_json(modified_edf_config)
+    signal_header = modified_edf_config['signal_headers']
+    signal_header_updates = list()
+    for i in range(DEFAULT_NUMBER_SIGNALS):
+        updated_signal_header = dict(signal_header)
+        updated_signal_header['label'] += f'_{i + 1}'
+        signal_header_updates.append(updated_signal_header)
+    return signal_header_updates
 
 
 def _update_annotation_text(text: str) -> str:
@@ -79,7 +95,7 @@ def _update_annotation_text(text: str) -> str:
 # Helper: rewrite EDF from scratch with pyedflib
 # ======================
 
-def rewrite_edf_with_updates(orig_path: str, new_path: str, field_mappings: dict) -> None:
+def rewrite_edf_with_updates(orig_path: str, new_path: str, header_updates: dict) -> None:
     """
     Read an EDF, apply simple transformations to header string fields
     and annotation texts, and write a new EDF from scratch using pyedflib.
@@ -97,12 +113,11 @@ def rewrite_edf_with_updates(orig_path: str, new_path: str, field_mappings: dict
         r.close()
 
     updated_header = dict(main_header)
-    for field, value in field_mappings.items():
+    for field, value in header_updates.items():
         if value is not None:
             updated_header[field] = value
 
-    updated_ann_texts = ann_texts
-    # updated_ann_texts = [_update_annotation_text(t) for t in ann_texts]
+    updated_ann_texts = [_update_annotation_text(t) for t in ann_texts]
 
     w = pyedflib.EdfWriter(
         new_path,
@@ -117,18 +132,20 @@ def rewrite_edf_with_updates(orig_path: str, new_path: str, field_mappings: dict
             w.writeAnnotation(onset, dur, txt)
     finally:
         w.close()
+    
+    return ann_onsets, ann_durations, updated_ann_texts
 
 
 # ======================
 # Test 2: real updates
 # ======================
 
-def test_inplace_vs_rewrite_semantic_equality(base_edf, tmp_path, field_mappings):
+def test_inplace_vs_rewrite_semantic_equality(base_edf, tmp_path, header_updates, signal_header_updates):
     """
     Copy an EDF, update all main-header string fields and all annotation texts
     in two ways:
 
-      1) In-place, using update_edf_main_header_inplace + redact_edf_annotations_inplace
+      1) In-place, using update_edf_header_inplace + update_edf_annotations_inplace
       2) By rewriting a new EDF from scratch with pyedflib
 
     Then compare:
@@ -143,36 +160,25 @@ def test_inplace_vs_rewrite_semantic_equality(base_edf, tmp_path, field_mappings
     rewrite_path = str(tmp_path / "rewrite.edf")
 
     shutil.copyfile(orig, inplace_path)
+    print(inplace_path)
 
     # print('Original header in EDF config:')
     # print(load_edf_test_config("basic_EDF+C")['pyedflib_header'])
 
     # ---- Rewrite-with-updates path ----
-    rewrite_edf_with_updates(orig, rewrite_path, field_mappings)
-
-    # Compare signals just before inplace update
-    # TODO: fix differences in rewritten signals
-    # rin = pyedflib.EdfReader(inplace_path)
-    # rre = pyedflib.EdfReader(rewrite_path)
-    # for i in range(rin.signals_in_file):
-    #     sig_in = rin.readSignal(i)
-    #     sig_re = rre.readSignal(i)
-    #     print(f"Comparing signal {i} before inplace update")
-    #     # assert all(sig_in == sig_re)
-    #     if not all(sig_in == sig_re):
-    #         print(f"Signal {i} differs before inplace update")
+    updated_annotations = rewrite_edf_with_updates(orig, rewrite_path, header_updates)
 
     update_edf_header_inplace(inplace_path,
-                              field_mappings,
+                              header_updates,
+                              signal_header_updates=signal_header_updates,
                               confirm_signals_unchanged=True)
-
-    # update_edf_annotations_inplace(inplace_path,
-    #                                updated_annotations=(1, 2, 3),
-    #                                verbosity=0)
+    
+    # update_edf_annotations_inplace(inplace_path, updated_annotations)
 
     # ---- Compare semantic equality (header, signals, annotations) ----
     rin = pyedflib.EdfReader(inplace_path)
     rre = pyedflib.EdfReader(rewrite_path)
+    rmodified = pyedflib.EdfReader(ORIGINAL_MODIFIED_EDF_PATH)
     try:
         # Compare number of signals and records
         assert rin.signals_in_file == rre.signals_in_file
@@ -184,12 +190,20 @@ def test_inplace_vs_rewrite_semantic_equality(base_edf, tmp_path, field_mappings
         for key in hin:
             assert hin.get(key) == hre.get(key)
 
+        # compare signal headers
+        for i in range(rin.signals_in_file):
+            sh_in = rin.getSignalHeader(i)
+            sh_modified = rmodified.getSignalHeader(i)
+            for key in sh_in:
+                assert sh_in.get(key) == sh_modified.get(key)
+
         # Compare signals
-        # TODO: fix rewritten signals, which differ from original 
-        # for i in range(rin.signals_in_file):
-        #     sig_in = rin.readSignal(i)
-        #     sig_re = rre.readSignal(i)
-        #     assert all(sig_in == sig_re)
+        # for an unknown reason the rewritten EDF has slightly different signal values,
+        # so we instead compare against modified EDF file generated directly from config
+        for i in range(rin.signals_in_file):
+            sig_in = rin.readSignal(i)
+            sig_modified = rmodified.readSignal(i)
+            assert all(sig_in == sig_modified)
 
         # Compare annotations (onset, duration, text)
         o_in, d_in, t_in = rin.readAnnotations()

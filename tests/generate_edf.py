@@ -7,6 +7,8 @@ import lunapi as lp
 from clean_eeg.paths import TEST_DATA_DIR, TEST_SUBJECT_DATA_DIR, INCONSISTENT_SUBJECT_DATA_DIR
 from clean_eeg.load_eeg import RESERVED_FIELD_EDF_HEADER_BYTE_OFFSET
 
+DEFAULT_NUMBER_SIGNALS = 2
+
 
 def generate_test_edf(header, signal_headers, filename='sinusoidal_continuous_file.edf'):
     # generate EDF files for testing that include a few sinusoidal oscillations, values for all header meta-data, and a few annotations
@@ -41,7 +43,7 @@ def generate_test_edf(header, signal_headers, filename='sinusoidal_continuous_fi
             f.writeAnnotation(time, duration, text)
 
 
-def generate_test_edf_from_config(config_dict, path, n_signals=2):
+def generate_test_edf_from_config(config_dict, path, n_signals=DEFAULT_NUMBER_SIGNALS):
     """
     Generate a test EDF file based on the provided configuration dictionary.
 
