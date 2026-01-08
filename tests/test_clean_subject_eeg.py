@@ -1,5 +1,7 @@
 import numpy as np
 import os
+import shutil
+import pytest
 
 from clean_eeg.clean_subject_eeg import remove_gendered_pronouns, _GENDERED_PRONOUNS, BASE_START_DATE,\
         DEFAULT_REDACT_HEADER_KEYS, REDACT_REPLACEMENT, REDACT_PRONOUN_REPLACEMENT, clean_subject_edf_files
@@ -13,8 +15,8 @@ import json
 with open(TEST_CONFIG_FILE, 'r') as f:
     TEST_CONFIG = json.load(f)
 BASIC_EDF_PATH = str(TEST_DATA_DIR / TEST_CONFIG["basic_EDF+C"]['filename'])
-SUBJECT_EDF_PATH1 = str(TEST_DATA_DIR / TEST_CONFIG["subject_EDF+C_1"]['filename'])
-SUBJECT_EDF_PATH2 = str(TEST_DATA_DIR / TEST_CONFIG["subject_EDF+C_2"]['filename'])
+SUBJECT_EDF_PATH1 = str(TEST_SUBJECT_DATA_DIR / TEST_CONFIG["subject_EDF+C_1"]['filename'])
+SUBJECT_EDF_PATH2 = str(TEST_SUBJECT_DATA_DIR / TEST_CONFIG["subject_EDF+C_2"]['filename'])
 
 
 def test_remove_gendered_pronouns_basic():
@@ -101,8 +103,8 @@ def test_deidentify_edf():
     new_annotations = new_data['annotations']
     assert new_annotations[2][2] == REDACT_PRONOUN_REPLACEMENT + ' ' + REDACT_NAME_REPLACEMENT
 
-
-def test_clean_subject_edf_files(monkeypatch):
+@pytest.mark.parametrize("inplace", [False, True])
+def test_clean_subject_edf_files(monkeypatch, inplace):
     responses = iter(["y"])  # answers in sequence
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
 
@@ -112,11 +114,20 @@ def test_clean_subject_edf_files(monkeypatch):
     output_path = TEST_SUBJECT_DATA_DIR / 'temp_clean_output'
     if not output_path.exists():
         os.makedirs(output_path)
+    elif inplace:
+        # for inplace, clear out existing files in output_path
+        for f in os.listdir(output_path):
+            os.remove(os.path.join(output_path, f))
+
+    if inplace:
+        shutil.copyfile(SUBJECT_EDF_PATH1, os.path.join(output_path, os.path.basename(SUBJECT_EDF_PATH1)))
+        shutil.copyfile(SUBJECT_EDF_PATH2, os.path.join(output_path, os.path.basename(SUBJECT_EDF_PATH2)))
     
     clean_subject_edf_files(subject_name=PATIENT_NAME,
                             subject_code=SUBJECT_CODE,
-                            input_path=str(TEST_SUBJECT_DATA_DIR),
-                            output_path=str(output_path))
+                            input_path=str(TEST_SUBJECT_DATA_DIR) if not inplace else str(output_path),
+                            output_path=str(output_path),
+                            inplace=inplace)
     
     # check that file was created
     filename_no_ext1 = Path(SUBJECT_EDF_PATH1).stem
@@ -127,7 +138,7 @@ def test_clean_subject_edf_files(monkeypatch):
         clean_full_path = os.path.join(output_path, clean_filename)
         assert os.path.exists(clean_full_path), 'Cleaned EDF file was not created: ' + clean_full_path
         os.remove(clean_full_path)
-    os.rmdir(output_path)
+    shutil.rmtree(output_path)
 
 
 def test_clean_subject_edf_files_w_large_gap(monkeypatch):

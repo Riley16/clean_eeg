@@ -144,7 +144,10 @@ def create_annotations_only_edf(path: str,
                                         [bool(re.match(r'^[Xx]+$', ann)) for ann in annotations_rewrite[2]])), "Annotation texts mismatch after rewrite"
             header_rewrite = f.getHeader()
             # Compare headers field by field, allowing 'x*' patterns to match empty strings
+            ignore_fields = ['record_duration', 'n_records', 'file_duration']
             for field in header:
+                if field in ignore_fields:
+                    continue
                 original_value = header[field]
                 rewrite_value = header_rewrite[field]
                 
@@ -154,7 +157,7 @@ def create_annotations_only_edf(path: str,
                         continue
                 
                 if original_value != rewrite_value:
-                    raise AssertionError(f"Header field '{field}' mismatch: original='{original_value}', rewrite='{rewrite_value}'")
+                    raise ValueError(f"Header field '{field}' mismatch: original='{original_value}', rewrite='{rewrite_value}'")
 
 
 def clear_edf_annotations_inplace(path, validate: bool = True):

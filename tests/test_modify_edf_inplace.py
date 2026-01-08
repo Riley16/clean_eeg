@@ -1,17 +1,13 @@
 import shutil
-from typing import Any
 import numpy as np
 
 import pyedflib
 import pytest
 
 from clean_eeg.modify_edf_inplace import (
+    update_edf_header_inplace,
     clear_edf_annotations_inplace,
     create_annotations_only_edf,
-    update_edf_header_inplace,
-    read_header_raw_bytes,
-    # redact_edf_annotations_inplace,
-    # _EDF_HEADER_FIELDS,  # used for length checks
 )
 from clean_eeg.paths import TEST_DATA_DIR
 from .generate_edf import format_edf_config_json, DEFAULT_NUMBER_SIGNALS

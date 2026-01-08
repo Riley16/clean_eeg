@@ -1,5 +1,6 @@
 import re
 import os
+import shutil
 import numpy as np
 from copy import deepcopy
 from typing import Union
@@ -7,12 +8,15 @@ from datetime import datetime, timedelta
 from tqdm import tqdm
 from clean_eeg.anonymize import redact_subject_name, PersonalName
 from clean_eeg.load_eeg import load_edf, write_edf_pyedflib
+from clean_eeg.modify_edf_inplace import (
+    update_edf_header_inplace,
+    clear_edf_annotations_inplace,
+    create_annotations_only_edf,
+)
 
 BASE_START_DATE = datetime(1985, 1, 1)
-DEFAULT_REDACT_HEADER_KEYS = ['patientname', 'sex', 'gender',
-                              'patient_additional',
-                              'admincode','technician']
-REDACT_REPLACEMENT = 'unknown'  # match pyedflib default for missing fields
+DEFAULT_REDACT_HEADER_KEYS = ['patientname', 'sex', 'gender', 'patient_additional']
+REDACT_REPLACEMENT = 'X'  # match pyedflib default for missing field
 MAX_RECORDING_GAP_SECONDS = 60
 MIN_RECORDING_GAP_ERROR_SECONDS = -2  # allow small overlaps in files
 MIN_RECORDING_GAP_WARNING_SECONDS = -0.25
@@ -59,12 +63,14 @@ def deidentify_edf_header(header: dict,
                           earliest_recording_start_time: Union[datetime,None]=None,
                           redact_keys: list[str]=DEFAULT_REDACT_HEADER_KEYS):
     header = deepcopy(header)
+    is_signal_header = 'label' in header
     if earliest_recording_start_time is None:
         assert 'startdate' not in header
     else:
         header['startdate'] = deidentify_start_date_time(header['startdate'],
                                                          earliest_recording_start_time)
-    header['birthdate'] = datetime(1900, 1, 1)
+    if not is_signal_header:
+        header['birthdate'] = '01 jan 1900'
     for key in redact_keys:
         header[key] = REDACT_REPLACEMENT
     header['patientcode'] = subject_code
@@ -162,19 +168,24 @@ def clean_subject_edf_files(
     subject_name: Union[PersonalName, None] = None,
     load_method: str = "pyedflib",
     raise_errors: bool = False,
+    inplace: bool = False,
     verbosity: int = 1,
 ):
+    if inplace:
+        assert input_path == output_path, "For inplace cleaning, input_path must equal output_path."
     EDF_meta_data = _load_edf_metadata(input_path=input_path,
-                                       load_method=load_method,
                                        verbosity=verbosity,
+                                       load_method=load_method,
                                        raise_errors=raise_errors)
 
     _validate_EDF_meta_data(EDF_meta_data, subject_name=subject_name, verbosity=verbosity)
     min_start_time = _get_start_time_earliest_recording(EDF_meta_data, verbosity=verbosity)
 
     # de-identify EDF files and save out
+    print("Cleaning EDF files... Saving to output path:", output_path)
     for filename, _ in tqdm(EDF_meta_data.items()):
-        edf = load_edf(os.path.join(input_path, filename), load_method='pyedflib', preload=True)
+        input_file_path = os.path.join(input_path, filename)
+        edf = load_edf(input_file_path, load_method=load_method, preload=True)
         assert isinstance(edf, dict)
         edf = deidentify_edf(
             edf_data=edf,
@@ -189,8 +200,24 @@ def clean_subject_edf_files(
         subject_val = subject_code
         clean_filename = f"{filename_no_ext}_{subject_val}_{clean_start_time.strftime('%Y.%m.%d__%H:%M:%S')}.edf"
         clean_full_path = os.path.join(output_path, clean_filename)
-        write_edf_pyedflib(edf, clean_full_path)
-        print(f"Saved cleaned EDF file as {clean_filename}")
+        if inplace:
+            shutil.move(input_file_path, clean_full_path)
+            clean_annotations_path = str(clean_full_path).replace('.edf', '_annotations.edf')
+            print(edf.keys())
+            print(edf['header'])
+            print(edf['signal_headers'])
+            print(edf['annotations'])
+
+            create_annotations_only_edf(clean_annotations_path,
+                                        header=edf['header'],
+                                        annotations=edf['annotations'])
+            update_edf_header_inplace(clean_full_path,
+                                      header_updates=edf['header'],
+                                      signal_header_updates=edf['signal_headers'])
+            clear_edf_annotations_inplace(clean_full_path)
+        else:
+            write_edf_pyedflib(edf, clean_full_path)
+        print(f"Cleaned EDF file at: {clean_filename}")
     print("Done cleaning EDF files. Saved to output path:", output_path)
     site_code = subject_code[-1]  # last character of subject code is site code
     site_code_incoming_folder = SITE_CODE_TO_INCOMING_FOLDER.get(site_code, 'UNKNOWN_SITE')
