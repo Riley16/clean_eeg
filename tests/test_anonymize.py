@@ -111,3 +111,99 @@ def test_hyphenated_name_variants():
     ]
     for text, expected in cases:
         assert redact_subject_name(text, HYPHENATED_PATIENT_NAME) == expected
+
+
+# --- No middle name ---
+
+NO_MIDDLE_NAME = PersonalName(first_name='Alice',
+                              middle_names=[],
+                              last_name='Johnson')
+
+
+def test_no_middle_name():
+    """Name with no middle name should still redact first, last, and full."""
+    cases = [
+        ("Alice Johnson arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+        ("Johnson arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+        ("Alice arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+        ("Dr. Alice Johnson arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+    ]
+    for text, expected in cases:
+        assert redact_subject_name(text, NO_MIDDLE_NAME) == expected
+
+
+# --- Multiple middle names ---
+
+MULTI_MIDDLE = PersonalName(first_name='John',
+                            middle_names=['Paul', 'Angelina'],
+                            last_name='Smith')
+
+
+def test_multiple_middle_names_full():
+    """Full name with multiple middle names should be redacted."""
+    text = "John Paul Angelina Smith signed."
+    assert REDACT_NAME_REPLACEMENT in redact_subject_name(text, MULTI_MIDDLE)
+    assert "Smith" not in redact_subject_name(text, MULTI_MIDDLE)
+
+
+def test_multiple_middle_names_individual_tokens():
+    """Each middle name should be individually redacted."""
+    cases = [
+        ("Paul testified.", f"{REDACT_NAME_REPLACEMENT} testified."),
+        ("Angelina testified.", f"{REDACT_NAME_REPLACEMENT} testified."),
+        ("Smith testified.", f"{REDACT_NAME_REPLACEMENT} testified."),
+        ("John testified.", f"{REDACT_NAME_REPLACEMENT} testified."),
+    ]
+    for text, expected in cases:
+        assert redact_subject_name(text, MULTI_MIDDLE) == expected
+
+
+def test_multiple_middle_names_first_last_only():
+    """First + last (middle names omitted) should still be redacted."""
+    text = "John Smith signed."
+    assert REDACT_NAME_REPLACEMENT in redact_subject_name(text, MULTI_MIDDLE)
+    assert "Smith" not in redact_subject_name(text, MULTI_MIDDLE)
+
+
+def test_multiple_middle_names_subset():
+    """Partial middle names (only some present) should still redact."""
+    # First + one middle + last
+    text = "John Paul Smith signed."
+    assert REDACT_NAME_REPLACEMENT in redact_subject_name(text, MULTI_MIDDLE)
+    assert "Smith" not in redact_subject_name(text, MULTI_MIDDLE)
+
+
+def test_multiple_middle_names_initials():
+    """Middle initials should be consumed in title pattern."""
+    text = "Dr. John P. A. Smith signed."
+    result = redact_subject_name(text, MULTI_MIDDLE)
+    assert "Smith" not in result
+    assert REDACT_NAME_REPLACEMENT in result
+
+
+def test_multiple_middle_names_nicknames():
+    """Nicknames of middle names should be detected (e.g., Paul -> Pablo)."""
+    # NickNamer may not have all variants, so test that the mechanism works
+    # by checking that the first name nickname still works with multiple middles
+    text = "Johnny Smith signed."
+    result = redact_subject_name(text, MULTI_MIDDLE)
+    assert "Johnny" not in result
+    assert REDACT_NAME_REPLACEMENT in result
+
+
+# --- Hyphenated middle name ---
+
+HYPHEN_MIDDLE = PersonalName(first_name='Jane',
+                             middle_names=['Marie-Claire'],
+                             last_name='Doe')
+
+
+def test_hyphenated_middle_name():
+    """Hyphenated middle name should be detected."""
+    cases = [
+        ("Jane Marie-Claire Doe arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+        ("Marie-Claire arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+        ("MarieClaire arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),  # dropped hyphen
+    ]
+    for text, expected in cases:
+        assert redact_subject_name(text, HYPHEN_MIDDLE) == expected

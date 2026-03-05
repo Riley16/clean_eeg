@@ -125,22 +125,24 @@ class FuzzySubjectNameRecognizer(EntityRecognizer):
         return results
 
 
-def build_title_name_pattern(first_name_token: str, last_name_token: str) -> str:
+def build_title_name_pattern(first_name_token: str, last_name_token: str,
+                             n_middle_names: int = 0) -> str:
     """
     Build a regex that matches:
       [optional title] + First + optional middle initial(s) + Last(+compound) + optional possessive
     Also supports: [optional title] + Last(+compound) (+possessive)
     - allows apostrophes/hyphens in tokens, and treats them as optional where present
-    - middle initials: one or two single-letter tokens with optional dot
+    - middle initials: single-letter tokens with optional dot
     - spacing between parts can be zero or more (handles 'DrJohnPOConnor')
     """
 
     first_pat = make_token_regex_allow_optional_punct(first_name_token)
     last_pat  = make_token_regex_allow_optional_punct(last_name_token)
 
-    # up to two middle initials like "P." / "Q" with flexible/optional spacing
+    # middle initials like "P." / "Q" with flexible/optional spacing
+    max_mid = max(2, n_middle_names)
     mid_initial = r"(?:\s*[A-Za-z]\.?\s*)"
-    mid_block = fr"{mid_initial}{{0,2}}"   # optional up to 2
+    mid_block = fr"{mid_initial}{{0,{max_mid}}}"
 
     # optional title prefix (with/without dot), allow zero-or-more whitespace after
     prefix = r"\b(?:(?:Dr|Mr|Mrs|Ms|Mx|Prof)\.?\s*)?"
@@ -200,7 +202,8 @@ class TitleAndInitialsRecognizer(PatternRecognizer):
     """
     def __init__(self, name: PersonalName):
         pat = build_title_name_pattern(first_name_token=normalize_name_token(name.first_name),
-                                       last_name_token=normalize_name_token(name.last_name))
+                                       last_name_token=normalize_name_token(name.last_name),
+                                       n_middle_names=len(name.middle_names))
         patterns = [Pattern(name="title_first_midinit_last", regex=pat, score=0.9)] if pat else []
         super().__init__(supported_entity="SUBJECT_NAME", name="subject_title_initials", patterns=patterns)
 
@@ -218,8 +221,11 @@ def add_subject_name_detectors(registry: RecognizerRegistry,
                                name: PersonalName):
     tokens = name.get_normalized_tokens()
 
-    # add nickname variants (e.g., "John" -> "Johnny", "Jack")
+    # add nickname variants for first name and middle names
     nicknames = get_name_variants(name.first_name, levels=2)
+    for mn in name.middle_names:
+        if len(mn) >= 2:  # skip single-char initials
+            nicknames |= get_name_variants(mn, levels=2)
     tokens.extend(nicknames)
 
     # 1) exact matches + punctuation-dropped mirrors (incl. possessives)

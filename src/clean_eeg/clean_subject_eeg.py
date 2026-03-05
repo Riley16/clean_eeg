@@ -542,9 +542,10 @@ if __name__ == "__main__":
         logger.rescrub()
         logger.log_args(args)
 
+        middle_names = [mn for mn in args.middle_name.split('_') if mn] if args.middle_name else []
         subject_name = PersonalName(
             first_name=args.first_name,
-            middle_names=args.middle_name.split('_') if args.middle_name else [],
+            middle_names=middle_names,
             last_name=args.last_name
         )
 
