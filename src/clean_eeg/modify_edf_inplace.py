@@ -4,6 +4,7 @@ from copy import deepcopy
 import datetime
 import os
 import re
+import shutil
 import numpy as np
 import pyedflib
 
@@ -199,6 +200,195 @@ def clear_edf_annotations_inplace(path, validate: bool = True):
             _, _, ann_texts = f.readAnnotations()
             assert len(ann_texts) == 0, "Annotations found after clearing"
 
+
+
+def _encode_tal(onset: float, duration: float, text: str) -> bytes:
+    """Encode a single EDF+ Time-stamped Annotation List (TAL) entry.
+
+    TAL format: +onset[\\x15duration]\\x14text\\x14\\x00
+    The onset sign (+ or -) is mandatory per EDF+ spec.
+    """
+    onset_str = f"+{onset:.10g}" if onset >= 0 else f"{onset:.10g}"
+    if duration > 0:
+        dur_str = f"{duration:.10g}"
+        tal = f"{onset_str}\x15{dur_str}\x14{text}\x14\x00"
+    else:
+        tal = f"{onset_str}\x14{text}\x14\x00"
+    return tal.encode("utf-8")
+
+
+def merge_annotation_stub_edf(data_edf_path: str,
+                               stub_edf_path: str,
+                               validate: bool = True) -> None:
+    """Merge annotations from a stub EDF back into a data EDF.
+
+    The data EDF is expected to have its annotation texts cleared
+    (e.g., by clear_edf_annotations_inplace). The stub EDF is an
+    annotations-only file created by create_annotations_only_edf.
+
+    Uses atomic file replacement (os.replace) so the data EDF is never
+    left in a partially-written state.
+
+    Args:
+        data_edf_path: Path to the data EDF (with cleared annotations).
+        stub_edf_path: Path to the annotations-only stub EDF.
+        validate: If True, verify merged annotations match the stub.
+    """
+    # Read annotations from stub
+    with pyedflib.EdfReader(stub_edf_path) as f:
+        ann_onsets, ann_durations, ann_texts = f.readAnnotations()
+
+    if len(ann_onsets) == 0:
+        return  # nothing to merge
+
+    # Get annotation record layout from data EDF
+    ann_signal_index = get_annotation_signal_header_index(data_edf_path)
+    signal_record_lengths = get_signal_header_fields(data_edf_path, field='num_samples')
+    for i in range(len(signal_record_lengths)):
+        signal_record_lengths[i] *= 2  # 2 bytes per sample
+    ann_record_length = signal_record_lengths[ann_signal_index]
+    ann_record_offset = sum(signal_record_lengths[:ann_signal_index])
+    total_records_length = sum(signal_record_lengths)
+
+    n_signals = len(signal_record_lengths)
+    n_records = get_header_field(data_edf_path, 'num_data_records')
+    record_duration = float(get_header_field(data_edf_path, 'data_record_duration'))
+
+    # Assign each annotation to the data record it belongs to
+    record_annotations = {i: [] for i in range(n_records)}
+    for onset, duration, text in zip(ann_onsets, ann_durations, ann_texts):
+        if record_duration > 0:
+            record_idx = min(int(onset / record_duration), n_records - 1)
+        else:
+            record_idx = 0
+        record_annotations[record_idx].append((onset, duration, text))
+
+    # Snapshot original signals and headers before any modification so
+    # the post-merge integrity check can verify nothing was corrupted.
+    with pyedflib.EdfReader(data_edf_path) as f:
+        orig_header = f.getHeader()
+        orig_signal_headers = [f.getSignalHeader(i)
+                               for i in range(f.signals_in_file)]
+        orig_signals = [f.readSignal(i) for i in range(f.signals_in_file)]
+
+    # Work on a temp copy so the original is never partially written
+    temp_path = data_edf_path + ".merge_tmp"
+    shutil.copy2(data_edf_path, temp_path)
+    try:
+        header_size = TOTAL_HEADER_BYTES + SIGNAL_HEADER_BYTES * n_signals
+        with open(temp_path, "r+b") as f:
+            for record_idx in range(n_records):
+                if not record_annotations[record_idx]:
+                    continue  # no annotations for this record
+
+                record_offset = (header_size
+                                 + total_records_length * record_idx
+                                 + ann_record_offset)
+                f.seek(record_offset)
+                ann_bytes = f.read(ann_record_length)
+
+                # Find end of timekeeping TAL
+                tk_delim = b"\x14\x14"
+                tk_end = ann_bytes.find(tk_delim)
+                if tk_end < 0:
+                    raise ValueError(
+                        f"No timekeeping TAL found in data record {record_idx}")
+                tk_end += len(tk_delim)
+
+                # Encode annotations for this record.
+                # Leading \x00 terminates the timekeeping TAL before the
+                # first annotation TAL begins.
+                encoded = b"\x00"
+                for onset, duration, text in record_annotations[record_idx]:
+                    encoded += _encode_tal(onset, duration, text)
+
+                available = ann_record_length - tk_end
+                if len(encoded) > available:
+                    raise ValueError(
+                        f"Annotations for record {record_idx} "
+                        f"({len(encoded)} bytes) exceed available space "
+                        f"({available} bytes) in annotation signal")
+
+                # Write annotation bytes + zero padding
+                new_region = encoded + b"\x00" * (available - len(encoded))
+                f.seek(record_offset + tk_end)
+                f.write(new_region)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # ---- Integrity check: signals, headers, and annotations ----
+        # The merge must not corrupt any part of the EDF. Verify all
+        # three domains before committing the atomic replacement.
+        _verify_merge_integrity(
+            temp_path, orig_header, orig_signal_headers, orig_signals,
+            ann_onsets, ann_durations, ann_texts)
+
+        # Atomic replacement
+        os.replace(temp_path, data_edf_path)
+    except Exception as exc:
+        print(f"ERROR: Annotation merge failed. The partially-written temp "
+              f"file has been preserved for debugging:\n  {temp_path}")
+        raise ValueError(
+            f"Annotation merge failed; temp file preserved at {temp_path}"
+        ) from exc
+
+
+def _verify_merge_integrity(merged_path: str,
+                            orig_header: dict,
+                            orig_signal_headers: list,
+                            orig_signals: list,
+                            expected_onsets: np.ndarray,
+                            expected_durations: np.ndarray,
+                            expected_texts: np.ndarray) -> None:
+    """Verify the merged EDF has identical signals/headers and correct annotations.
+
+    Raises ValueError if any mismatch is detected, preventing the atomic
+    replacement from proceeding.
+    """
+    with pyedflib.EdfReader(merged_path) as f:
+        merged_header = f.getHeader()
+        n_signals = f.signals_in_file
+        merged_signal_headers = [f.getSignalHeader(i) for i in range(n_signals)]
+        merged_signals = [f.readSignal(i) for i in range(n_signals)]
+        m_onsets, m_durations, m_texts = f.readAnnotations()
+
+    # --- Signals: must be bit-identical ---
+    if len(merged_signals) != len(orig_signals):
+        raise ValueError(
+            f"Signal count changed: {len(orig_signals)} -> {len(merged_signals)}")
+    for i, (orig, merged) in enumerate(zip(orig_signals, merged_signals)):
+        if not np.array_equal(orig, merged):
+            raise ValueError(f"Signal {i} data corrupted by merge")
+
+    # --- Main header: every field must be unchanged ---
+    for key in orig_header:
+        if orig_header[key] != merged_header.get(key):
+            raise ValueError(
+                f"Header field '{key}' changed: "
+                f"'{orig_header[key]}' -> '{merged_header.get(key)}'")
+
+    # --- Signal headers: every field of every channel must be unchanged ---
+    for i, (orig_sh, merged_sh) in enumerate(
+            zip(orig_signal_headers, merged_signal_headers)):
+        for key in orig_sh:
+            if orig_sh[key] != merged_sh.get(key):
+                raise ValueError(
+                    f"Signal header {i} field '{key}' changed: "
+                    f"'{orig_sh[key]}' -> '{merged_sh.get(key)}'")
+
+    # --- Annotations: texts, onsets, and durations must match stub ---
+    if len(m_texts) != len(expected_texts):
+        raise ValueError(
+            f"Annotation count mismatch: expected {len(expected_texts)}, "
+            f"got {len(m_texts)}")
+    for i, (exp, got) in enumerate(zip(expected_texts, m_texts)):
+        if exp != got:
+            raise ValueError(
+                f"Annotation {i} text mismatch: expected '{exp}', got '{got}'")
+    if not np.allclose(m_onsets, expected_onsets):
+        raise ValueError("Annotation onsets mismatch after merge")
+    if not np.allclose(m_durations, expected_durations):
+        raise ValueError("Annotation durations mismatch after merge")
 
 
 TOTAL_HEADER_BYTES = 256

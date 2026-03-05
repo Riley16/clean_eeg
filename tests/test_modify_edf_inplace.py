@@ -8,6 +8,7 @@ from clean_eeg.modify_edf_inplace import (
     update_edf_header_inplace,
     clear_edf_annotations_inplace,
     create_annotations_only_edf,
+    merge_annotation_stub_edf,
     validate_header_roundtrip,
 )
 from clean_eeg.paths import TEST_DATA_DIR
@@ -358,3 +359,131 @@ def test_validate_header_roundtrip_truncation_warning(base_edf):
     result = validate_header_roundtrip(header)
     assert len(result) > 0, "Expected truncation warning for oversized field"
     assert any('80 chars' in w for w in result)
+
+
+# ======================
+# Test 8: merge annotation stub roundtrip
+# ======================
+
+def test_merge_annotation_stub_roundtrip(base_edf, tmp_path):
+    """Clear annotations, create stub, merge back — annotations should match original."""
+    # Read original annotations and signals
+    with pyedflib.EdfReader(base_edf) as f:
+        orig_annotations = f.readAnnotations()
+        orig_signals = [f.readSignal(i) for i in range(f.signals_in_file)]
+        orig_header = f.getHeader()
+    orig_onsets, orig_durations, orig_texts = orig_annotations
+
+    assert len(orig_texts) > 0, "Test EDF should have annotations"
+
+    # Create annotation stub from original annotations
+    stub_path = str(tmp_path / "annotations.edf")
+    create_annotations_only_edf(stub_path, orig_header, orig_annotations)
+
+    # Clear annotations from data EDF
+    clear_edf_annotations_inplace(base_edf)
+    with pyedflib.EdfReader(base_edf) as f:
+        _, _, cleared_texts = f.readAnnotations()
+    assert len(cleared_texts) == 0, "Annotations should be cleared"
+
+    # Merge stub back into data EDF
+    merge_annotation_stub_edf(base_edf, stub_path)
+
+    # Verify annotations match original
+    with pyedflib.EdfReader(base_edf) as f:
+        merged_onsets, merged_durations, merged_texts = f.readAnnotations()
+        merged_signals = [f.readSignal(i) for i in range(f.signals_in_file)]
+
+    assert list(merged_texts) == list(orig_texts), (
+        f"Texts mismatch: {list(merged_texts)} != {list(orig_texts)}")
+    assert np.allclose(merged_onsets, orig_onsets), "Onsets mismatch after merge"
+    assert np.allclose(merged_durations, orig_durations), "Durations mismatch after merge"
+
+    # Verify signals unchanged
+    for i, (orig_sig, merged_sig) in enumerate(zip(orig_signals, merged_signals)):
+        assert np.array_equal(orig_sig, merged_sig), f"Signal {i} changed after merge"
+
+
+# ======================
+# Test 9: merge preserves file size
+# ======================
+
+def test_merge_annotation_stub_preserves_file_size(base_edf, tmp_path):
+    """Merging annotations back should not change file size."""
+    import os as _os
+    orig_size = _os.path.getsize(base_edf)
+
+    with pyedflib.EdfReader(base_edf) as f:
+        header = f.getHeader()
+        annotations = f.readAnnotations()
+
+    stub_path = str(tmp_path / "annotations.edf")
+    create_annotations_only_edf(stub_path, header, annotations)
+    clear_edf_annotations_inplace(base_edf)
+    merge_annotation_stub_edf(base_edf, stub_path)
+
+    assert _os.path.getsize(base_edf) == orig_size, "File size changed after merge"
+
+
+# ======================
+# Test 10: atomic merge — original untouched on failure
+# ======================
+
+def test_merge_annotation_stub_atomic_on_failure(base_edf, tmp_path):
+    """If the integrity check fails, the original data EDF should be
+    untouched and the temp file preserved for debugging."""
+    import os as _os
+    from unittest.mock import patch
+
+    with pyedflib.EdfReader(base_edf) as f:
+        header = f.getHeader()
+        annotations = f.readAnnotations()
+
+    # Create a valid stub, then clear the data EDF
+    stub_path = str(tmp_path / "annotations.edf")
+    create_annotations_only_edf(stub_path, header, annotations)
+    clear_edf_annotations_inplace(base_edf)
+
+    with open(base_edf, "rb") as f:
+        original_bytes = f.read()
+
+    # Patch _verify_merge_integrity to simulate a post-write integrity failure
+    with patch("clean_eeg.modify_edf_inplace._verify_merge_integrity",
+               side_effect=ValueError("fake integrity failure")):
+        temp_path = base_edf + ".merge_tmp"
+        with pytest.raises(ValueError, match="temp file preserved"):
+            merge_annotation_stub_edf(base_edf, stub_path)
+
+    # Original should be unchanged
+    with open(base_edf, "rb") as f:
+        after_bytes = f.read()
+    assert original_bytes == after_bytes, "Data EDF was modified despite merge failure"
+
+    # Temp file should be preserved for debugging
+    assert _os.path.exists(temp_path), "Temp file should be preserved on failure"
+
+
+# ======================
+# Test 11: merge with empty stub (no annotations)
+# ======================
+
+def test_merge_empty_stub_is_noop(base_edf, tmp_path):
+    """Merging a stub with no annotations should leave the data EDF unchanged."""
+    # Create a stub with annotations, then clear them — produces a valid EDF
+    # that pyedflib can read but which has 0 user annotations.
+    with pyedflib.EdfReader(base_edf) as f:
+        header = f.getHeader()
+        annotations = f.readAnnotations()
+    stub_path = str(tmp_path / "empty_stub.edf")
+    create_annotations_only_edf(stub_path, header, annotations)
+    clear_edf_annotations_inplace(stub_path, validate=False)
+
+    clear_edf_annotations_inplace(base_edf)
+    with open(base_edf, "rb") as f:
+        before_bytes = f.read()
+
+    merge_annotation_stub_edf(base_edf, stub_path)
+
+    with open(base_edf, "rb") as f:
+        after_bytes = f.read()
+    assert before_bytes == after_bytes, "Data EDF changed after merging empty stub"
