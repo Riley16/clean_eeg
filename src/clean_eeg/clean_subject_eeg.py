@@ -1,7 +1,9 @@
+import random
 import re
 import os
 import shutil
 import numpy as np
+import pyedflib
 from copy import deepcopy
 from typing import Union
 from datetime import datetime, timedelta
@@ -12,6 +14,7 @@ from clean_eeg.modify_edf_inplace import (
     update_edf_header_inplace,
     clear_edf_annotations_inplace,
     create_annotations_only_edf,
+    validate_header_roundtrip,
 )
 
 BASE_START_DATE = datetime(1985, 1, 1)
@@ -181,33 +184,42 @@ def clean_subject_edf_files(
     _validate_EDF_meta_data(EDF_meta_data, subject_name=subject_name, verbosity=verbosity)
     min_start_time = _get_start_time_earliest_recording(EDF_meta_data, verbosity=verbosity)
 
+    # Select files for post-write signal integrity audit
+    all_filenames = list(EDF_meta_data.keys())
+    n_audit = min(2, len(all_filenames))
+    audit_filenames = set(random.sample(all_filenames, n_audit))
+    audit_data = {}  # filename -> (orig_signals, clean_full_path)
+
     # de-identify EDF files and save out
     print("Cleaning EDF files... Saving to output path:", output_path)
     for filename, _ in tqdm(EDF_meta_data.items()):
         input_file_path = os.path.join(input_path, filename)
         edf = load_edf(input_file_path, load_method=load_method, preload=True)
         assert isinstance(edf, dict)
+
+        # Stash original signals before de-identification for audited files
+        if filename in audit_filenames:
+            orig_signals = [sig.copy() for sig in edf['signals']]
+
         edf = deidentify_edf(
             edf_data=edf,
             subject_name=subject_name,
             subject_code=subject_code,
             earliest_recording_start_time=min_start_time
         )
+        truncation_warnings = validate_header_roundtrip(
+            edf['header'], edf['signal_headers'])
+        for warning in truncation_warnings:
+            print(f"WARNING: {warning}")
+
         clean_start_time = edf['header']['startdate']
         filename_no_ext = os.path.splitext(filename)[0]
-        # subject argument is not always present, fallback to subject_code if not provided
-        # subject_val = subject if subject is not None else subject_code
         subject_val = subject_code
         clean_filename = f"{filename_no_ext}_{subject_val}_{clean_start_time.strftime('%Y.%m.%d__%H:%M:%S')}.edf"
         clean_full_path = os.path.join(output_path, clean_filename)
         if inplace:
             shutil.move(input_file_path, clean_full_path)
             clean_annotations_path = str(clean_full_path).replace('.edf', '_annotations.edf')
-            print(edf.keys())
-            print(edf['header'])
-            print(edf['signal_headers'])
-            print(edf['annotations'])
-
             create_annotations_only_edf(clean_annotations_path,
                                         header=edf['header'],
                                         annotations=edf['annotations'])
@@ -218,6 +230,14 @@ def clean_subject_edf_files(
         else:
             write_edf_pyedflib(edf, clean_full_path)
         print(f"Cleaned EDF file at: {clean_filename}")
+
+        if filename in audit_filenames:
+            audit_data[filename] = (orig_signals, clean_full_path)
+
+    # Audit: spot-check signal integrity on sampled output files
+    for filename, (orig_signals, clean_path) in audit_data.items():
+        _audit_signal_integrity(orig_signals, clean_path, filename, inplace=inplace)
+
     print("Done cleaning EDF files. Saved to output path:", output_path)
     site_code = subject_code[-1]  # last character of subject code is site code
     site_code_incoming_folder = SITE_CODE_TO_INCOMING_FOLDER.get(site_code, 'UNKNOWN_SITE')
@@ -225,6 +245,31 @@ def clean_subject_edf_files(
     print("Example commands to transfer cleaned EDF files to the CML rhino server (make sure to change USER to appropriate username):")
     print(f'ssh USER@rhino2.psych.upenn.edu "mkdir -p {remote_dir}"')
     print(f"scp {os.path.join(output_path, '*.edf')} USER@rhino2.psych.upenn.edu:{remote_dir}")
+
+
+def _audit_signal_integrity(orig_signals: list, clean_file_path: str, filename: str,
+                            inplace: bool = False):
+    """Spot-check that signal data in the output file matches the original.
+
+    For inplace mode, signals must be bit-identical since only headers are modified.
+    For rewrite mode, pyedflib's digital/physical conversion introduces floating-point
+    differences, so the audit is skipped (this is a known pyedflib limitation and the
+    reason the in-place approach was developed).
+    """
+    if not inplace:
+        return
+    with pyedflib.EdfReader(clean_file_path) as f:
+        n_signals = f.signals_in_file
+        for i in range(n_signals):
+            clean_signal = f.readSignal(i)
+            orig_signal = orig_signals[i]
+            min_len = min(len(orig_signal), len(clean_signal))
+            if not np.array_equal(orig_signal[:min_len], clean_signal[:min_len]):
+                raise RuntimeError(
+                    f"AUDIT FAILURE: Signal {i} in {filename} was modified "
+                    f"during in-place de-identification."
+                )
+    print(f"Audit passed for {filename}: all {n_signals} signals unchanged.")
 
 
 def convert_edfC_to_edfD(input_file: str):

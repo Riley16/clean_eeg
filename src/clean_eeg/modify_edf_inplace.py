@@ -97,35 +97,36 @@ def update_edf_header_inplace(edf_path: str,
     os.remove(temp_path)
 
 
-# TODO account for multiple data fields in single header field
-def clean_header(header: dict, raise_errors: bool) -> dict:
-    header = deepcopy(header)
-    str_fields = ['technician', 'recording_additional',
-                  'patientname', 'patient_additional',
-                  'patientcode', 'equipment', 'admincode',
-                  'sex', 'birthdate', 'gender']
-    for field in str_fields:
-        assert field in header
-        if not isinstance(header[field], str):
-            raise ValueError(f"Header field '{field}' must be a string")
-        max_length = EDF_HEADER_FIELD_OFFSETS_LENGTHS[field][1]
-        if len(header[field]) > max_length:
-            message = f"Header field '{field}' exceeds max length of {max_length} characters."
-            if raise_errors:
-                raise ValueError(message)
-            print(message + " Truncating...")
-            header[field] = header[field][:max_length]
-    
-    assert 'startdate' in header
-    if not isinstance(header['startdate'], datetime.date):
-        raise ValueError("Header field 'startdate' must be a datetime object")
-    
-    return header
+def validate_header_roundtrip(header: dict, signal_headers: list = None) -> list[str]:
+    """Check for pyedflib truncation by doing a dry-run header write.
+
+    Returns a list of warning strings for any fields that would be truncated.
+    pyedflib packs multiple fields into the 80-byte patient_id and recording_id
+    EDF fields, so per-field byte limits can't be checked in isolation.
+    """
+    import tempfile
+    import warnings as warnings_module
+    result = []
+    n_channels = len(signal_headers) if signal_headers else 0
+    with tempfile.NamedTemporaryFile(suffix='.edf', delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        with warnings_module.catch_warnings(record=True) as caught:
+            warnings_module.simplefilter("always")
+            with pyedflib.EdfWriter(tmp_path, n_channels) as w:
+                w.setHeader(header)
+                if signal_headers:
+                    w.setSignalHeaders(signal_headers)
+        for w in caught:
+            result.append(str(w.message))
+    finally:
+        os.remove(tmp_path)
+    return result
 
 
 def create_annotations_only_edf(path: str,
                                 header: dict,
-                                annotations: tuple[List[float], List[float], List[str]],
+                                annotations: tuple,
                                 validate: bool = True) -> None:
     """Create a minimal EDF file containing only annotations."""
     with pyedflib.EdfWriter(file_name=path,

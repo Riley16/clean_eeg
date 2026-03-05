@@ -56,7 +56,6 @@ def test_load_edf_discontinuous_lunapi():
     data = load_edf(CONTINUOUS_EDFD_FILE, load_method='lunapi', preload=True)
     import lunapi as lp
     assert isinstance(data, lp.inst)
-    print(data)
 
 
 def test_roundtrip_io_pyedflib():

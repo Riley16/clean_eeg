@@ -8,6 +8,7 @@ from clean_eeg.modify_edf_inplace import (
     update_edf_header_inplace,
     clear_edf_annotations_inplace,
     create_annotations_only_edf,
+    validate_header_roundtrip,
 )
 from clean_eeg.paths import TEST_DATA_DIR
 from .generate_edf import format_edf_config_json, DEFAULT_NUMBER_SIGNALS
@@ -158,10 +159,6 @@ def test_inplace_vs_rewrite_semantic_equality(base_edf, tmp_path, header_updates
     rewrite_path = str(tmp_path / "rewrite.edf")
 
     shutil.copyfile(orig, inplace_path)
-    print(inplace_path)
-
-    # print('Original header in EDF config:')
-    # print(load_edf_test_config("basic_EDF+C")['pyedflib_header'])
 
     # ---- Rewrite-with-updates path ----
     updated_annotations = rewrite_edf_with_updates(orig, rewrite_path, header_updates)
@@ -237,3 +234,127 @@ def test_inplace_vs_rewrite_semantic_equality(base_edf, tmp_path, header_updates
     finally:
         rin_orig.close()
         rin_inplace.close()
+
+
+# ======================
+# Test 3: clear annotations standalone
+# ======================
+
+def test_clear_annotations_inplace(base_edf):
+    """Verify clear_edf_annotations_inplace removes all annotation texts
+    while preserving signals and header."""
+    # Read original data
+    with pyedflib.EdfReader(base_edf) as f:
+        orig_header = f.getHeader()
+        orig_signals = [f.readSignal(i) for i in range(f.signals_in_file)]
+        _, _, orig_texts = f.readAnnotations()
+
+    # Confirm annotations exist before clearing
+    assert len(orig_texts) > 0, "Test EDF should have annotations to clear"
+
+    clear_edf_annotations_inplace(base_edf)
+
+    # Verify annotations are gone, signals and header preserved
+    with pyedflib.EdfReader(base_edf) as f:
+        post_header = f.getHeader()
+        post_signals = [f.readSignal(i) for i in range(f.signals_in_file)]
+        _, _, post_texts = f.readAnnotations()
+
+    assert len(post_texts) == 0, "Annotations should be empty after clearing"
+    for key in orig_header:
+        assert orig_header[key] == post_header[key], f"Header field '{key}' changed after clearing annotations"
+    for i, (orig_sig, post_sig) in enumerate(zip(orig_signals, post_signals)):
+        assert np.array_equal(orig_sig, post_sig), f"Signal {i} changed after clearing annotations"
+
+
+# ======================
+# Test 4: create annotations-only EDF standalone
+# ======================
+
+def test_create_annotations_only_edf(base_edf, tmp_path):
+    """Verify create_annotations_only_edf produces a readable EDF with correct annotations."""
+    with pyedflib.EdfReader(base_edf) as f:
+        header = f.getHeader()
+        annotations = f.readAnnotations()
+
+    stub_path = str(tmp_path / "annotations_only.edf")
+    create_annotations_only_edf(stub_path, header, annotations)
+
+    with pyedflib.EdfReader(stub_path) as f:
+        stub_annotations = f.readAnnotations()
+        assert f.signals_in_file == 0, "Annotations-only EDF should have no signals"
+
+    assert np.array_equal(stub_annotations[0], annotations[0]), "Annotation onsets mismatch"
+    assert np.array_equal(stub_annotations[1], annotations[1]), "Annotation durations mismatch"
+    assert np.array_equal(stub_annotations[2], annotations[2]), "Annotation texts mismatch"
+
+
+# ======================
+# Test 5: header-only update (no signal header changes)
+# ======================
+
+def test_inplace_header_only_update(base_edf):
+    """Verify updating only main header (no signal_header_updates) preserves everything else."""
+    with pyedflib.EdfReader(base_edf) as f:
+        orig_signal_headers = [f.getSignalHeader(i) for i in range(f.signals_in_file)]
+        orig_signals = [f.readSignal(i) for i in range(f.signals_in_file)]
+
+    update_edf_header_inplace(base_edf,
+                              header_updates={'technician': 'UpdatedTech'},
+                              signal_header_updates=None)
+
+    with pyedflib.EdfReader(base_edf) as f:
+        new_header = f.getHeader()
+        new_signal_headers = [f.getSignalHeader(i) for i in range(f.signals_in_file)]
+        new_signals = [f.readSignal(i) for i in range(f.signals_in_file)]
+
+    assert new_header['technician'] == 'UpdatedTech'
+    for i, (orig_sh, new_sh) in enumerate(zip(orig_signal_headers, new_signal_headers)):
+        for key in orig_sh:
+            assert orig_sh[key] == new_sh[key], f"Signal header {i} field '{key}' changed"
+    for i, (orig_sig, new_sig) in enumerate(zip(orig_signals, new_signals)):
+        assert np.array_equal(orig_sig, new_sig), f"Signal {i} changed after header-only update"
+
+
+# ======================
+# Test 6: file size unchanged after in-place operations
+# ======================
+
+def test_inplace_preserves_file_size(base_edf, header_updates, signal_header_updates):
+    """In-place header update must not change file size."""
+    import os
+    orig_size = os.path.getsize(base_edf)
+
+    update_edf_header_inplace(base_edf,
+                              header_updates,
+                              signal_header_updates=signal_header_updates)
+
+    assert os.path.getsize(base_edf) == orig_size, "File size changed after in-place update"
+
+    clear_edf_annotations_inplace(base_edf)
+
+    assert os.path.getsize(base_edf) == orig_size, "File size changed after clearing annotations"
+
+
+# ======================
+# Test 7: validate_header_roundtrip detects truncation
+# ======================
+
+def test_validate_header_roundtrip_no_warnings(base_edf):
+    """Normal-length header fields should produce no warnings."""
+    with pyedflib.EdfReader(base_edf) as f:
+        header = f.getHeader()
+        signal_headers = [f.getSignalHeader(i) for i in range(f.signals_in_file)]
+    result = validate_header_roundtrip(header, signal_headers)
+    assert result == [], f"Unexpected warnings: {result}"
+
+
+def test_validate_header_roundtrip_truncation_warning(base_edf):
+    """Overly long header field should produce a truncation warning."""
+    with pyedflib.EdfReader(base_edf) as f:
+        header = f.getHeader()
+    # technician is packed into recording_id (80 bytes total with equipment, admincode, etc.)
+    header['technician'] = 'A' * 200
+    result = validate_header_roundtrip(header)
+    assert len(result) > 0, "Expected truncation warning for oversized field"
+    assert any('80 chars' in w for w in result)
