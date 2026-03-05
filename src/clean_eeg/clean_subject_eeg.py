@@ -184,11 +184,10 @@ def clean_subject_edf_files(
     _validate_EDF_meta_data(EDF_meta_data, subject_name=subject_name, verbosity=verbosity)
     min_start_time = _get_start_time_earliest_recording(EDF_meta_data, verbosity=verbosity)
 
-    # Select files for post-write signal integrity audit
+    # Select files for signal integrity audit
     all_filenames = list(EDF_meta_data.keys())
     n_audit = min(2, len(all_filenames))
     audit_filenames = set(random.sample(all_filenames, n_audit))
-    audit_data = {}  # filename -> (orig_signals, clean_full_path)
 
     # de-identify EDF files and save out
     print("Cleaning EDF files... Saving to output path:", output_path)
@@ -231,12 +230,9 @@ def clean_subject_edf_files(
             write_edf_pyedflib(edf, clean_full_path)
         print(f"Cleaned EDF file at: {clean_filename}")
 
+        # Audit signal integrity immediately after write
         if filename in audit_filenames:
-            audit_data[filename] = (orig_signals, clean_full_path)
-
-    # Audit: spot-check signal integrity on sampled output files
-    for filename, (orig_signals, clean_path) in audit_data.items():
-        _audit_signal_integrity(orig_signals, clean_path, filename, inplace=inplace)
+            _audit_signal_integrity(orig_signals, clean_full_path, filename, inplace=inplace)
 
     print("Done cleaning EDF files. Saved to output path:", output_path)
     site_code = subject_code[-1]  # last character of subject code is site code
