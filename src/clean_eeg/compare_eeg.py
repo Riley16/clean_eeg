@@ -14,7 +14,7 @@ def compare_edf_files(file1, file2,
     Parameters:
         file1 (str): Path to the first EDF file.
         file2 (str): Path to the second EDF file.
-        load_method (str): Method to load EDF files ('edfio', 'pyedflib', or 'mne').
+        load_method (str): Method to load EDF files ('pyedflib').
 
     Returns:
         bool: True if files are equal, False otherwise.
@@ -22,16 +22,10 @@ def compare_edf_files(file1, file2,
     data1 = load_edf(file1, load_method=load_method, preload=compare_signals, read_digital=True)
     data2 = load_edf(file2, load_method=load_method, preload=compare_signals, read_digital=True)
 
-    # compare headers, signal headers, signals, and annotations separately
-    if load_method == 'edfio':
-        raise NotImplementedError("Comparison for edfio is not implemented yet.")
-    elif load_method == 'pyedflib':
+    if load_method == 'pyedflib':
         return compare_edf_pyedflib(data1, data2,
                                     physical_range_rel_tol=physical_range_rel_tol,
                                     verbosity=verbosity)
-    elif load_method == 'mne':
-        # MNE Raw objects do not expose all header info, making direct comparison less informative
-        raise NotImplementedError("Comparison for MNE is not implemented yet.")
     else:
         raise ValueError("Invalid load method specified. Use 'pyedflib'.")
 

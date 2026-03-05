@@ -1,9 +1,8 @@
 import argparse
 import os
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import lunapi as lp
-from edfio import Edf, EdfAnnotation
 
 
 def convert_edf_to_continuous_segments(input_file: str, output_dir: str, verbosity: int = 1) -> None:
@@ -46,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Split EDF+D into EDF+C segments with Luna, "
                     "grab segment annotations in-memory, "
-                    "then embed them into each segment EDF as EDF+ (using edfio)."
+                    "then embed them into each segment EDF as EDF+."
     )
     p.add_argument("-i", "--input", required=True, help="Path to EDF/EDF+ (likely EDF+D) input file")
     p.add_argument("-o", "--outdir", required=True, help="Output directory for segment EDFs")
@@ -120,163 +119,6 @@ def luna_fetch_segment_annots(inst: lp.inst) -> "pandas.DataFrame":
 
 def luna_clear_mask(inst: lp.inst) -> None:
     inst.proc("MASK clear")
-
-
-# -------------------- Annotation conversion --------------------
-def _col(df, *names: str) -> Optional[str]:
-    """Return first matching column name in df among provided candidates (case-insensitive)."""
-    lower = {c.lower(): c for c in df.columns}
-    for n in names:
-        c = lower.get(n.lower())
-        if c is not None:
-            return c
-    return None
-
-
-def df_to_edfio_annotations(df, seg_start: float, seg_stop: float) -> List[EdfAnnotation]:
-    """
-    Convert a Luna ANNOTS DataFrame (for a masked segment) into a list of EdfAnnotation,
-    rebasing times so the segment starts at t=0.
-    Expected columns (names vary a bit across Luna versions):
-      - class label:    CLASS or ANNOT
-      - instance:       INSTANCE or INST (optional)
-      - start (sec):    START
-      - stop (sec):     STOP (optional for instantaneous events)
-    """
-    if df is None or df.empty:
-        return []
-
-    c_label = _col(df, "CLASS", "ANNOT")
-    c_inst  = _col(df, "INSTANCE", "INST")
-    c_start = _col(df, "START")
-    c_stop  = _col(df, "STOP")
-
-    if c_label is None or c_start is None:
-        # Minimal requirement: label + start
-        return []
-
-    anns: List[EdfAnnotation] = []
-    seg_len = float(seg_stop - seg_start)
-
-    for _, row in df.iterrows():
-        label = str(row[c_label])
-        start_abs = float(row[c_start])
-        stop_abs = float(row[c_stop]) if (c_stop and not _is_nan(row[c_stop])) else None
-
-        # rebase to segment-relative time
-        start_rel = start_abs - seg_start
-        stop_rel = (stop_abs - seg_start) if stop_abs is not None else None
-
-        # clip to [0, seg_len]
-        if (stop_rel is not None) and (stop_rel <= 0):
-            continue  # entirely before
-        if start_rel >= seg_len:
-            continue  # entirely after
-        if start_rel < 0:
-            # clip head to 0
-            if stop_rel is None:
-                start_rel = 0.0
-            else:
-                # shift start to 0; keep end within segment
-                start_rel = 0.0
-        if stop_rel is not None and stop_rel > seg_len:
-            stop_rel = seg_len
-
-        duration = (stop_rel - start_rel) if stop_rel is not None else None
-
-        # Optionally include instance in text; else just label
-        if c_inst and not _is_nan(row[c_inst]):
-            text = f"{label}:{row[c_inst]}"
-        else:
-            text = label
-
-        anns.append(EdfAnnotation(onset=float(start_rel),
-                                  duration=(None if duration is None else float(duration)),
-                                  text=text))
-    return anns
-
-
-def _is_nan(x) -> bool:
-    try:
-        from math import isnan
-        return isinstance(x, float) and isnan(x)
-    except Exception:
-        return False
-
-
-def embed_annots_with_edfio(edf_path: str, annotations: List[EdfAnnotation]) -> None:
-    """
-    Overwrite the EDF segment with embedded annotations (TALs) as EDF+ continuous.
-    """
-    from edfio import read_edf
-    edf = read_edf(edf_path)
-    # Rebuild an Edf object with the same content but new annotations
-    edf = Edf(
-        edf.signals,
-        patient=edf.patient,
-        recording=edf.recording,
-        start_datetime=edf.start_datetime,
-        data_record_duration=edf.data_record_duration,
-        reserved=edf.reserved,
-        annotations=annotations,
-    )
-    edf.write(edf_path)  # in-place overwrite
-
-
-def load_edf_annotations_mne(edf_path, preload=False, verbose=False):
-    """
-    Load technician/user annotations from an EDF/EDF+ file using MNE.
-
-    Parameters
-    ----------
-    edf_path : str
-        Path to the EDF/EDF+ file.
-    preload : bool
-        Passed to mne.io.read_raw_edf (you usually don't need to preload to read annotations).
-    verbose : bool
-        If True, let MNE print info.
-
-    Returns
-    -------
-    df : pandas.DataFrame
-        Columns: ['onset_sec', 'duration_sec', 'description', 'onset_time'].
-        - onset_sec/duration_sec are relative to file start (seconds).
-        - onset_time is an absolute datetime if available in the file; otherwise None.
-        Empty DataFrame if no annotations.
-    raw : mne.io.BaseRaw
-        The loaded Raw object (so you can keep working with it).
-    """
-    import mne
-    import pandas as pd
-    from datetime import timedelta
-
-    # Read EDF; stim_channel=None avoids trying to guess a trigger channel as events
-    raw = mne.io.read_raw_edf(
-        edf_path,
-        preload=preload,
-        stim_channel=None,
-        verbose=verbose
-    )
-
-    ann = raw.annotations  # mne.Annotations or empty
-    if ann is None or len(ann) == 0:
-        return pd.DataFrame(columns=["onset_sec", "duration_sec", "description", "onset_time"]), raw
-
-    # Onsets are in seconds relative to the file start (MNE sets this appropriately for EDF+)
-    df = pd.DataFrame({
-        "onset_sec": ann.onset,
-        "duration_sec": ann.duration,
-        "description": ann.description,
-    })
-
-    # If the EDF had an absolute clock (orig_time), add absolute datetimes
-    if ann.orig_time is not None:
-        base = ann.orig_time  # datetime
-        df["onset_time"] = [base + timedelta(seconds=float(t)) for t in df["onset_sec"]]
-    else:
-        df["onset_time"] = None
-
-    return df, raw
 
 
 def overwrite_edfD_to_edfC(input_file: str, require_continuous_data: bool = True) -> None:

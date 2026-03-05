@@ -477,7 +477,7 @@ def get_clean_eeg_cli_arguments():
     parser.add_argument("--last_name", type=str, default='',
                         help="Subject last name (required)")
     parser.add_argument("--load_method", type=str, default="pyedflib",
-                        help="Method to load EDF files: 'pyedflib', 'edfio', or 'mne'")
+                        help="Method to load EDF files: 'pyedflib' or 'lunapi'")
     parser.add_argument("--raise_errors", action="store_true",
                         help="Raise errors instead of warnings for debugging")
     parser.add_argument("--verbosity", type=int, default=1,

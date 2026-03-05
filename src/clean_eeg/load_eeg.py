@@ -1,17 +1,16 @@
 import argparse
-import datetime
 
 
 RESERVED_FIELD_EDF_HEADER_BYTE_OFFSET = 192
 
 
-def load_edf(filename, load_method='edfio', preload=False, read_digital=False):
+def load_edf(filename, load_method='pyedflib', preload=False, read_digital=False):
     """
-    Load an EDF file using either pyedflib, edfio, or MNE.
+    Load an EDF file using pyedflib or lunapi.
 
     Parameters:
         filename (str): Path to the EDF file.
-        load_method (str): one of 'edfio', 'pyedflib', or 'mne'.
+        load_method (str): one of 'pyedflib' or 'lunapi'.
         preload (bool): If True, preload the EEG data into memory.
         read_digital (bool): If True, read digital signals if available.
 
@@ -19,11 +18,7 @@ def load_edf(filename, load_method='edfio', preload=False, read_digital=False):
         object: Loaded data object (depends on backend).
     """
     validate_edf_file_path(filename)
-    if load_method == 'edfio':
-        import edfio
-        edf = edfio.read_edf(filename)
-        return edf
-    elif load_method == 'pyedflib':
+    if load_method == 'pyedflib':
         import pyedflib
         reader = pyedflib.EdfReader(filename)
         if preload:
@@ -44,12 +39,8 @@ def load_edf(filename, load_method='edfio', preload=False, read_digital=False):
         inst = proj.inst("rec1")
         inst.attach_edf(filename)
         return inst
-    elif load_method == 'mne':
-        import mne
-        raw = mne.io.read_raw_edf(filename, preload=preload, verbose='error')
-        return raw
     else:
-        raise ValueError("Invalid load method specified. Use 'edfio', 'pyedflib', 'mne'.")
+        raise ValueError("Invalid load method specified. Use 'pyedflib' or 'lunapi'.")
     
 
 def write_edf_pyedflib(data, filename):
@@ -69,33 +60,12 @@ def write_edf_pyedflib(data, filename):
             f.writeAnnotation(time, duration, text)
     
 
-def print_edf(data, load_method='edfio', verbosity=1):
+def print_edf(data, load_method='pyedflib', verbosity=1):
     # Print the contents of an EDF file loaded by load_edf()
-    if load_method == 'edfio':
-        print_edf_edfio(data, verbosity)
-    elif load_method == 'pyedflib':
+    if load_method == 'pyedflib':
         print_edf_pyedflib(data, verbosity)
-    elif load_method == 'mne':
-        print_edf_mne(data, verbosity)
     else:
-        raise ValueError("Invalid load method specified. Use 'edfio', 'pyedflib', 'mne'.")
-
-
-def print_edf_edfio(data, verbosity=1):
-    # Print the contents of an EDF file loaded by load_edf() with edfio
-    if verbosity > 0:
-        print('Header:')
-        print('Patient:')
-        print(data.patient)
-        print('Recording:')
-        print(data.recording)
-    if verbosity > 1:
-        print('Example signal header:')
-        print(data.signals[0].__dict__)
-    if verbosity > 2:
-        print('Annotations:')
-        for annotation in data.annotations:
-            print(annotation)
+        raise ValueError("Invalid load method specified. Use 'pyedflib'.")
 
 
 def print_edf_pyedflib(data, verbosity=1):
@@ -111,53 +81,6 @@ def print_edf_pyedflib(data, verbosity=1):
         n_annotations = len(data['annotations'][0])
         print(f'{n_annotations} annotations found:')
         print(data['annotations'])
-
-
-def print_edf_mne(data, verbosity=1):
-    # Print the contents of an EDF file loaded by load_edf() with MNE
-    if verbosity > 0:
-        print('Header:')
-        print(data.info)
-    if verbosity > 1:
-        print('Example signal header:')
-        print(data.ch_names)
-    if verbosity > 2:
-        print('Annotations:')
-        print(data.annotations)
-        print(data.times)
-        print(data.duration)
-        print(data.annotations.extras)
-        print(data.annotations.orig_time)
-        print(data.annotations.__dict__)
-
-
-def get_edf_start_time_from_mne(raw):
-    """
-    Get the start time of the EDF file using MNE.
-
-    Parameters:
-        raw (mne.io.Raw): MNE Raw object.
-
-    Returns:
-        float: Start time in seconds.
-    """
-    return raw.info['meas_date']
-
-
-def offset_edf_start_time_first_recording(raw, offset_seconds):
-    """
-    Offset the start time of the first recording in an EDF file.
-
-    Parameters:
-        raw (mne.io.Raw): MNE Raw object.
-        offset_seconds (float): Offset in seconds.
-
-    Returns:
-        mne.io.Raw: Modified MNE Raw object with updated start time.
-    """
-    new_start_time = get_edf_start_time_from_mne(raw) + offset_seconds
-    raw.info['meas_date'] = datetime.datetime.fromtimestamp(new_start_time)
-    return raw
 
 
 def validate_edf_file_path(input_file: str) -> None:
@@ -220,7 +143,7 @@ def print_edf_file_type(input_file: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Load an EDF file using pyedflib or MNE.")
     parser.add_argument("--path", type=str, required=True, help="Path to EDF file")
-    parser.add_argument("--load-method", type=str, default="pyedflib", help="Method to load EDF files: 'edfio', 'pyedflib', or 'mne'")
+    parser.add_argument("--load-method", type=str, default="pyedflib", help="Method to load EDF files: 'pyedflib' or 'lunapi'")
     parser.add_argument("--lazy-load", action="store_true", help="Preload EEG into memory")
     parser.add_argument("--raise-errors", action="store_true", help="Raise errors instead of warnings for debugging")
     parser.add_argument("--verbosity", type=int, default=1, help="Enable verbose output")

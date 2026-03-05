@@ -12,10 +12,8 @@ license = { text = "MIT" }
 authors = [{ name = "Riley DeHaan"}]
 dependencies = [
     "pyedflib>=0.1.42",
-    "edfio==0.4.9",
     "lunapi==1.2.3",
     "numpy>=2.3.2",
-    "mne==1.10.1",
     "presidio-analyzer",
     "presidio-anonymizer",
     "rapidfuzz",

@@ -18,21 +18,6 @@ def test_load_edf_pyedflib():
     assert 'annotations' in data
 
 
-def test_load_edf_edfio():
-    data = load_edf(BASIC_EDFC, load_method='edfio', preload=True)
-    assert hasattr(data, 'signals')
-    assert hasattr(data, 'patient')
-    assert hasattr(data, 'recording')
-    assert hasattr(data, 'annotations')
-
-
-def test_load_edf_mne():
-    import mne
-    data = load_edf(BASIC_EDFC, load_method='mne', preload=True)
-    assert isinstance(data, mne.io.edf.edf.RawEDF)
-    assert data.ch_names is not None
-    assert data.info is not None
-
 
 def test_load_edf_lunapi():
     data = load_edf(BASIC_EDFC, load_method='lunapi', preload=True)
