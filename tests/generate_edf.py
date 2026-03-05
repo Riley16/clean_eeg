@@ -92,6 +92,54 @@ def generate_discontinuous_edf_from_config(edf_config):
             f.seek(RESERVED_FIELD_EDF_HEADER_BYTE_OFFSET)
             f.write(b'EDF+D   ')
 
+def generate_partial_record_edf(output_path, n_channels=2, sample_rate=100,
+                                duration_sec=10, file_type=pyedflib.FILETYPE_EDFPLUS):
+    """
+    Generate an EDF file with a truncated final data record.
+
+    Creates a valid EDF, then removes half the bytes of the last data record
+    to simulate an NK export with a partial final recording block.
+    The header's num_data_records field is left unchanged (claims more records
+    than are fully present on disk).
+
+    Returns (full_path, partial_path) where full_path is the intact reference.
+    """
+    full_path = str(output_path) + '.full_ref.edf'
+
+    writer = pyedflib.EdfWriter(full_path, n_channels, file_type=file_type)
+    for i in range(n_channels):
+        writer.setSignalHeader(i, {
+            'label': f'CH{i}', 'dimension': 'uV',
+            'sample_frequency': sample_rate,
+            'physical_max': 3200, 'physical_min': -3200,
+            'digital_max': 32767, 'digital_min': -32768,
+        })
+    signals = [np.array([float(j + i * 1000 + 1)
+                         for j in range(sample_rate * duration_sec)])
+               for i in range(n_channels)]
+    writer.writeSamples(signals)
+    writer.close()
+
+    # Read header geometry
+    with open(full_path, 'rb') as f:
+        f.seek(184)
+        header_size = int(f.read(8).decode('ascii').strip())
+        f.seek(236)
+        n_records = int(f.read(8).decode('ascii').strip())
+
+    full_size = os.path.getsize(full_path)
+    bytes_per_record = (full_size - header_size) // n_records
+
+    # Create truncated copy (remove half of last data record)
+    import shutil
+    partial_path = str(output_path)
+    shutil.copy2(full_path, partial_path)
+    with open(partial_path, 'r+b') as f:
+        f.truncate(full_size - bytes_per_record // 2)
+
+    return full_path, partial_path
+
+
 def format_edf_config_json(config_json):
     """
     Format the EDF configuration JSON to match the expected structure for pyedflib.
