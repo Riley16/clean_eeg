@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from tqdm import tqdm
 from clean_eeg.anonymize import redact_subject_name, PersonalName
 from clean_eeg.load_eeg import load_edf, write_edf_pyedflib
+from clean_eeg.log import logged_input, setup_logger, get_logger, close_logger
 from clean_eeg.modify_edf_inplace import (
     update_edf_header_inplace,
     clear_edf_annotations_inplace,
@@ -357,7 +358,7 @@ def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0):
             if gap.total_seconds() < MIN_RECORDING_GAP_ERROR_SECONDS:
                 confirm_continue = True
     if confirm_continue:
-        continue_input = input("Continue? yes/no: ")
+        continue_input = logged_input("Continue? yes/no: ")
     if continue_input.lower() not in ['yes', 'y']:
         raise RuntimeError("Aborting EDF de-identification conversion due to recording gap.")
 
@@ -381,7 +382,7 @@ def _check_subject_name_consistency(EDF_meta_data: dict, command_line_subject_na
             files_with_name = [fname for fname, sname in subject_names.items() if sname == name]
             print(f'Subject name "{name}" found in files: {files_with_name}')
         print("This may indicate multiple subjects are included in the same EDF data folder, which should not be the case.")
-        continue_input = input("Continue? (only continue if names are indeed from the same subject for data integrity) yes/no: ")
+        continue_input = logged_input("Continue? (only continue if names are indeed from the same subject for data integrity) yes/no: ")
         if continue_input.lower() not in ['yes', 'y']:
             raise RuntimeError("Aborting EDF de-identification conversion due to inconsistent subject names.")
     elif len(unique_names) < 1:
@@ -393,10 +394,10 @@ def _check_subject_name_consistency(EDF_meta_data: dict, command_line_subject_na
         if len(unique_names) == 1:
             subject_name = unique_names.pop()
             if (not is_all_X_with_spaces(subject_name)) and (subject_name != command_line_subject_name_str):
-                continue_input = input(f'Confirm that subject name in EDF files ("{subject_name}") matches '
+                continue_input = logged_input(f'Confirm that subject name in EDF files ("{subject_name}") matches '
                                        f'subject name specified by command line ("{command_line_subject_name_str}"): yes/no: ')
         elif (len(unique_names) > 1) and not all(is_all_X_with_spaces(subject_name) for subject_name in unique_names):
-            continue_input = input(f'Confirm that subject names in EDF files ({unique_names}) match '
+            continue_input = logged_input(f'Confirm that subject names in EDF files ({unique_names}) match '
                                    f'subject name specified by command line ("{command_line_subject_name_str}"): yes/no: ')
         if continue_input.lower() not in ['yes', 'y']:
             raise RuntimeError("Aborting EDF de-identification conversion due to inconsistent subject names.")
@@ -417,7 +418,7 @@ def _check_signal_header_consistency(EDF_meta_data: dict, verbosity: int = 0):
             print(f'Signal header labels\n\n{labels}\n\nfound in files:\n{files_with_header}')
         print("\nThis may indicate inconsistent EDF signal labels across recordings or multiple subjects across files in the EDF data folder.")
         print('Alternatively, this may be due to multiple recording montages during e.g., the same stay in the epilepsy monitoring unit.')
-        continue_input = input("Continue? (only continue if recordings have been confirmed as coming from the same subject and EMU stay for data integrity) yes/no: ")
+        continue_input = logged_input("Continue? (only continue if recordings have been confirmed as coming from the same subject and EMU stay for data integrity) yes/no: ")
         if continue_input.lower() not in ['yes', 'y']:
             raise RuntimeError("Aborting EDF de-identification conversion due to inconsistent signal headers.")
 
@@ -440,13 +441,13 @@ def get_clean_eeg_cli_arguments():
         # Prompt for required arguments
         for attr, prompt in required_fields.items():
             if getattr(args, attr) in (None, ""):
-                value = input(prompt).strip()
+                value = logged_input(prompt).strip()
                 setattr(args, attr, value)
 
         # Middle name: optional, but still prompt if missing
         # If user presses Enter, leave default "NOT_SPECIFIED"
         if args.middle_name in (None, "", "NOT_SPECIFIED"):
-            mn = input(
+            mn = logged_input(
                 "Enter subject middle name(s) "
                 "(use underscores between multiple names; press Enter to skip): "
             ).strip()
@@ -513,21 +514,63 @@ def validate_cli_arguments(args):
     is_valid_subject_code(args.subject_code)
 
 
-if __name__ == "__main__":
-    args = get_clean_eeg_cli_arguments()
-    validate_cli_arguments(args)
-    subject_name = PersonalName(
-        first_name=args.first_name,
-        middle_names=args.middle_name.split('_') if args.middle_name else [],
-        last_name=args.last_name
-    )
+def redact_log_file(log_path: str, subject_name: PersonalName):
+    """Run full name redaction on the log file to catch fuzzy matches and nicknames."""
+    with open(log_path, "r") as f:
+        content = f.read()
+    redacted = redact_subject_name(content, subject_full_name=subject_name)
+    with open(log_path, "w") as f:
+        f.write(redacted)
 
-    clean_subject_edf_files(
-        input_path=args.input_path,
-        output_path=args.output_path,
-        subject_code=args.subject_code,
-        subject_name=subject_name,
-        load_method=args.load_method,
-        raise_errors=args.raise_errors,
-        verbosity=args.verbosity,
-    )
+
+LOG_FILENAME = "log.out"
+
+if __name__ == "__main__":
+    log_path = os.path.join(os.getcwd(), LOG_FILENAME)
+    logger = setup_logger(log_path)
+
+    try:
+        args = get_clean_eeg_cli_arguments()
+        validate_cli_arguments(args)
+
+        # Register subject name parts as PHI for log scrubbing
+        for name_part in [args.first_name, args.last_name]:
+            logger.add_phi(name_part)
+        if args.middle_name and args.middle_name != "NOT_SPECIFIED":
+            for mn in args.middle_name.split('_'):
+                logger.add_phi(mn)
+        logger.rescrub()
+        logger.log_args(args)
+
+        subject_name = PersonalName(
+            first_name=args.first_name,
+            middle_names=args.middle_name.split('_') if args.middle_name else [],
+            last_name=args.last_name
+        )
+
+        clean_subject_edf_files(
+            input_path=args.input_path,
+            output_path=args.output_path,
+            subject_code=args.subject_code,
+            subject_name=subject_name,
+            load_method=args.load_method,
+            raise_errors=args.raise_errors,
+            verbosity=args.verbosity,
+        )
+
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print(f"\nPlease send the log file to the data management team for debugging:")
+        print(f"  {log_path}")
+        raise SystemExit(1)
+
+    finally:
+        close_logger()
+        # Run full name redaction on the log file (fuzzy matching, nicknames, etc.)
+        _subject_name = locals().get('subject_name')
+        if _subject_name is not None:
+            redact_log_file(log_path, _subject_name)
+        # Copy log alongside output files for transfer
+        if 'args' in locals() and hasattr(args, 'output_path') and args.output_path and os.path.isdir(args.output_path):
+            shutil.copy(log_path, os.path.join(args.output_path, LOG_FILENAME))
