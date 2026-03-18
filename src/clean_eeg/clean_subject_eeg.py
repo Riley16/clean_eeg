@@ -464,10 +464,11 @@ def get_clean_eeg_cli_arguments():
     # ---- DO NOT mark required=True; we prompt manually ----
     parser.add_argument("--input_path", type=str, default='',
                         help="Path to all EDF files (required)")
-    parser.add_argument("--output_path", type=str, default='',
-                        help="Path to output de-identified EDF files. Must differ "
-                             "from input_path. If not specified, defaults to "
-                             "'deidentified_eeg_files' within input_path.")
+    parser.add_argument("--copy_path", type=str, default=None,
+                        help="Write de-identified files to this directory instead "
+                             "of modifying in place. If set without a value, "
+                             "defaults to 'deidentified_eeg_files' within input_path.",
+                        nargs='?', const='')
     parser.add_argument("--subject_code", type=str, default='',
                         help="Subject code (e.g., R1755A) (required)")
     parser.add_argument("--first_name", type=str, default='',
@@ -477,8 +478,6 @@ def get_clean_eeg_cli_arguments():
                              'multiple middle names. If no middle name, use ""')
     parser.add_argument("--last_name", type=str, default='',
                         help="Subject last name (required)")
-    parser.add_argument("--load_method", type=str, default="pyedflib",
-                        help="Method to load EDF files: 'pyedflib' or 'lunapi'")
     parser.add_argument("--raise_errors", action="store_true",
                         help="Raise errors instead of warnings for debugging")
     parser.add_argument("--verbosity", type=int, default=1,
@@ -489,20 +488,35 @@ def get_clean_eeg_cli_arguments():
     # Prompt for anything missing (including middle name)
     args = prompt_if_missing(args)
 
-    # Auto-generate output_path if not supplied
-    if not args.output_path:
-        args.output_path = os.path.join(args.input_path, "deidentified_eeg_files")
+    # Resolve output_path based on mode
+    if args.copy_path is not None:
+        # Copy mode
+        if not args.copy_path:
+            args.output_path = os.path.join(args.input_path, "deidentified_eeg_files")
+        else:
+            args.output_path = args.copy_path
+    else:
+        # Inplace mode (default)
+        args.output_path = args.input_path
 
     return args
 
 
 def validate_cli_arguments(args):
-    if args.output_path == args.input_path:
-        raise ValueError("Output path must be different from input path to avoid overwriting original EDF files.")
     if not os.path.exists(args.input_path):
         raise ValueError(f"Input path does not exist: {args.input_path}")
-    if not os.path.exists(args.output_path):
-        os.makedirs(args.output_path)
+    if args.copy_path is not None:
+        if args.output_path == args.input_path:
+            raise ValueError("With --copy_path, output path must differ from input path.")
+        if not os.path.exists(args.output_path):
+            os.makedirs(args.output_path)
+    else:
+        print(f"WARNING: De-identification will modify EDF files in place at:\n"
+              f"  {args.input_path}\n"
+              f"Original headers will be overwritten. Use --copy_path to write to a separate directory instead.")
+        confirm = logged_input("Continue with in-place de-identification? yes/no: ")
+        if confirm.lower() not in ['yes', 'y']:
+            raise RuntimeError("Aborting. Re-run with --copy_path to write to a separate directory.")
 
     if args.middle_name == 'NOT_SPECIFIED':
         raise ValueError('Middle name must be specified with --middle-name argument. '
@@ -554,8 +568,8 @@ if __name__ == "__main__":
             output_path=args.output_path,
             subject_code=args.subject_code,
             subject_name=subject_name,
-            load_method=args.load_method,
             raise_errors=args.raise_errors,
+            inplace=args.copy_path is None,
             verbosity=args.verbosity,
         )
 

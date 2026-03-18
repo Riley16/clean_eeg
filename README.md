@@ -20,25 +20,68 @@ pip install .
 
 To run unit tests, instead install in editable mode:
 ```
-pip install -e .
+pip install -e ".[test]"
 pytest
 ```
 
-To clean a directory of EEG files for one subject:
+## Usage
+
+To de-identify a directory of EEG files for one subject (modifies files in place by default):
 ```
 cd clean_eeg
 conda activate clean_eeg
-python src/clean_eeg/clean_subject_eeg.py --input_path PATH/TO/ALL/SUBJECT/EEG/FILES --output_path OPTIONAL/PATH/TO/OUTPUT/DEIDENTIFIED/FILES --subject_code R1XXXY --first-name John --middle-name Paul --last-name Smith
+python src/clean_eeg/clean_subject_eeg.py \
+  --input_path /path/to/subject/edf/files \
+  --subject_code SUBJECT_CODE \
+  --first_name FIRST_NAME \
+  --middle_name MIDDLE_NAME \
+  --last_name LAST_NAME
 ```
-The path to the de-identified files will be printed once the process finishes. Multiple middle names can be specified by separating them with an underscore.
+
+By default, EDF files are de-identified in place — headers are modified directly in the original files and a separate annotation stub is created alongside each file. This avoids rewriting signal data and is significantly faster.
+
+To write de-identified copies to a separate directory instead, use `--copy_path`:
+```
+python src/clean_eeg/clean_subject_eeg.py \
+  --input_path /path/to/subject/edf/files \
+  --copy_path /path/to/output/directory \
+  --subject_code SUBJECT_CODE \
+  --first_name FIRST_NAME \
+  --middle_name MIDDLE_NAME \
+  --last_name LAST_NAME
+```
+
+If `--copy_path` is used without a value, de-identified files are written to a `deidentified_eeg_files` subdirectory within the input path.
+
+If the subject has no middle name, pass an empty string:
+```
+  --middle_name ""
+```
+
+If the subject has multiple middle names, separate them with underscores:
+```
+  --middle_name MIDDLE1_MIDDLE2
+```
+
+Any required arguments not provided on the command line will be prompted for interactively. The path to the de-identified files will be printed once the process finishes.
+
+## Log files
+
+The pipeline writes a log file (`log.out`) to the current working directory. All console output is duplicated to this file, with patient name parts automatically scrubbed (replaced with `[PHI_REDACTED]`). After the pipeline finishes, the log is also copied to the output directory alongside the de-identified EDF files.
+
+If the pipeline encounters an error, it will print the log file path and ask you to send it to the data management team for debugging. Because PHI is scrubbed from the log, it is safe to share.
+
+After a successful run, a final redaction pass (fuzzy matching and nickname variants) is applied to the log file to catch any name fragments that may have been missed during streaming output.
 
 ## Dependencies:
-- [pyedflib](https://github.com/holgern/pyedflib)
-    - our primary EDF IO manager
-- [lunapi](https://zzz.bwh.harvard.edu/luna/lunapi/)
-    - used to split discontinuous EDF+D files into separate continuous EDF+C files since pyedflib does not support the EDF+D formats
-- [edfio](https://github.com/the-siesta-group/edfio)
-- [MNE](https://mne.tools/stable/index.html)
+- [pyedflib](https://github.com/holgern/pyedflib) — primary EDF I/O and header manipulation
+- [lunapi](https://zzz.bwh.harvard.edu/luna/lunapi/) — splitting discontinuous EDF+D files into continuous EDF+C segments (pyedflib does not support EDF+D)
+- [numpy](https://numpy.org/) — array operations for signal data
+- [presidio-analyzer](https://github.com/microsoft/presidio) / [presidio-anonymizer](https://github.com/microsoft/presidio) — NLP entity detection and redaction
+- [rapidfuzz](https://github.com/rapidfuzz/RapidFuzz) — fuzzy name matching via Levenshtein distance
+- [nicknames](https://github.com/carltonnorthern/nickname-and-diminutive-names-lookup) — nickname variant expansion (e.g., John → Johnny)
+- [regex](https://github.com/mrabarnett/mrab-regex) — advanced regex support
+- [tqdm](https://github.com/tqdm/tqdm) — progress bars
 
 
 ## Accessing External or Network Drives (Windows, WSL, macOS)
