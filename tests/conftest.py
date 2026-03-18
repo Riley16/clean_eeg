@@ -27,3 +27,13 @@ def ensure_test_data():
             run_generate_test_edf()
             print('Finished generating test EDF data files on first test run.')
             break
+
+    # Remove any stale EDF files in TEST_SUBJECT_DATA_DIR that are not expected
+    expected_subject_files = {
+        test_config[k]['filename']
+        for k in test_config
+        if test_config[k]['filename'].startswith('subject_')
+    }
+    for f in TEST_SUBJECT_DATA_DIR.iterdir():
+        if f.suffix == '.edf' and f.name not in expected_subject_files:
+            f.unlink()

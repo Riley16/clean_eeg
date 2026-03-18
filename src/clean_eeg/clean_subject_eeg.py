@@ -215,7 +215,7 @@ def clean_subject_edf_files(
         clean_start_time = edf['header']['startdate']
         filename_no_ext = os.path.splitext(filename)[0]
         subject_val = subject_code
-        clean_filename = f"{filename_no_ext}_{subject_val}_{clean_start_time.strftime('%Y.%m.%d__%H:%M:%S')}.edf"
+        clean_filename = f"{filename_no_ext}_{subject_val}_{clean_start_time.strftime('%Y.%m.%d__%H.%M.%S')}.edf"
         clean_full_path = os.path.join(output_path, clean_filename)
         if inplace:
             shutil.move(input_file_path, clean_full_path)
