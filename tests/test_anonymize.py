@@ -207,3 +207,67 @@ def test_hyphenated_middle_name():
     ]
     for text, expected in cases:
         assert redact_subject_name(text, HYPHEN_MIDDLE) == expected
+
+
+# ---------------------------------------------------------------------
+# SubjectNameRedactor memoization
+# ---------------------------------------------------------------------
+
+def test_redactor_memoizes_identical_inputs():
+    """Repeated ``.redact()`` calls on the same text must return the same
+    result and the text must land in the cache after the first call."""
+    from clean_eeg.anonymize import SubjectNameRedactor
+
+    redactor = SubjectNameRedactor(PATIENT_NAME)
+
+    first = redactor.redact("John P. O'Connor was here")
+    second = redactor.redact("John P. O'Connor was here")
+    assert first == second
+    assert REDACT_NAME_REPLACEMENT in first
+    assert "John P. O'Connor was here" in redactor._cache
+
+
+def test_redactor_cache_calls_presidio_once_per_unique_text(monkeypatch):
+    """The analyzer must be invoked exactly once per unique input, no
+    matter how many times that input is redacted. Guards against a
+    future regression where the cache is bypassed."""
+    from clean_eeg.anonymize import SubjectNameRedactor
+
+    redactor = SubjectNameRedactor(PATIENT_NAME)
+
+    call_count = {"n": 0}
+    orig_analyze = redactor.analyzer.analyze
+
+    def counting_analyze(*args, **kwargs):
+        call_count["n"] += 1
+        return orig_analyze(*args, **kwargs)
+
+    monkeypatch.setattr(redactor.analyzer, "analyze", counting_analyze)
+
+    # 3 unique strings, each redacted 10 times. analyzer must fire only
+    # 3 times if the cache is wired up correctly.
+    for _ in range(10):
+        redactor.redact("uV")
+        redactor.redact("")
+        redactor.redact("John arrived")
+    assert call_count["n"] == 3
+
+
+def test_redactor_caches_are_independent_per_subject():
+    """Two redactors for different subjects must have independent caches
+    so a hit for one can't leak the wrong redacted value to the other."""
+    from clean_eeg.anonymize import SubjectNameRedactor
+
+    red_a = SubjectNameRedactor(PATIENT_NAME)  # John P. O'Connor
+    red_b = SubjectNameRedactor(PersonalName(first_name='Jane',
+                                              middle_names=[],
+                                              last_name='Doe'))
+
+    text = "Jane arrived"
+    a_result = red_a.redact(text)
+    b_result = red_b.redact(text)
+    # For John: "Jane" is not his name -> unchanged.
+    # For Jane: "Jane" is her name    -> redacted.
+    assert a_result == text
+    assert REDACT_NAME_REPLACEMENT in b_result
+    assert red_a._cache is not red_b._cache
