@@ -37,3 +37,12 @@ where = ["src"]
 tag_regex = "^v(?P<version>\\d+\\.\\d+\\.\\d+)$"
 version_scheme = "post-release"
 local_scheme = "no-local-version"
+
+[tool.pytest.ini_options]
+# Benchmark tests generate larger EDF fixtures and exercise the full
+# pipeline end-to-end; they are opt-in only. Default test runs skip them.
+# Run explicitly with:  pytest -m benchmark
+markers = [
+    "benchmark: long-running pipeline benchmark tests (not run by default)",
+]
+addopts = "-m 'not benchmark'"

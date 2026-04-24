@@ -8,7 +8,7 @@ from copy import deepcopy
 from typing import Union
 from datetime import datetime, timedelta
 from tqdm import tqdm
-from clean_eeg.anonymize import redact_subject_name, PersonalName
+from clean_eeg.anonymize import redact_subject_name, PersonalName, SubjectNameRedactor
 from clean_eeg.load_eeg import load_edf, write_edf_pyedflib
 from clean_eeg.log import logged_input, setup_logger, get_logger, close_logger
 from clean_eeg.modify_edf_inplace import (
@@ -30,7 +30,8 @@ SITE_CODE_TO_INCOMING_FOLDER = {'S': 'UTHSCSA',
                                 'J': 'TJ'}
 
 
-def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_start_time):
+def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_start_time,
+                   redactor: Union[SubjectNameRedactor, None] = None):
     # remove protected health information (PHI) from EEG
     # accepts EDF data in 'pyedflib' format
 
@@ -42,30 +43,41 @@ def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_star
     #        RELATIVE.START.DATE_RELATIVE:START:TIME corresponds to YEAR.MONTH.DAY__HOUR:MINUTE:SECOND relative to the earliest recording start time
     #        relative times are offset by the EDF standard clipping date of 1985-01-01
 
-    edf_data = deepcopy(edf_data)
-    edf_data['header'] = deidentify_edf_header(edf_data['header'],
-                                               subject_name=subject_name,
-                                               subject_code=subject_code,
-                                               earliest_recording_start_time=earliest_recording_start_time)
-    clean_signal_headers = list()
-    for signal_header in edf_data['signal_headers']:
-        cleaned = deidentify_edf_header(signal_header,
+    # Build a fresh top-level dict. Each helper already constructs new
+    # objects for the fields it modifies (deidentify_edf_header deepcopies
+    # its input dict; deidentify_edf_annotations builds fresh arrays), so
+    # an outer deepcopy would double the memory of the signal arrays for
+    # no additional isolation. Signals are not mutated by de-identification,
+    # so we share the reference.
+    clean_signal_headers = [
+        deidentify_edf_header(sh,
+                              subject_name=subject_name,
+                              subject_code=subject_code,
+                              earliest_recording_start_time=None,  # signal headers do not have a start time
+                              redact_keys=list(),  # check all
+                              redactor=redactor)
+        for sh in edf_data['signal_headers']
+    ]
+    return {
+        'header': deidentify_edf_header(edf_data['header'],
                                         subject_name=subject_name,
                                         subject_code=subject_code,
-                                        earliest_recording_start_time=None,  # signal headers do not have a start time
-                                        redact_keys=list()  # check all
-                                        )
-        clean_signal_headers.append(cleaned)
-    edf_data['signal_headers'] = clean_signal_headers
-    edf_data['annotations'] = deidentify_edf_annotations(edf_data['annotations'], subject_name=subject_name)
-    return edf_data
+                                        earliest_recording_start_time=earliest_recording_start_time,
+                                        redactor=redactor),
+        'signal_headers': clean_signal_headers,
+        'annotations': deidentify_edf_annotations(edf_data['annotations'],
+                                                  subject_name=subject_name,
+                                                  redactor=redactor),
+        'signals': edf_data['signals'],
+    }
 
 
 def deidentify_edf_header(header: dict,
                           subject_code: str,
                           subject_name: PersonalName,
                           earliest_recording_start_time: Union[datetime,None]=None,
-                          redact_keys: list[str]=DEFAULT_REDACT_HEADER_KEYS):
+                          redact_keys: list[str]=DEFAULT_REDACT_HEADER_KEYS,
+                          redactor: Union[SubjectNameRedactor, None] = None):
     header = deepcopy(header)
     is_signal_header = 'label' in header
     if earliest_recording_start_time is None:
@@ -85,7 +97,8 @@ def deidentify_edf_header(header: dict,
         if isinstance(val, str):
             header[key] = redact_string(val,
                                         field_name=key,
-                                        subject_name=subject_name)
+                                        subject_name=subject_name,
+                                        redactor=redactor)
         elif isinstance(val, (int, float, datetime)):
             pass
         else:
@@ -93,7 +106,8 @@ def deidentify_edf_header(header: dict,
     return header
 
 
-def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: PersonalName):
+def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: PersonalName,
+                                redactor: Union[SubjectNameRedactor, None] = None):
     clean_start_times = list()
     clean_durations = list()
     clean_descriptions = list()
@@ -102,7 +116,8 @@ def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: Per
         redacted_text = redact_string(str(text),
                                       field_name='annotation',
                                       subject_name=subject_name,
-                                      alert=True)
+                                      alert=True,
+                                      redactor=redactor)
         clean_start_times.append(start_time)
         clean_durations.append(duration)
         clean_descriptions.append(redacted_text)
@@ -136,8 +151,9 @@ def deidentify_start_date_time(recording_start_time, earliest_recording_start_ti
 
 
 def redact_string(text: str, field_name: str, subject_name: PersonalName,
-                  alert: bool = False) -> str:
-    redacted = redact_subject_name(text, subject_full_name=subject_name)
+                  alert: bool = False,
+                  redactor: Union[SubjectNameRedactor, None] = None) -> str:
+    redacted = redact_subject_name(text, subject_full_name=subject_name, redactor=redactor)
     redacted = remove_gendered_pronouns(redacted)
     if alert and text != redacted:
         print('Subject protected health information detected in EDF '
@@ -177,13 +193,19 @@ def clean_subject_edf_files(
     inplace: bool = False,
     verbosity: int = 1,
     skip_header_name_check: bool = False,
+    benchmark: bool = False,
+    read_digital: bool = True,
 ):
+    from clean_eeg.benchmark import BenchmarkCollector
+    bench = BenchmarkCollector(enabled=benchmark)
+
     if inplace:
         assert input_path == output_path, "For inplace cleaning, input_path must equal output_path."
     EDF_meta_data = _load_edf_metadata(input_path=input_path,
                                        verbosity=verbosity,
                                        load_method=load_method,
-                                       raise_errors=raise_errors)
+                                       raise_errors=raise_errors,
+                                       bench=bench)
 
     if not EDF_meta_data:
         raise RuntimeError(
@@ -203,27 +225,46 @@ def clean_subject_edf_files(
     n_audit = min(2, len(all_filenames))
     audit_filenames = set(random.sample(all_filenames, n_audit))
 
+    # Build Presidio once per subject and reuse across all redact_string calls.
+    # This amortizes the spaCy-model + recognizer-registry construction cost.
+    with bench.step("build_presidio_redactor"):
+        redactor = SubjectNameRedactor(subject_name) if subject_name is not None else None
+
     # de-identify EDF files and save out
     print("Cleaning EDF files... Saving to output path:", output_path)
     failed_files: list[tuple[str, str]] = []
     for filename, _ in tqdm(EDF_meta_data.items()):
         try:
             input_file_path = os.path.join(input_path, filename)
-            edf = load_edf(input_file_path, load_method=load_method, preload=True)
+            # In inplace mode, signals are never rewritten — the pipeline only
+            # moves the file and patches headers/annotations in place. Signals
+            # are therefore only needed for the audit files. For non-audit
+            # files in inplace mode we skip preload entirely (load_edf returns
+            # signals=None in that case). Copy mode always needs signals.
+            need_signals = (not inplace) or (filename in audit_filenames)
+            step_label = ("load_preload_signals" if need_signals
+                          else "load_metadata_only")
+            with bench.step(step_label, file=filename):
+                edf = load_edf(input_file_path, load_method=load_method,
+                               preload=need_signals, read_digital=read_digital)
             assert isinstance(edf, dict)
 
-            # Stash original signals before de-identification for audited files
-            if filename in audit_filenames:
-                orig_signals = [sig.copy() for sig in edf['signals']]
+            # Hold on to a reference to the original signals for the audit.
+            # deidentify_edf does not mutate signals (and no longer deep-copies
+            # them), so the same array objects remain valid across the call.
+            orig_signals = edf['signals'] if filename in audit_filenames else None
 
-            edf = deidentify_edf(
-                edf_data=edf,
-                subject_name=subject_name,
-                subject_code=subject_code,
-                earliest_recording_start_time=min_start_time
-            )
-            truncation_warnings = validate_header_roundtrip(
-                edf['header'], edf['signal_headers'])
+            with bench.step("deidentify_edf", file=filename):
+                edf = deidentify_edf(
+                    edf_data=edf,
+                    subject_name=subject_name,
+                    subject_code=subject_code,
+                    earliest_recording_start_time=min_start_time,
+                    redactor=redactor,
+                )
+            with bench.step("validate_header_roundtrip", file=filename):
+                truncation_warnings = validate_header_roundtrip(
+                    edf['header'], edf['signal_headers'])
             for warning in truncation_warnings:
                 print(f"WARNING: {warning}")
 
@@ -233,22 +274,26 @@ def clean_subject_edf_files(
             clean_filename = f"{filename_no_ext}_{subject_val}_{clean_start_time.strftime('%Y.%m.%d__%H.%M.%S')}.edf"
             clean_full_path = os.path.join(output_path, clean_filename)
             if inplace:
-                shutil.move(input_file_path, clean_full_path)
-                clean_annotations_path = str(clean_full_path).replace('.edf', '_annotations.edf')
-                create_annotations_only_edf(clean_annotations_path,
-                                            header=edf['header'],
-                                            annotations=edf['annotations'])
-                update_edf_header_inplace(clean_full_path,
-                                          header_updates=edf['header'],
-                                          signal_header_updates=edf['signal_headers'])
-                clear_edf_annotations_inplace(clean_full_path)
+                with bench.step("write_inplace", file=filename):
+                    shutil.move(input_file_path, clean_full_path)
+                    clean_annotations_path = str(clean_full_path).replace('.edf', '_annotations.edf')
+                    create_annotations_only_edf(clean_annotations_path,
+                                                header=edf['header'],
+                                                annotations=edf['annotations'])
+                    update_edf_header_inplace(clean_full_path,
+                                              header_updates=edf['header'],
+                                              signal_header_updates=edf['signal_headers'])
+                    clear_edf_annotations_inplace(clean_full_path)
             else:
-                write_edf_pyedflib(edf, clean_full_path)
+                with bench.step("write_edf_pyedflib", file=filename):
+                    write_edf_pyedflib(edf, clean_full_path, digital=read_digital)
             print(f"Cleaned EDF file at: {clean_filename}")
 
             # Audit signal integrity immediately after write
             if filename in audit_filenames:
-                _audit_signal_integrity(orig_signals, clean_full_path, filename, inplace=inplace)
+                with bench.step("audit_signal_integrity", file=filename):
+                    _audit_signal_integrity(orig_signals, clean_full_path, filename,
+                                            inplace=inplace, digital=read_digital)
         except Exception as e:
             if raise_errors:
                 raise e
@@ -257,6 +302,8 @@ def clean_subject_edf_files(
                   f"Skipping this file and continuing...\n")
 
     print("Done cleaning EDF files. Saved to output path:", output_path)
+    if benchmark:
+        print(bench.report())
     if failed_files:
         print(
             f"\nWARNING: {len(failed_files)} EDF file(s) were skipped during "
@@ -277,20 +324,23 @@ def clean_subject_edf_files(
 
 
 def _audit_signal_integrity(orig_signals: list, clean_file_path: str, filename: str,
-                            inplace: bool = False):
+                            inplace: bool = False, digital: bool = False):
     """Spot-check that signal data in the output file matches the original.
 
     For inplace mode, signals must be bit-identical since only headers are modified.
     For rewrite mode, pyedflib's digital/physical conversion introduces floating-point
     differences, so the audit is skipped (this is a known pyedflib limitation and the
     reason the in-place approach was developed).
+
+    ``digital`` must match the mode used to read ``orig_signals``; when True, the
+    clean file is also read in digital mode so the bit-comparison is meaningful.
     """
     if not inplace:
         return
     with pyedflib.EdfReader(clean_file_path) as f:
         n_signals = f.signals_in_file
         for i in range(n_signals):
-            clean_signal = f.readSignal(i)
+            clean_signal = f.readSignal(i, digital=digital)
             orig_signal = orig_signals[i]
             min_len = min(len(orig_signal), len(clean_signal))
             if not np.array_equal(orig_signal[:min_len], clean_signal[:min_len]):
@@ -314,8 +364,12 @@ def _load_edf_metadata(input_path: str,
                        verbosity: int = 1,
                        convert_to_edfC: bool = True,
                        repair_truncated: bool = True,
-                       raise_errors: bool = False):
+                       raise_errors: bool = False,
+                       bench=None):
     from clean_eeg.repair_edf import repair_truncated_edf_header
+    from clean_eeg.benchmark import BenchmarkCollector
+    if bench is None:
+        bench = BenchmarkCollector(enabled=False)
     EDF_meta_data = dict()
     failed_files: list[tuple[str, str]] = []  # (filename, error_message)
     for filename in tqdm(os.listdir(input_path), desc="Loading EDF meta-data..."):
@@ -324,10 +378,13 @@ def _load_edf_metadata(input_path: str,
         full_path = os.path.join(input_path, filename)
         try:
             if convert_to_edfC:
-                convert_edfC_to_edfD(full_path)
+                with bench.step("convert_edfD_to_edfC", file=filename):
+                    convert_edfC_to_edfD(full_path)
             if repair_truncated:
-                repair_truncated_edf_header(full_path, verbosity=verbosity)
-            data = load_edf(full_path, load_method=load_method, preload=False)
+                with bench.step("repair_truncated_header", file=filename):
+                    repair_truncated_edf_header(full_path, verbosity=verbosity)
+            with bench.step("load_edf_metadata_only", file=filename):
+                data = load_edf(full_path, load_method=load_method, preload=False)
             EDF_meta_data[filename] = {'data': data}
         except Exception as e:
             if raise_errors:
@@ -542,6 +599,10 @@ def get_clean_eeg_cli_arguments():
                              "header name fields have already been redacted but annotations "
                              "still need to be cleaned. Name redaction is still applied to "
                              "all header fields.")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Print per-step wall time, RSS delta, and peak-RSS growth for "
+                             "each EDF file. Useful for profiling the pipeline's time and "
+                             "memory hot-spots.")
 
     args = parser.parse_args()
 
@@ -642,6 +703,7 @@ if __name__ == "__main__":
             inplace=args.copy_path is None,
             verbosity=args.verbosity,
             skip_header_name_check=args.skip_header_name_check,
+            benchmark=args.benchmark,
         )
 
     except Exception:

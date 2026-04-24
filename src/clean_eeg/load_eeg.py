@@ -43,19 +43,22 @@ def load_edf(filename, load_method='pyedflib', preload=False, read_digital=False
         raise ValueError("Invalid load method specified. Use 'pyedflib' or 'lunapi'.")
     
 
-def write_edf_pyedflib(data, filename):
+def write_edf_pyedflib(data, filename, digital: bool = False):
     """
     Write EDF data using pyedflib.
 
     Parameters:
         data (dict): Data dictionary containing 'signals', 'header', 'signal_headers', and 'annotations'.
         filename (str): Path to save the EDF file.
+        digital (bool): If True, ``data['signals']`` is expected to hold int16
+            digital samples (i.e. matching what was read with ``read_digital=True``).
+            Avoids the float64<->int16 round-trip and the associated memory overhead.
     """
     import pyedflib
     with pyedflib.EdfWriter(filename, len(data['signals']), file_type=pyedflib.FILETYPE_EDFPLUS) as f:
         f.setHeader(data['header'])
         f.setSignalHeaders(data['signal_headers'])
-        f.writeSamples(data['signals'])
+        f.writeSamples(data['signals'], digital=digital)
         for time, duration, text in zip(*data['annotations']):
             f.writeAnnotation(time, duration, text)
     

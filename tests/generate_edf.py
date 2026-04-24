@@ -140,6 +140,63 @@ def generate_partial_record_edf(output_path, n_channels=2, sample_rate=100,
     return full_path, partial_path
 
 
+def generate_large_benchmark_edf(out_path: str,
+                                 n_channels: int = 178,
+                                 sample_rate_hz: int = 500,
+                                 duration_s: int = 180,
+                                 patient_name: str = "Test Patient",
+                                 subject_code: str = "R1BENCHS") -> None:
+    """Write a single EDF file shaped like a Nihon Kohden export for
+    benchmarking the de-identification pipeline.
+
+    Defaults produce a ~30 MB file (178 ch * 500 Hz * 2 bytes * 180 s).
+    """
+    signal_headers = []
+    for i in range(n_channels):
+        signal_headers.append({
+            'label': f'CH{i:03d}',
+            'dimension': 'uV',
+            'sample_frequency': sample_rate_hz,
+            'physical_max': 3200.0,
+            'physical_min': -3200.0,
+            'digital_max': 32767,
+            'digital_min': -32768,
+            'prefilter': '',
+            'transducer': '',
+        })
+
+    t = np.arange(0, duration_s, 1 / sample_rate_hz, dtype=np.float32)
+    signals = []
+    for i in range(n_channels):
+        freq_hz = (i % 20) + 1
+        signals.append((1000.0 * np.sin(2 * np.pi * freq_hz * t)).astype(np.float64))
+
+    header = {
+        'technician': 'BenchTech',
+        'recording_additional': '',
+        'patientname': patient_name,
+        'patient_additional': '',
+        'patientcode': subject_code,
+        'equipment': 'Nihon Kohden EEG-1200C',
+        'admincode': '',
+        'sex': 'Male',
+        'startdate': datetime(2023, 1, 1, 10, 0, 0),
+        'birthdate': '01 jan 1970',
+        'gender': 'Male',
+    }
+
+    with pyedflib.EdfWriter(file_name=out_path,
+                            n_channels=n_channels,
+                            file_type=pyedflib.FILETYPE_EDFPLUS) as f:
+        f.setHeader(header)
+        f.setSignalHeaders(signal_headers)
+        f.writeSamples(signals)
+        f.writeAnnotation(0.5, -1, "SEGMENT 1")
+        f.writeAnnotation(5.0, -1, f"Patient {patient_name} awake")
+        f.writeAnnotation(duration_s / 2, -1, "EVENT MID")
+        f.writeAnnotation(duration_s - 5.0, -1, "SEGMENT END")
+
+
 def format_edf_config_json(config_json):
     """
     Format the EDF configuration JSON to match the expected structure for pyedflib.

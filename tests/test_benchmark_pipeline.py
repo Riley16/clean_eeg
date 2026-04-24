@@ -1,0 +1,63 @@
+"""End-to-end pipeline benchmark test.
+
+Marked `benchmark` and excluded from default pytest runs via
+`addopts = "-m 'not benchmark'"` in pyproject.toml. To execute explicitly:
+
+    pytest -m benchmark
+    pytest tests/test_benchmark_pipeline.py -m benchmark -s
+
+The `-s` flag keeps pytest from swallowing stdout so the per-step
+[bench] lines and final benchmark report are visible live.
+"""
+
+import os
+
+import pytest
+
+from clean_eeg.anonymize import PersonalName
+from clean_eeg.clean_subject_eeg import clean_subject_edf_files
+from tests.generate_edf import generate_large_benchmark_edf
+
+
+@pytest.mark.benchmark
+def test_pipeline_benchmark_large_edf(tmp_path, capsys):
+    """Generate a ~30 MB synthetic EDF and run the full pipeline with
+    benchmark=True. Asserts the benchmark report is emitted and contains
+    the expected step names. The printed timing/memory rows are the real
+    product of this test; the assertions just guard that instrumentation
+    stays wired up."""
+    subject_code = "R1BENCHS"
+    subject_dir = tmp_path / subject_code / "raw"
+    subject_dir.mkdir(parents=True)
+    edf_path = subject_dir / "bench_large.edf"
+
+    generate_large_benchmark_edf(
+        str(edf_path),
+        n_channels=178,
+        sample_rate_hz=500,
+        duration_s=180,
+        patient_name="Test Patient",
+        subject_code=subject_code,
+    )
+    size_mb = os.path.getsize(edf_path) / (1024 ** 2)
+    assert size_mb >= 25, f"fixture smaller than expected: {size_mb:.1f} MB"
+
+    output_dir = tmp_path / "deidentified"
+    output_dir.mkdir()
+
+    clean_subject_edf_files(
+        input_path=str(subject_dir),
+        output_path=str(output_dir),
+        subject_code=subject_code,
+        subject_name=PersonalName(first_name="Test", middle_names=[], last_name="Patient"),
+        inplace=False,
+        raise_errors=True,
+        verbosity=1,
+        benchmark=True,
+    )
+
+    out = capsys.readouterr().out
+    assert "Benchmark report" in out
+    for step in ("load_preload_signals", "deidentify_edf",
+                 "write_edf_pyedflib", "Totals per file"):
+        assert step in out, f"expected '{step}' in benchmark output"

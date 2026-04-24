@@ -254,14 +254,47 @@ def get_name_variants(name: str, levels=1) -> set[str]:
     return variants
 
 
+class SubjectNameRedactor:
+    """Pre-built Presidio engines plus subject-specific recognizers.
+
+    Building the Presidio stack costs ~100 ms (loads the spaCy model and
+    compiles regex/deny-list/fuzzy recognizers). When redacting many
+    fields per subject — e.g. 178 signal headers times ~12 string fields
+    each — that cost dominates wall time. Construct one instance per
+    subject and reuse ``.redact(text)`` across all calls.
+    """
+
+    def __init__(self, subject_full_name: "PersonalName",
+                 replacement: str = REDACT_NAME_REPLACEMENT):
+        self.subject_full_name = subject_full_name
+        self.replacement = replacement
+        self.analyzer, self.anonymizer, self.registry = build_presidio()
+        add_subject_name_detectors(self.registry, subject_full_name)
+        self._operators = {"SUBJECT_NAME": OperatorConfig(
+            "replace", {"new_value": replacement})}
+
+    def redact(self, text: str) -> str:
+        results = self.analyzer.analyze(
+            text=text, entities=["SUBJECT_NAME"], language="en")
+        return self.anonymizer.anonymize(
+            text=text, analyzer_results=results,
+            operators=self._operators).text
+
+
 def redact_subject_name(text: str,
                         subject_full_name: PersonalName,
-                        replacement: str = REDACT_NAME_REPLACEMENT) -> str:
-    analyzer, anonymizer, registry = build_presidio()
-    add_subject_name_detectors(registry, subject_full_name)
-    results = analyzer.analyze(text=text, entities=["SUBJECT_NAME"], language="en")
-    operators = {"SUBJECT_NAME": OperatorConfig("replace", {"new_value": replacement})}
-    return anonymizer.anonymize(text=text, analyzer_results=results, operators=operators).text
+                        replacement: str = REDACT_NAME_REPLACEMENT,
+                        redactor: "SubjectNameRedactor | None" = None) -> str:
+    """Redact subject-name mentions in ``text``.
+
+    If ``redactor`` is provided, the pre-built engines are reused — strongly
+    preferred when calling this function many times for the same subject.
+    Otherwise a fresh engine is built for each call (backward-compatible
+    behaviour; slow if invoked repeatedly).
+    """
+    if redactor is None:
+        redactor = SubjectNameRedactor(subject_full_name, replacement=replacement)
+    return redactor.redact(text)
 
 
 # ---------- example ----------
