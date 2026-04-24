@@ -41,8 +41,9 @@ local_scheme = "no-local-version"
 [tool.pytest.ini_options]
 # Benchmark tests generate larger EDF fixtures and exercise the full
 # pipeline end-to-end; they are opt-in only. Default test runs skip them.
-# Run explicitly with:  pytest -m benchmark
+# Run explicitly with:  pytest -m benchmark  or  pytest -m benchmark_heavy
 markers = [
-    "benchmark: long-running pipeline benchmark tests (not run by default)",
+    "benchmark: small (~30 MB) pipeline benchmark (not run by default)",
+    "benchmark_heavy: large (~150 MB, many annotations) benchmark; minutes + GB of RAM",
 ]
-addopts = "-m 'not benchmark'"
+addopts = "-m 'not benchmark and not benchmark_heavy'"

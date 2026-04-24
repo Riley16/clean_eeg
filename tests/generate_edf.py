@@ -145,11 +145,19 @@ def generate_large_benchmark_edf(out_path: str,
                                  sample_rate_hz: int = 500,
                                  duration_s: int = 180,
                                  patient_name: str = "Test Patient",
-                                 subject_code: str = "R1BENCHS") -> None:
+                                 subject_code: str = "R1BENCHS",
+                                 n_annotations: int = 4) -> None:
     """Write a single EDF file shaped like a Nihon Kohden export for
     benchmarking the de-identification pipeline.
 
-    Defaults produce a ~30 MB file (178 ch * 500 Hz * 2 bytes * 180 s).
+    Defaults produce a ~30 MB file (178 ch * 500 Hz * 2 bytes * 180 s) with
+    4 hand-crafted annotations. Pass larger duration_s / n_annotations for
+    heavier benchmarks.
+
+    When n_annotations > 4, annotations are distributed evenly across the
+    recording. About one in five contains the patient's name, one in five
+    contains a gendered pronoun, and the rest are generic event markers —
+    so annotation-redaction cost is exercised realistically.
     """
     signal_headers = []
     for i in range(n_channels):
@@ -191,10 +199,27 @@ def generate_large_benchmark_edf(out_path: str,
         f.setHeader(header)
         f.setSignalHeaders(signal_headers)
         f.writeSamples(signals)
-        f.writeAnnotation(0.5, -1, "SEGMENT 1")
-        f.writeAnnotation(5.0, -1, f"Patient {patient_name} awake")
-        f.writeAnnotation(duration_s / 2, -1, "EVENT MID")
-        f.writeAnnotation(duration_s - 5.0, -1, "SEGMENT END")
+        if n_annotations <= 4:
+            f.writeAnnotation(0.5, -1, "SEGMENT 1")
+            f.writeAnnotation(5.0, -1, f"Patient {patient_name} awake")
+            f.writeAnnotation(duration_s / 2, -1, "EVENT MID")
+            f.writeAnnotation(duration_s - 5.0, -1, "SEGMENT END")
+        else:
+            step = duration_s / n_annotations
+            for i in range(n_annotations):
+                onset = min(i * step, max(duration_s - 0.01, 0.0))
+                kind = i % 5
+                if kind == 0:
+                    text = f"Patient {patient_name} awake (event {i})"
+                elif kind == 1:
+                    text = f"he moved slightly, technician noted event {i}"
+                elif kind == 2:
+                    text = f"SEGMENT {i}"
+                elif kind == 3:
+                    text = f"marker {i}: spike-and-wave burst"
+                else:
+                    text = f"clinical note {i}"
+                f.writeAnnotation(onset, -1, text)
 
 
 def format_edf_config_json(config_json):

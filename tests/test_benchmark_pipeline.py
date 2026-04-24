@@ -61,3 +61,51 @@ def test_pipeline_benchmark_large_edf(tmp_path, capsys):
     for step in ("load_preload_signals", "deidentify_edf",
                  "write_edf_pyedflib", "Totals per file"):
         assert step in out, f"expected '{step}' in benchmark output"
+
+
+@pytest.mark.benchmark_heavy
+def test_pipeline_benchmark_heavy_edf(tmp_path, capsys):
+    """Heavy benchmark: ~150 MB fixture with 100 annotations.
+
+    Modelled on real Nihon Kohden recordings that take minutes and many GB
+    of RAM on operator laptops. File is sized by:
+        178 ch * 500 Hz * 2 bytes * 900 s ~= 153 MB
+    and seeded with 100 annotations, ~40% of which contain the subject's
+    name or a gendered pronoun so annotation-redaction cost is exercised.
+
+    Opt in with: pytest -m benchmark_heavy -s
+    """
+    subject_code = "R1BENCHH"
+    subject_dir = tmp_path / subject_code / "raw"
+    subject_dir.mkdir(parents=True)
+    edf_path = subject_dir / "bench_heavy.edf"
+
+    generate_large_benchmark_edf(
+        str(edf_path),
+        n_channels=178,
+        sample_rate_hz=500,
+        duration_s=900,
+        patient_name="Test Patient",
+        subject_code=subject_code,
+        n_annotations=100,
+    )
+    size_mb = os.path.getsize(edf_path) / (1024 ** 2)
+    assert size_mb >= 140, f"fixture smaller than expected: {size_mb:.1f} MB"
+
+    output_dir = tmp_path / "deidentified"
+    output_dir.mkdir()
+
+    clean_subject_edf_files(
+        input_path=str(subject_dir),
+        output_path=str(output_dir),
+        subject_code=subject_code,
+        subject_name=PersonalName(first_name="Test", middle_names=[], last_name="Patient"),
+        inplace=False,
+        raise_errors=True,
+        verbosity=1,
+        benchmark=True,
+    )
+
+    out = capsys.readouterr().out
+    assert "Benchmark report" in out
+    assert "deidentify_edf" in out

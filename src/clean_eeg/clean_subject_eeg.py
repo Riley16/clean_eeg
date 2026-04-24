@@ -86,13 +86,20 @@ def deidentify_edf_header(header: dict,
         header['startdate'] = deidentify_start_date_time(header['startdate'],
                                                          earliest_recording_start_time)
     if not is_signal_header:
+        # Overwrite the entire birthdate field with a standard placeholder.
+        # The whole string is replaced, so any PHI that was there is gone —
+        # no need to run the redactor on it, and doing so would risk
+        # mangling "01 jan 1900" into e.g. "01 X 1900" when the subject's
+        # name shares a substring with the month abbreviation (pyedflib
+        # writes this field via strptime("%d %b %Y") and would crash).
         header['birthdate'] = '01 jan 1900'
     for key in redact_keys:
         header[key] = REDACT_REPLACEMENT
     header['patientcode'] = subject_code
-    # check for patient name, gendered pronouns in all other fields
+    # Check for patient name, gendered pronouns in all other string fields.
+    # birthdate is skipped — we just overwrote it entirely above.
     for key, val in header.items():
-        if key in redact_keys:
+        if key in redact_keys or key == 'birthdate':
             continue
         if isinstance(val, str):
             header[key] = redact_string(val,
@@ -150,14 +157,25 @@ def deidentify_start_date_time(recording_start_time, earliest_recording_start_ti
     return shifted_time
 
 
+# Matches empty, all-whitespace, pure-numeric (incl. sign and decimal), or
+# EDF+ timekeeping-TAL-shaped strings like "+0.086" / "-12.5" / "+1234".
+# These cannot contain PHI — skip the Presidio pass entirely.
+_NON_PHI_TEXT_RE = re.compile(r"^\s*[+-]?\d*\.?\d*\s*$")
+
+
 def redact_string(text: str, field_name: str, subject_name: PersonalName,
                   alert: bool = False,
                   redactor: Union[SubjectNameRedactor, None] = None) -> str:
+    if _NON_PHI_TEXT_RE.match(text):
+        # Empty, numeric, or timekeeping-shaped — cannot hold PHI; skip Presidio.
+        return text
     redacted = redact_subject_name(text, subject_full_name=subject_name, redactor=redactor)
     redacted = remove_gendered_pronouns(redacted)
     if alert and text != redacted:
+        # Print the *redacted* value (not the raw one) so the log stays
+        # PHI-free while still showing what was flagged and what survived.
         print('Subject protected health information detected in EDF '
-              f'{field_name} with value "{text}"... redacting. '
+              f'{field_name}; redacted value: "{redacted}". '
               'Alert the data analysis team.')
     return redacted
 
@@ -364,9 +382,13 @@ def _load_edf_metadata(input_path: str,
                        verbosity: int = 1,
                        convert_to_edfC: bool = True,
                        repair_truncated: bool = True,
+                       repair_phys_ranges: bool = True,
                        raise_errors: bool = False,
                        bench=None):
-    from clean_eeg.repair_edf import repair_truncated_edf_header
+    from clean_eeg.repair_edf import (
+        repair_truncated_edf_header,
+        repair_degenerate_signal_ranges,
+    )
     from clean_eeg.benchmark import BenchmarkCollector
     if bench is None:
         bench = BenchmarkCollector(enabled=False)
@@ -383,6 +405,9 @@ def _load_edf_metadata(input_path: str,
             if repair_truncated:
                 with bench.step("repair_truncated_header", file=filename):
                     repair_truncated_edf_header(full_path, verbosity=verbosity)
+            if repair_phys_ranges:
+                with bench.step("repair_phys_ranges", file=filename):
+                    repair_degenerate_signal_ranges(full_path, verbosity=verbosity)
             with bench.step("load_edf_metadata_only", file=filename):
                 data = load_edf(full_path, load_method=load_method, preload=False)
             EDF_meta_data[filename] = {'data': data}
@@ -677,6 +702,15 @@ if __name__ == "__main__":
             logger.relocate(os.path.join(args.input_path, LOG_FILENAME))
             log_path = logger.log_path
         validate_cli_arguments(args)
+
+        # Log the installed version up-front so shared log.out files always
+        # carry provenance for the code that produced them.
+        try:
+            from importlib.metadata import version as _pkg_version
+            _installed_version = _pkg_version("clean_eeg")
+        except Exception:
+            _installed_version = "unknown"
+        print(f"clean_eeg version: {_installed_version}")
 
         # Register subject name parts as PHI for log scrubbing
         for name_part in [args.first_name, args.last_name]:

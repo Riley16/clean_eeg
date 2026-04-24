@@ -8,6 +8,11 @@ from clean_eeg.repair_edf import (
     _read_header_fields,
     is_edf_truncated,
     repair_truncated_edf_header,
+    repair_degenerate_signal_ranges,
+    MAIN_HEADER_BYTES,
+    SIG_PHYS_MIN_OFFSET, SIG_PHYS_MIN_WIDTH,
+    SIG_PHYS_MAX_OFFSET, SIG_PHYS_MAX_WIDTH,
+    SIG_PHYS_DIM_OFFSET, SIG_PHYS_DIM_WIDTH,
     N_RECORDS_OFFSET,
     N_RECORDS_WIDTH,
 )
@@ -124,3 +129,172 @@ def test_repair_prints_one_liner_report(tmp_path, capsys):
     repair_truncated_edf_header(partial_path, verbosity=1)
     out = capsys.readouterr().out
     assert "Repairing truncated EDF header" in out
+
+
+# ------------------------------------------------------------
+# repair_degenerate_signal_ranges tests
+# ------------------------------------------------------------
+
+def _corrupt_phys_fields(path: str, signal_idx: int,
+                         new_min: str, new_max: str,
+                         new_dim: str = None) -> None:
+    """Directly write ASCII bytes to a signal's physical-range header fields."""
+    with open(path, "rb") as f:
+        main = f.read(MAIN_HEADER_BYTES)
+    n_signals = int(main[252:256].decode().strip())
+
+    def _write(field_offset, field_width, value):
+        abs_offset = (MAIN_HEADER_BYTES
+                      + field_offset * n_signals
+                      + signal_idx * field_width)
+        with open(path, "r+b") as f:
+            f.seek(abs_offset)
+            f.write(value.ljust(field_width).encode("ascii"))
+
+    _write(SIG_PHYS_MIN_OFFSET, SIG_PHYS_MIN_WIDTH, new_min)
+    _write(SIG_PHYS_MAX_OFFSET, SIG_PHYS_MAX_WIDTH, new_max)
+    if new_dim is not None:
+        _write(SIG_PHYS_DIM_OFFSET, SIG_PHYS_DIM_WIDTH, new_dim)
+
+
+def _read_signal_phys_bytes(path: str, signal_idx: int) -> dict:
+    """Read the 8-byte phys_min, phys_max, and phys_dim fields for a signal."""
+    with open(path, "rb") as f:
+        main = f.read(MAIN_HEADER_BYTES)
+    n_signals = int(main[252:256].decode().strip())
+    out = {}
+    with open(path, "rb") as f:
+        for field_name, field_offset, field_width in (
+            ("phys_min", SIG_PHYS_MIN_OFFSET, SIG_PHYS_MIN_WIDTH),
+            ("phys_max", SIG_PHYS_MAX_OFFSET, SIG_PHYS_MAX_WIDTH),
+            ("phys_dim", SIG_PHYS_DIM_OFFSET, SIG_PHYS_DIM_WIDTH),
+        ):
+            f.seek(MAIN_HEADER_BYTES + field_offset * n_signals
+                   + signal_idx * field_width)
+            out[field_name] = f.read(field_width)
+    return out
+
+
+def test_detects_and_repairs_exact_degenerate_range(tmp_path):
+    """phys_max == phys_min should be detected and repaired to -1/1 with
+    blank dimension."""
+    full_path, _ = generate_partial_record_edf(tmp_path / "degen.edf",
+                                               n_channels=3,
+                                               sample_rate=100,
+                                               duration_sec=5)
+    # Corrupt signal 1's phys range so phys_max == phys_min.
+    _corrupt_phys_fields(full_path, signal_idx=1,
+                         new_min="0.00000", new_max="0.00000",
+                         new_dim="uV")
+
+    repairs = repair_degenerate_signal_ranges(full_path, verbosity=0)
+
+    assert len(repairs) == 1
+    r = repairs[0]
+    assert r["signal_idx"] == 1
+    assert r["original_phys_min"] == "0.00000"
+    assert r["original_phys_max"] == "0.00000"
+    assert "phys_min == phys_max" in r["reason"]
+
+    post = _read_signal_phys_bytes(full_path, 1)
+    assert post["phys_min"].decode().rstrip() == "-1"
+    assert post["phys_max"].decode().rstrip() == "1"
+    assert post["phys_dim"].decode() == " " * 8  # 8-space spec canonical
+
+
+def test_detects_negative_zero_degenerate_range(tmp_path):
+    """The NK "-0.00000" / "0.00000" pair (float equal, string-different) must
+    also be caught, because pyedflib does the numeric comparison in C."""
+    full_path, _ = generate_partial_record_edf(tmp_path / "neg_zero.edf",
+                                               n_channels=3,
+                                               sample_rate=100,
+                                               duration_sec=5)
+    _corrupt_phys_fields(full_path, signal_idx=2,
+                         new_min="0.00000", new_max="-0.00000",
+                         new_dim="V")
+
+    repairs = repair_degenerate_signal_ranges(full_path, verbosity=0)
+
+    assert len(repairs) == 1
+    assert repairs[0]["signal_idx"] == 2
+    assert repairs[0]["original_phys_max"] == "-0.00000"
+
+    # File must now open in pyedflib (the "Physical Maximum" check passes).
+    with pyedflib.EdfReader(full_path) as r:
+        assert r.signals_in_file >= 1
+
+
+def test_preserves_valid_signals_and_file_opens(tmp_path):
+    """Well-formed signals must not be touched; file must still be pyedflib-openable."""
+    full_path, _ = generate_partial_record_edf(tmp_path / "valid.edf",
+                                               n_channels=3,
+                                               sample_rate=100,
+                                               duration_sec=5)
+    before = [_read_signal_phys_bytes(full_path, i) for i in range(3)]
+
+    repairs = repair_degenerate_signal_ranges(full_path, verbosity=0)
+    assert repairs == []
+
+    after = [_read_signal_phys_bytes(full_path, i) for i in range(3)]
+    assert before == after
+
+    with pyedflib.EdfReader(full_path) as r:
+        assert r.signals_in_file == 3
+
+
+def test_unparseable_phys_field_is_repaired(tmp_path):
+    """A phys field that isn't a valid number should also trigger repair."""
+    full_path, _ = generate_partial_record_edf(tmp_path / "garbled.edf",
+                                               n_channels=3,
+                                               sample_rate=100,
+                                               duration_sec=5)
+    _corrupt_phys_fields(full_path, signal_idx=0,
+                         new_min="notanum", new_max="0.5",
+                         new_dim="uV")
+
+    repairs = repair_degenerate_signal_ranges(full_path, verbosity=0)
+
+    assert len(repairs) == 1
+    assert repairs[0]["signal_idx"] == 0
+    assert "unparseable" in repairs[0]["reason"]
+
+    post = _read_signal_phys_bytes(full_path, 0)
+    assert post["phys_min"].decode().rstrip() == "-1"
+    assert post["phys_max"].decode().rstrip() == "1"
+    assert post["phys_dim"].decode() == " " * 8
+
+
+def test_repair_is_idempotent(tmp_path):
+    """Running repair twice on the same file should find nothing new on the
+    second pass."""
+    full_path, _ = generate_partial_record_edf(tmp_path / "idemp.edf",
+                                               n_channels=3,
+                                               sample_rate=100,
+                                               duration_sec=5)
+    _corrupt_phys_fields(full_path, signal_idx=1,
+                         new_min="5", new_max="5")
+
+    first = repair_degenerate_signal_ranges(full_path, verbosity=0)
+    second = repair_degenerate_signal_ranges(full_path, verbosity=0)
+
+    assert len(first) == 1
+    assert second == []
+
+
+def test_repair_warning_includes_original_values(tmp_path, capsys):
+    """verbosity >= 1 must print the signal label + original values so the
+    operator can see exactly what was rewritten."""
+    full_path, _ = generate_partial_record_edf(tmp_path / "chatty_phys.edf",
+                                               n_channels=3,
+                                               sample_rate=100,
+                                               duration_sec=5)
+    _corrupt_phys_fields(full_path, signal_idx=0,
+                         new_min="0.00000", new_max="-0.00000",
+                         new_dim="raw")
+    repair_degenerate_signal_ranges(full_path, verbosity=1)
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "invalid EDF+" in out
+    assert "0.00000" in out
+    assert "-0.00000" in out
+    assert "raw" in out

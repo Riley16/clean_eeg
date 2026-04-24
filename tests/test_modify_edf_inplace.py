@@ -487,3 +487,175 @@ def test_merge_empty_stub_is_noop(base_edf, tmp_path):
     with open(base_edf, "rb") as f:
         after_bytes = f.read()
     assert before_bytes == after_bytes, "Data EDF changed after merging empty stub"
+
+
+# =================================================================
+# Regressions for the NK truncated-file / non-default record-duration
+# inplace-header-update path (see: "filesize / contains format errors"
+# bugs hit on Nihon Kohden exports with record_duration = 0.086 and an
+# atypically-sized EDF Annotations channel).
+# =================================================================
+
+import numpy as _np
+import pyedflib as _pyedflib
+
+
+def _write_synthetic_edf(path: str,
+                         *,
+                         n_data_channels: int,
+                         sample_frequency: int,
+                         record_duration_s: float,
+                         duration_s: float,
+                         n_annotations: int = 4) -> None:
+    """Write an EDF+ with the caller-specified record_duration_s.
+
+    setDatarecordDuration disables pyedflib's auto-calc so
+    samples_per_record = sample_frequency * record_duration_s exactly.
+    """
+    signal_headers = []
+    for i in range(n_data_channels):
+        signal_headers.append({
+            'label': f'CH{i:02d}',
+            'dimension': 'uV',
+            'sample_frequency': sample_frequency,
+            'physical_max': 3200.0,
+            'physical_min': -3200.0,
+            'digital_max': 32767,
+            'digital_min': -32768,
+            'prefilter': '',
+            'transducer': '',
+        })
+
+    n_samples = int(sample_frequency * duration_s)
+    t = _np.arange(n_samples, dtype=_np.float32) / sample_frequency
+    signals = [
+        (1000.0 * _np.sin(2 * _np.pi * ((i % 5) + 1) * t)).astype(_np.float64)
+        for i in range(n_data_channels)
+    ]
+
+    import warnings
+    with _pyedflib.EdfWriter(path, n_data_channels,
+                              file_type=_pyedflib.FILETYPE_EDFPLUS) as f:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            f.setDatarecordDuration(record_duration_s)
+        f.setSignalHeaders(signal_headers)
+        # Inline header so the writer doesn't look up undefined fields.
+        from datetime import datetime
+        f.setHeader({
+            'technician': 'T', 'recording_additional': '',
+            'patientname': 'Synthetic Subject', 'patient_additional': '',
+            'patientcode': 'R1SYNTH', 'equipment': 'test',
+            'admincode': '', 'sex': 'Male',
+            'startdate': datetime(2023, 1, 1, 10, 0, 0),
+            'birthdate': '01 jan 1970', 'gender': 'Male',
+        })
+        f.writeSamples(signals)
+        for i in range(n_annotations):
+            f.writeAnnotation(i * (duration_s / max(n_annotations, 1)), -1,
+                              f"marker {i}")
+
+
+def _read_on_disk_numeric_signal_fields(path: str) -> dict:
+    """Return the raw bytes of every numeric signal-header field
+    (phys_min/max, dig_min/max, samples_per_record) from the file."""
+    from clean_eeg.modify_edf_inplace import (
+        TOTAL_HEADER_BYTES,
+        EDF_SIGNAL_HEADER_FIELD_OFFSETS_LENGTHS as FIELD_TABLE,
+    )
+    with open(path, "rb") as f:
+        main = f.read(TOTAL_HEADER_BYTES)
+        n_signals = int(main[252:256].decode().strip())
+        f.seek(TOTAL_HEADER_BYTES)
+        block = f.read(n_signals * 256)
+
+    out = {}
+    for field in ('physical_min', 'physical_max',
+                  'digital_min', 'digital_max',
+                  'num_samples'):
+        field_offset, field_width, _ = FIELD_TABLE[field]
+        start = field_offset * n_signals
+        end = start + field_width * n_signals
+        out[field] = block[start:end]
+    return out
+
+
+@pytest.mark.parametrize("record_duration_s", [0.086, 0.5, 2.0])
+def test_update_inplace_preserves_record_duration(tmp_path, record_duration_s):
+    """After update_edf_header_inplace the file's data_record_duration must
+    survive unchanged. Exposes the bug where pyedflib's writer auto-derived
+    a (typically 1.0 s) record_duration, producing wrong samples_per_record
+    in the signal headers the copy-back step then wrote into the orig."""
+    path = str(tmp_path / f"rec_{record_duration_s}.edf")
+    _write_synthetic_edf(path,
+                         n_data_channels=4,
+                         sample_frequency=500,
+                         record_duration_s=record_duration_s,
+                         duration_s=10.0)
+
+    with _pyedflib.EdfReader(path) as f:
+        orig_header = f.getHeader()
+        orig_signal_headers = [f.getSignalHeader(i) for i in range(f.signals_in_file)]
+        expected_record_duration = f.datarecord_duration
+        expected_samples_per_record = [
+            sh['sample_frequency'] * expected_record_duration
+            for sh in orig_signal_headers
+        ]
+
+    update_edf_header_inplace(path,
+                              header_updates=orig_header,
+                              signal_header_updates=orig_signal_headers)
+
+    # File must still be readable and structural fields must be untouched.
+    with _pyedflib.EdfReader(path) as f:
+        assert f.datarecord_duration == pytest.approx(expected_record_duration), (
+            f"record_duration changed: {f.datarecord_duration} "
+            f"vs {expected_record_duration}"
+        )
+        for i in range(f.signals_in_file):
+            sh = f.getSignalHeader(i)
+            got = sh['sample_frequency'] * f.datarecord_duration
+            assert got == pytest.approx(expected_samples_per_record[i]), (
+                f"signal {i} samples_per_record implied by sample_frequency * "
+                f"record_duration changed: {got} vs {expected_samples_per_record[i]}"
+            )
+
+
+def test_update_inplace_preserves_numeric_signal_header_bytes(tmp_path):
+    """Numeric signal-header fields (phys_min/max, dig_min/max, samples_per_record)
+    must be byte-identical after a no-op inplace update — they describe the
+    on-disk data layout and can't be silently rewritten by pyedflib's
+    trailing-zero formatting or empty-temp heuristics.
+
+    Regression for the NK case where the 'EDF Annotations' signal's
+    samples_per_record got overwritten from 172 to 57 because pyedflib's
+    temp writer had no annotations to size against."""
+    path = str(tmp_path / "numeric_fields.edf")
+    # Use an NK-style record_duration so pyedflib's auto-calc would diverge.
+    _write_synthetic_edf(path,
+                         n_data_channels=6,
+                         sample_frequency=500,
+                         record_duration_s=0.086,
+                         duration_s=5.0,
+                         # Many annotations so the annotations-channel size is
+                         # larger than what an empty temp would allocate.
+                         n_annotations=40)
+
+    before = _read_on_disk_numeric_signal_fields(path)
+
+    with _pyedflib.EdfReader(path) as f:
+        hdr = f.getHeader()
+        sigs = [f.getSignalHeader(i) for i in range(f.signals_in_file)]
+    update_edf_header_inplace(path, header_updates=hdr, signal_header_updates=sigs)
+
+    after = _read_on_disk_numeric_signal_fields(path)
+    for field in before:
+        assert after[field] == before[field], (
+            f"Numeric signal-header field {field!r} changed bytes during "
+            f"update_edf_header_inplace; this breaks on-disk record layout."
+        )
+
+    # File must remain pyedflib-openable.
+    with _pyedflib.EdfReader(path) as f:
+        assert f.signals_in_file == 6
+        _ = f.readSignal(0)

@@ -36,6 +36,12 @@ def update_edf_header_inplace(edf_path: str,
     with pyedflib.EdfReader(edf_path) as f:
         orig_header = f.getHeader()
         orig_signal_headers = f.getSignalHeaders()
+        # Preserve the original data-record duration so the temp writer computes
+        # the correct samples_per_record per signal. Otherwise pyedflib auto-
+        # derives a record_duration from the sample frequencies (typically 1.0s)
+        # and writes samples_per_record = sample_frequency * 1.0, which mismatches
+        # the orig's main-header data_record_duration we copy back below.
+        orig_record_duration = f.datarecord_duration
         if confirm_signals_unchanged:
             # load original signals for later comparison
             orig_signals = [f.readSignal(i) for i in range(f.signals_in_file)]
@@ -66,6 +72,14 @@ def update_edf_header_inplace(edf_path: str,
             print("updated header written to temp EDF:")
             print(updated_header)
         f.setHeader(updated_header)
+        # Lock the temp writer to the orig's record duration so the
+        # samples_per_record bytes in each signal header match what we'll
+        # copy back. pyedflib's setDatarecordDuration emits a harmless
+        # FutureWarning; we suppress it since the override is intentional.
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            f.setDatarecordDuration(orig_record_duration)
         if signal_header_updates is not None:
             f.setSignalHeaders(updated_signal_headers)
 
@@ -78,6 +92,27 @@ def update_edf_header_inplace(edf_path: str,
     for field in copy_overwrite_fields:
         copy_bytes(edf_path, temp_path,
                    *EDF_HEADER_FIELD_OFFSETS_LENGTHS[field][:2])
+
+    # Preserve the original file's signal-header numeric fields. These
+    # describe the actual on-disk data layout (physical/digital ranges and,
+    # critically, samples_per_record per signal — which determines how many
+    # bytes each signal occupies inside each data record). pyedflib's empty
+    # temp writer recomputes these from whatever defaults it has and can
+    # pick values that disagree with the bytes physically present on disk
+    # (e.g. the "EDF Annotations" signal ends up with samples_per_record=57
+    # instead of the orig's 172, shifting every record's layout). Copy the
+    # orig's bytes into the temp before we swap headers back.
+    on_disk_n_signals = get_header_field(edf_path, 'num_signals')
+    preserve_signal_header_fields = [
+        'physical_min', 'physical_max',
+        'digital_min', 'digital_max',
+        'num_samples',
+    ]
+    for field in preserve_signal_header_fields:
+        field_offset, field_width, _ = EDF_SIGNAL_HEADER_FIELD_OFFSETS_LENGTHS[field]
+        abs_offset = TOTAL_HEADER_BYTES + field_offset * on_disk_n_signals
+        total_length = field_width * on_disk_n_signals
+        copy_bytes(edf_path, temp_path, abs_offset, total_length)
 
     # Copy updated header bytes back to original file
     with open(edf_path, "r+b") as orig_file, open(temp_path, "rb") as temp_file:

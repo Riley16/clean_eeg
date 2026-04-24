@@ -54,9 +54,23 @@ def write_edf_pyedflib(data, filename, digital: bool = False):
             digital samples (i.e. matching what was read with ``read_digital=True``).
             Avoids the float64<->int16 round-trip and the associated memory overhead.
     """
+    import warnings
     import pyedflib
     with pyedflib.EdfWriter(filename, len(data['signals']), file_type=pyedflib.FILETYPE_EDFPLUS) as f:
         f.setHeader(data['header'])
+        # Lock the writer to the original file's record_duration (captured by
+        # load_edf into header['record_duration']). Without this, pyedflib
+        # auto-calculates a record_duration from the sample frequencies —
+        # typically 1.0s — which usually does not divide the total signal
+        # length evenly for Nihon Kohden files (whose record_duration is
+        # 0.086s). The resulting output file's claimed size then disagrees
+        # with the bytes pyedflib actually writes, and the reopened file
+        # fails the filesize compliance check.
+        record_duration = data['header'].get('record_duration')
+        if record_duration is not None and 0.001 <= record_duration <= 60:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                f.setDatarecordDuration(record_duration)
         f.setSignalHeaders(data['signal_headers'])
         f.writeSamples(data['signals'], digital=digital)
         for time, duration, text in zip(*data['annotations']):
