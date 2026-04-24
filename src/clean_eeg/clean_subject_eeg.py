@@ -213,6 +213,7 @@ def clean_subject_edf_files(
     skip_header_name_check: bool = False,
     benchmark: bool = False,
     read_digital: bool = True,
+    skip_audit: bool = False,
 ):
     from clean_eeg.benchmark import BenchmarkCollector
     bench = BenchmarkCollector(enabled=benchmark)
@@ -238,10 +239,16 @@ def clean_subject_edf_files(
                             skip_header_name_check=skip_header_name_check)
     min_start_time = _get_start_time_earliest_recording(EDF_meta_data, verbosity=verbosity)
 
-    # Select files for signal integrity audit
+    # Select files for signal integrity audit. When skip_audit is True,
+    # the set stays empty so no files are audited; inplace runs then also
+    # skip the signal preload for every file (see need_signals below),
+    # which is the bulk of the I/O time on multi-GB NK recordings.
     all_filenames = list(EDF_meta_data.keys())
-    n_audit = min(2, len(all_filenames))
-    audit_filenames = set(random.sample(all_filenames, n_audit))
+    if skip_audit:
+        audit_filenames: set = set()
+    else:
+        n_audit = min(2, len(all_filenames))
+        audit_filenames = set(random.sample(all_filenames, n_audit))
 
     # Build Presidio once per subject and reuse across all redact_string calls.
     # This amortizes the spaCy-model + recognizer-registry construction cost.
@@ -628,6 +635,13 @@ def get_clean_eeg_cli_arguments():
                         help="Print per-step wall time, RSS delta, and peak-RSS growth for "
                              "each EDF file. Useful for profiling the pipeline's time and "
                              "memory hot-spots.")
+    parser.add_argument("--skip_audit", action="store_true",
+                        help="Skip the post-write signal-integrity audit. In inplace mode the "
+                             "audit is the only reason signals are loaded at all; this flag "
+                             "avoids the per-channel interleaved read that pyedflib performs, "
+                             "which can take minutes on multi-GB Nihon Kohden files. Headers "
+                             "and annotations are still de-identified; only the cross-check "
+                             "that signals survived byte-identical is skipped.")
 
     args = parser.parse_args()
 
@@ -738,6 +752,7 @@ if __name__ == "__main__":
             verbosity=args.verbosity,
             skip_header_name_check=args.skip_header_name_check,
             benchmark=args.benchmark,
+            skip_audit=args.skip_audit,
         )
 
     except Exception:
