@@ -250,3 +250,18 @@ def test_name_consistency_no_cli_name():
     """No CLI name provided — should pass without prompting regardless of header name."""
     meta = _make_edf_meta({'file1.edf': 'Jane Smith'})
     _check_subject_name_consistency(meta, command_line_subject_name=None)
+
+
+def test_clean_subject_edf_files_empty_dir_raises(tmp_path):
+    """An input directory with no .edf files should raise RuntimeError with a
+    helpful message rather than crashing in min() on an empty sequence."""
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    with pytest.raises(RuntimeError, match="No EDF files were successfully loaded"):
+        clean_subject_edf_files(
+            input_path=str(empty_dir),
+            output_path=str(empty_dir),
+            subject_code=SUBJECT_CODE,
+            subject_name=PATIENT_NAME,
+            inplace=True,
+        )

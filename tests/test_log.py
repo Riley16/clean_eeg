@@ -242,3 +242,42 @@ def test_redact_log_file_with_middle_name(tmp_path):
     assert "Alice" not in content
     assert "Marie" not in content
     assert "Smith" not in content
+
+
+def test_relocate_moves_log_and_continues_writing(tmp_path):
+    """relocate() should move the existing log to the new path and continue
+    writing there. Old path should no longer exist."""
+    initial_path = str(tmp_path / "initial.log")
+    new_path = str(tmp_path / "subject_dir" / "log.out")
+
+    logger = PipelineLogger(initial_path)
+    try:
+        print("line before relocate")
+        logger.relocate(new_path)
+        print("line after relocate")
+    finally:
+        logger.close()
+
+    assert not os.path.exists(initial_path), "original log file should have been moved"
+    assert os.path.exists(new_path)
+    assert logger.log_path == os.path.abspath(new_path)
+
+    content = open(new_path).read()
+    assert "line before relocate" in content
+    assert "line after relocate" in content
+
+
+def test_relocate_same_path_is_noop(tmp_path):
+    """relocate() to the current path should be a no-op and not lose content."""
+    log_path = str(tmp_path / "log.out")
+    logger = PipelineLogger(log_path)
+    try:
+        print("content")
+        logger.relocate(log_path)
+        print("more content")
+    finally:
+        logger.close()
+
+    content = open(log_path).read()
+    assert "content" in content
+    assert "more content" in content

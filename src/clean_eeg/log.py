@@ -5,7 +5,9 @@ PHI patterns (patient name parts) are scrubbed from the log but shown
 on the console so the operator can verify correctness.
 """
 
+import os
 import re
+import shutil
 import sys
 from datetime import datetime
 
@@ -41,6 +43,23 @@ class PipelineLogger:
     def write_to_log(self, text: str):
         self.log_file.write(self.scrub(text))
         self.log_file.flush()
+
+    def relocate(self, new_path: str):
+        """Move the active log file to new_path and continue writing there.
+
+        Preserves content already written. Safe to call mid-run — any further
+        writes (including future prompts and traceback output) go to the new
+        location.
+        """
+        new_path = os.path.abspath(new_path)
+        if os.path.abspath(self.log_path) == new_path:
+            return
+        self.log_file.flush()
+        self.log_file.close()
+        os.makedirs(os.path.dirname(new_path) or ".", exist_ok=True)
+        shutil.move(self.log_path, new_path)
+        self.log_path = new_path
+        self.log_file = open(self.log_path, "a")
 
     def rescrub(self):
         """Re-scrub the entire log file with all currently registered PHI patterns.

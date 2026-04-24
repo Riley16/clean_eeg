@@ -174,6 +174,7 @@ def clean_subject_edf_files(
     raise_errors: bool = False,
     inplace: bool = False,
     verbosity: int = 1,
+    skip_header_name_check: bool = False,
 ):
     if inplace:
         assert input_path == output_path, "For inplace cleaning, input_path must equal output_path."
@@ -182,7 +183,17 @@ def clean_subject_edf_files(
                                        load_method=load_method,
                                        raise_errors=raise_errors)
 
-    _validate_EDF_meta_data(EDF_meta_data, subject_name=subject_name, verbosity=verbosity)
+    if not EDF_meta_data:
+        raise RuntimeError(
+            f"No EDF files were successfully loaded from {input_path}. "
+            "This can happen if the directory contains no .edf files, or if "
+            "all .edf files failed to parse (see errors above — e.g. filesize "
+            "mismatches from Nihon Kohden exports that don't strictly follow "
+            "the EDF standard). Aborting."
+        )
+
+    _validate_EDF_meta_data(EDF_meta_data, subject_name=subject_name, verbosity=verbosity,
+                            skip_header_name_check=skip_header_name_check)
     min_start_time = _get_start_time_earliest_recording(EDF_meta_data, verbosity=verbosity)
 
     # Select files for signal integrity audit
@@ -314,10 +325,14 @@ def _get_start_time_earliest_recording(EDF_meta_data: dict, verbosity: int = 0) 
 
 
 def _validate_EDF_meta_data(EDF_meta_data: dict, subject_name: Union[PersonalName, None],
-                            verbosity: int = 0):
+                            verbosity: int = 0, skip_header_name_check: bool = False):
     _check_recording_gaps(EDF_meta_data, verbosity=verbosity)
-    _check_subject_name_consistency(EDF_meta_data, command_line_subject_name=subject_name,
-                                    verbosity=verbosity)
+    if skip_header_name_check:
+        print("Skipping EDF header subject-name consistency check "
+              "(--skip_header_name_check). Name redaction will still run against all header fields.")
+    else:
+        _check_subject_name_consistency(EDF_meta_data, command_line_subject_name=subject_name,
+                                        verbosity=verbosity)
     _check_signal_header_consistency(EDF_meta_data, verbosity=verbosity)
 
 
@@ -482,6 +497,11 @@ def get_clean_eeg_cli_arguments():
                         help="Raise errors instead of warnings for debugging")
     parser.add_argument("--verbosity", type=int, default=1,
                         help="Enable verbose output")
+    parser.add_argument("--skip_header_name_check", action="store_true",
+                        help="Skip the EDF-header subject-name consistency check. Use when "
+                             "header name fields have already been redacted but annotations "
+                             "still need to be cleaned. Name redaction is still applied to "
+                             "all header fields.")
 
     args = parser.parse_args()
 
@@ -540,11 +560,21 @@ def redact_log_file(log_path: str, subject_name: PersonalName):
 LOG_FILENAME = "log.out"
 
 if __name__ == "__main__":
-    log_path = os.path.join(os.getcwd(), LOG_FILENAME)
+    import tempfile
+    # Start logging to a temp file so the log can capture interactive prompts
+    # that run before args (and thus input_path) are known. Relocated into
+    # input_path as soon as args are parsed.
+    _tmp_fd, _tmp_log_path = tempfile.mkstemp(prefix="clean_eeg_log_", suffix=".out")
+    os.close(_tmp_fd)
+    log_path = _tmp_log_path
     logger = setup_logger(log_path)
 
     try:
         args = get_clean_eeg_cli_arguments()
+        # Relocate the log into the subject's EDF directory now that we know it.
+        if args.input_path and os.path.isdir(args.input_path):
+            logger.relocate(os.path.join(args.input_path, LOG_FILENAME))
+            log_path = logger.log_path
         validate_cli_arguments(args)
 
         # Register subject name parts as PHI for log scrubbing
@@ -571,21 +601,27 @@ if __name__ == "__main__":
             raise_errors=args.raise_errors,
             inplace=args.copy_path is None,
             verbosity=args.verbosity,
+            skip_header_name_check=args.skip_header_name_check,
         )
 
     except Exception:
         import traceback
         traceback.print_exc()
+        # Read the current log path from the logger (reflects any relocation).
+        log_path = logger.log_path
         print(f"\nPlease send the log file to the data management team for debugging:")
         print(f"  {log_path}")
         raise SystemExit(1)
 
     finally:
+        log_path = logger.log_path
         close_logger()
         # Run full name redaction on the log file (fuzzy matching, nicknames, etc.)
         _subject_name = locals().get('subject_name')
-        if _subject_name is not None:
+        if _subject_name is not None and os.path.exists(log_path):
             redact_log_file(log_path, _subject_name)
-        # Copy log alongside output files for transfer
+        # Copy log alongside output files for transfer (skip if it already lives there)
         if 'args' in locals() and hasattr(args, 'output_path') and args.output_path and os.path.isdir(args.output_path):
-            shutil.copy(log_path, os.path.join(args.output_path, LOG_FILENAME))
+            dest = os.path.join(args.output_path, LOG_FILENAME)
+            if os.path.abspath(dest) != os.path.abspath(log_path) and os.path.exists(log_path):
+                shutil.copy(log_path, dest)
