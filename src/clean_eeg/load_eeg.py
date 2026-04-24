@@ -108,9 +108,16 @@ def _read_signals_via_mmap(filename: str) -> list:
     Annotations"`` and filtered out of the returned list so the output
     matches pyedflib's ``readSignal`` contract.
 
-    Output dtype is ``np.int32`` to stay drop-in compatible with
-    ``readSignal(digital=True)``; the underlying data is int16 on disk
-    and in the mmap, the int32 upcast is the only copy.
+    Output dtype is ``np.int16`` — matches the on-disk width, no
+    upcast, so a 3.8 GB EDF stays ~3.8 GB in RAM instead of doubling
+    to 7.6 GB. Downstream consumers:
+    - ``_audit_signal_integrity``: compares via ``np.array_equal``,
+      which is dtype-agnostic (int16 vs int32 with matching values
+      still compares True).
+    - ``pyedflib.EdfWriter.writeSamples(..., digital=True)``: accepts
+      any ``np.integer`` dtype (verified at edfwriter.py:935 — the
+      check is ``np.issubdtype(a.dtype, np.integer)``), and upcasts
+      internally as needed.
     """
     import mmap
     import os
@@ -184,11 +191,12 @@ def _read_signals_via_mmap(filename: str) -> list:
             col_offset = 0
             for i in range(n_signals):
                 spr = samples_per_record[i]
-                # .astype(int32, copy=True) allocates a fresh buffer;
+                # .copy() allocates a fresh, contiguous int16 buffer;
                 # subsequent .ravel() returns a 1D view into that new
-                # buffer, not into mmap.
-                sig = records[:, col_offset:col_offset + spr].astype(
-                    np.int32, copy=True)
+                # buffer, not into mmap. No dtype upcast — the on-disk
+                # width is preserved so a 3.8 GB file stays ~3.8 GB in
+                # RAM, not 7.6 GB.
+                sig = records[:, col_offset:col_offset + spr].copy()
                 all_signals.append(sig.ravel())
                 col_offset += spr
 

@@ -366,21 +366,84 @@ def _audit_signal_integrity(orig_signals: list, clean_file_path: str, filename: 
 
     ``digital`` must match the mode used to read ``orig_signals``; when True, the
     clean file is also read in digital mode so the bit-comparison is meaningful.
+
+    Memory-efficient: streams the clean file signal-by-signal via mmap and
+    compares each to the corresponding ``orig_signals[i]`` before the next
+    signal is read. Peak RAM stays at ``sizeof(orig_signals) + one_channel``
+    instead of ``sizeof(orig_signals) + sizeof(clean_signals)``. For a 3.8
+    GB file, that's ~3.82 GB peak instead of ~7.6 GB.
     """
     if not inplace:
         return
-    with pyedflib.EdfReader(clean_file_path) as f:
-        n_signals = f.signals_in_file
-        for i in range(n_signals):
-            clean_signal = f.readSignal(i, digital=digital)
-            orig_signal = orig_signals[i]
-            min_len = min(len(orig_signal), len(clean_signal))
-            if not np.array_equal(orig_signal[:min_len], clean_signal[:min_len]):
-                raise RuntimeError(
-                    f"AUDIT FAILURE: Signal {i} in {filename} was modified "
-                    f"during in-place de-identification."
-                )
-    print(f"Audit passed for {filename}: all {n_signals} signals unchanged.")
+    import mmap as _mmap
+
+    # --- parse on-disk geometry from the clean file bytes ---
+    with open(clean_file_path, "rb") as f:
+        main = f.read(256)
+        n_signals_on_disk = int(main[252:256].decode().strip())
+        n_records = int(main[236:244].decode().strip())
+        sig_header = f.read(256 * n_signals_on_disk)
+
+    labels = []
+    samples_per_record = []
+    for i in range(n_signals_on_disk):
+        lab_b = sig_header[0 * n_signals_on_disk + i * 16:
+                           0 * n_signals_on_disk + (i + 1) * 16]
+        spr_b = sig_header[216 * n_signals_on_disk + i * 8:
+                           216 * n_signals_on_disk + (i + 1) * 8]
+        labels.append(lab_b.decode("ascii", errors="replace").rstrip())
+        samples_per_record.append(int(spr_b.decode("ascii").strip()))
+
+    # Map each public (non-annotation) signal index to its on-disk position
+    # so we stream clean signals in the same order pyedflib would have.
+    data_signal_disk_indices = [
+        i for i, lab in enumerate(labels)
+        if lab.strip().lower() != "edf annotations"
+    ]
+    if len(orig_signals) != len(data_signal_disk_indices):
+        raise RuntimeError(
+            f"AUDIT FAILURE: {filename}: orig_signals has "
+            f"{len(orig_signals)} signals but clean file contains "
+            f"{len(data_signal_disk_indices)} non-annotation signals."
+        )
+
+    record_samples = sum(samples_per_record)
+    header_bytes = 256 * (1 + n_signals_on_disk)
+
+    # --- stream: one signal at a time, compare, free ---
+    with open(clean_file_path, "rb") as f:
+        with _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ) as mm:
+            data = np.frombuffer(
+                mm,
+                dtype=np.int16,
+                count=n_records * record_samples,
+                offset=header_bytes,
+            )
+            records = data.reshape(n_records, record_samples)
+
+            for data_idx, disk_idx in enumerate(data_signal_disk_indices):
+                spr = samples_per_record[disk_idx]
+                col_offset = sum(samples_per_record[:disk_idx])
+                # .copy() materialises one channel (~MB-scale on a 3.8 GB
+                # file, ~20 MB per channel for 178-channel NK exports).
+                clean_sig = records[:, col_offset:col_offset + spr].copy().ravel()
+
+                orig_sig = orig_signals[data_idx]
+                min_len = min(len(orig_sig), len(clean_sig))
+                if not np.array_equal(orig_sig[:min_len], clean_sig[:min_len]):
+                    raise RuntimeError(
+                        f"AUDIT FAILURE: Signal {data_idx} in {filename} "
+                        "was modified during in-place de-identification."
+                    )
+                # Explicit free — next iteration allocates a fresh buffer
+                # of the same size, so peak stays at one channel, not N.
+                del clean_sig
+
+            del records
+            del data
+
+    n_data_signals = len(data_signal_disk_indices)
+    print(f"Audit passed for {filename}: all {n_data_signals} signals unchanged.")
 
 
 def convert_edfC_to_edfD(input_file: str):

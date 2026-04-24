@@ -247,7 +247,12 @@ def _write_synthetic_edf_with_signals(path: str,
 
 def _compare_pyedflib_vs_mmap(path: str):
     """Load once via pyedflib's readSignal and once via our mmap helper,
-    and assert byte-identical int32 output across every channel."""
+    and assert value-identical output across every channel.
+
+    pyedflib's readSignal(digital=True) returns int32; the mmap helper
+    returns int16 (matching the on-disk width, halving RAM). Both are
+    integer types so np.array_equal compares values correctly — we
+    assert value equality + integer dtype, not dtype equality."""
     pyedflib_data = load_edf(path, load_method='pyedflib',
                              preload=True, read_digital=True,
                              use_mmap=False)
@@ -258,9 +263,9 @@ def _compare_pyedflib_vs_mmap(path: str):
     assert len(pyedflib_data['signals']) == len(mmap_data['signals'])
     for i, (pe, mm) in enumerate(zip(pyedflib_data['signals'],
                                      mmap_data['signals'])):
-        # pyedflib returns int32; we return int32; both must match exactly.
-        assert pe.dtype == mm.dtype == np.int32, \
-            f"signal {i}: dtypes pe={pe.dtype} mm={mm.dtype} (want int32)"
+        assert pe.dtype == np.int32, f"signal {i}: pyedflib dtype {pe.dtype}"
+        assert np.issubdtype(mm.dtype, np.integer), \
+            f"signal {i}: mmap dtype {mm.dtype} not integer"
         assert pe.shape == mm.shape, \
             f"signal {i}: shapes pe={pe.shape} mm={mm.shape}"
         assert np.array_equal(pe, mm), \
