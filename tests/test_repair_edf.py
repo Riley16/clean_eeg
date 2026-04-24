@@ -229,13 +229,17 @@ def test_detects_and_repairs_exact_degenerate_range(tmp_path):
     assert r["original_phys_max"] == "0.00000"
     assert "phys_min == phys_max" in r["phys_issue"]
     assert r["dig_issue"] is None
-    assert r["phys_repaired"] is True
-    assert r["dig_repaired"] is False
 
     post = _read_signal_phys_bytes(full_path, 1)
     assert post["phys_min"].decode().rstrip() == "-1"
     assert post["phys_max"].decode().rstrip() == "1"
     assert post["phys_dim"].decode() == " " * 8  # 8-space spec canonical
+
+    # Dig range is also normalized to full int16 because any repair
+    # uncalibrates the signal on both sides.
+    post_dig = _read_signal_dig_bytes(full_path, 1)
+    assert post_dig["dig_min"].decode().rstrip() == "-32768"
+    assert post_dig["dig_max"].decode().rstrip() == "32767"
 
 
 def test_detects_negative_zero_degenerate_range(tmp_path):
@@ -337,42 +341,53 @@ def test_repair_warning_includes_original_values(tmp_path, capsys):
 
 
 # ------------------------------------------------------------
-# Digital-range: detect-and-warn only (no byte rewriting)
+# Digital-range: detect and repair (uncalibrates the whole signal, so
+# BOTH phys and dig get rewritten together — see the repair policy
+# docstring for the "all-or-nothing per signal" rationale).
 # ------------------------------------------------------------
 
-def test_detects_digital_range_degeneracy_without_repair(tmp_path):
-    """dig_max <= dig_min must be detected and warned about, but the dig
-    bytes must NOT be rewritten — the caller should let pyedflib reject
-    the file so it surfaces via the skipped-files path."""
+def test_dig_degeneracy_triggers_full_uncalibration(tmp_path):
+    """A signal with dig_max == dig_min (and otherwise-valid phys) must
+    get BOTH sides rewritten: phys to the uncalibrated convention (-1 / 1 /
+    8-space units) AND dig to the full int16 range (-32768 / 32767). This
+    keeps the header's scaling mapping internally consistent."""
+    import pyedflib
     full_path, _ = generate_partial_record_edf(tmp_path / "dig_degen.edf",
                                                n_channels=3,
                                                sample_rate=100,
                                                duration_sec=5)
-    # Corrupt signal 0's digital range so dig_max == dig_min
     _corrupt_dig_fields(full_path, signal_idx=0,
                         new_min="0", new_max="0")
-    before = _read_signal_dig_bytes(full_path, 0)
 
     repairs = repair_degenerate_signal_ranges(full_path, verbosity=0)
 
     assert len(repairs) == 1
     r = repairs[0]
     assert r["signal_idx"] == 0
-    assert r["phys_issue"] is None
+    assert r["phys_issue"] is None           # phys was fine, dig was not
     assert r["dig_issue"] is not None
     assert "dig_max" in r["dig_issue"]
-    assert r["phys_repaired"] is False
-    assert r["dig_repaired"] is False
 
-    # Dig bytes must be unchanged on disk.
-    after = _read_signal_dig_bytes(full_path, 0)
-    assert before == after
+    # Phys must have been uncalibrated too, even though phys was valid —
+    # we refuse to leave a valid phys paired with a synthesised dig.
+    phys_after = _read_signal_phys_bytes(full_path, 0)
+    assert phys_after["phys_min"].decode().rstrip() == "-1"
+    assert phys_after["phys_max"].decode().rstrip() == "1"
+    assert phys_after["phys_dim"].decode() == " " * 8
+
+    # Dig range rewritten to full int16.
+    dig_after = _read_signal_dig_bytes(full_path, 0)
+    assert dig_after["dig_min"].decode().rstrip() == "-32768"
+    assert dig_after["dig_max"].decode().rstrip() == "32767"
+
+    # File must now open cleanly in pyedflib (both checks pass).
+    with pyedflib.EdfReader(full_path) as r_:
+        assert r_.signals_in_file == 3
 
 
-def test_detects_digital_strict_inequality(tmp_path):
-    """EDF+ requires strict dig_max > dig_min. dig_max < dig_min + 1 must
-    fire (captures the dig_max == dig_min case and also dig_max < dig_min
-    if somehow written that way)."""
+def test_dig_strict_inequality_triggers_repair(tmp_path):
+    """EDF+ requires strict dig_max > dig_min. dig_max < dig_min (which is
+    < dig_min + 1) must fire the same repair."""
     full_path, _ = generate_partial_record_edf(tmp_path / "dig_strict.edf",
                                                n_channels=3,
                                                sample_rate=100,
@@ -384,30 +399,34 @@ def test_detects_digital_strict_inequality(tmp_path):
     assert repairs[0]["signal_idx"] == 1
     assert repairs[0]["dig_issue"] is not None
 
+    dig_after = _read_signal_dig_bytes(full_path, 1)
+    assert dig_after["dig_min"].decode().rstrip() == "-32768"
+    assert dig_after["dig_max"].decode().rstrip() == "32767"
 
-def test_detects_unparseable_digital_field(tmp_path):
-    """Garbage bytes in the dig fields must be flagged, not repaired."""
+
+def test_unparseable_digital_field_triggers_repair(tmp_path):
+    """Garbage bytes in the dig fields must also trigger the full
+    uncalibration repair."""
     full_path, _ = generate_partial_record_edf(tmp_path / "dig_garble.edf",
                                                n_channels=3,
                                                sample_rate=100,
                                                duration_sec=5)
     _corrupt_dig_fields(full_path, signal_idx=2,
                         new_min="abc", new_max="32767")
-    before = _read_signal_dig_bytes(full_path, 2)
 
     repairs = repair_degenerate_signal_ranges(full_path, verbosity=0)
 
     assert len(repairs) == 1
     assert "unparseable" in repairs[0]["dig_issue"]
-    assert repairs[0]["dig_repaired"] is False
 
-    after = _read_signal_dig_bytes(full_path, 2)
-    assert before == after
+    dig_after = _read_signal_dig_bytes(full_path, 2)
+    assert dig_after["dig_min"].decode().rstrip() == "-32768"
+    assert dig_after["dig_max"].decode().rstrip() == "32767"
 
 
-def test_combined_phys_and_dig_issues_phys_repaired_dig_flagged(tmp_path):
-    """A signal with BOTH phys and dig problems: phys gets repaired,
-    dig gets flagged-only (dig bytes unchanged)."""
+def test_combined_phys_and_dig_issues_both_rewritten(tmp_path):
+    """A signal with BOTH phys and dig issues: both sides get rewritten
+    to the uncalibrated defaults in a single pass."""
     full_path, _ = generate_partial_record_edf(tmp_path / "combined.edf",
                                                n_channels=3,
                                                sample_rate=100,
@@ -416,7 +435,6 @@ def test_combined_phys_and_dig_issues_phys_repaired_dig_flagged(tmp_path):
                          new_min="0.00000", new_max="-0.00000")
     _corrupt_dig_fields(full_path, signal_idx=1,
                         new_min="0", new_max="0")
-    dig_before = _read_signal_dig_bytes(full_path, 1)
 
     repairs = repair_degenerate_signal_ranges(full_path, verbosity=0)
 
@@ -424,23 +442,40 @@ def test_combined_phys_and_dig_issues_phys_repaired_dig_flagged(tmp_path):
     r = repairs[0]
     assert r["phys_issue"] is not None
     assert r["dig_issue"] is not None
-    assert r["phys_repaired"] is True
-    assert r["dig_repaired"] is False
 
-    # Phys bytes should now be the uncalibrated convention.
     phys_after = _read_signal_phys_bytes(full_path, 1)
     assert phys_after["phys_min"].decode().rstrip() == "-1"
     assert phys_after["phys_max"].decode().rstrip() == "1"
     assert phys_after["phys_dim"].decode() == " " * 8
 
-    # Dig bytes must be unchanged.
     dig_after = _read_signal_dig_bytes(full_path, 1)
-    assert dig_before == dig_after
+    assert dig_after["dig_min"].decode().rstrip() == "-32768"
+    assert dig_after["dig_max"].decode().rstrip() == "32767"
 
 
-def test_dig_warning_message_includes_not_repaired(tmp_path, capsys):
-    """The dig warning must make it obvious to the operator that the dig
-    bytes were NOT rewritten, so downstream pyedflib rejection is expected."""
+def test_phys_only_issue_also_rewrites_dig(tmp_path):
+    """Even when only phys is broken, dig gets rewritten too — the
+    all-or-nothing-per-signal rule. Keeps header scaling self-consistent."""
+    full_path, _ = generate_partial_record_edf(tmp_path / "phys_only.edf",
+                                               n_channels=3,
+                                               sample_rate=100,
+                                               duration_sec=5)
+    _corrupt_phys_fields(full_path, signal_idx=2,
+                         new_min="0.00000", new_max="-0.00000")
+
+    repairs = repair_degenerate_signal_ranges(full_path, verbosity=0)
+    assert len(repairs) == 1
+    assert repairs[0]["phys_issue"] is not None
+    assert repairs[0]["dig_issue"] is None
+
+    dig_after = _read_signal_dig_bytes(full_path, 2)
+    assert dig_after["dig_min"].decode().rstrip() == "-32768"
+    assert dig_after["dig_max"].decode().rstrip() == "32767"
+
+
+def test_dig_warning_message_reports_original_values(tmp_path, capsys):
+    """Warning must include the signal label and the original dig values
+    so operators can see which channel triggered the uncalibration."""
     full_path, _ = generate_partial_record_edf(tmp_path / "dig_msg.edf",
                                                n_channels=3,
                                                sample_rate=100,
@@ -450,7 +485,6 @@ def test_dig_warning_message_includes_not_repaired(tmp_path, capsys):
     repair_degenerate_signal_ranges(full_path, verbosity=1)
     out = capsys.readouterr().out
     assert "digital range issue" in out
-    assert "NOT REPAIRED" in out
-    # Original values must appear so the operator knows which signal.
+    assert "uncalibrated" in out
     assert "dig_min='42'" in out
     assert "dig_max='42'" in out
