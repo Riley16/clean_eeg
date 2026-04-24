@@ -49,6 +49,10 @@ SIG_PHYS_MIN_OFFSET = 16 + 80 + 8       # = 104
 SIG_PHYS_MIN_WIDTH = 8
 SIG_PHYS_MAX_OFFSET = 16 + 80 + 8 + 8   # = 112
 SIG_PHYS_MAX_WIDTH = 8
+SIG_DIG_MIN_OFFSET = 16 + 80 + 8 + 8 + 8       # = 120
+SIG_DIG_MIN_WIDTH = 8
+SIG_DIG_MAX_OFFSET = 16 + 80 + 8 + 8 + 8 + 8   # = 128
+SIG_DIG_MAX_WIDTH = 8
 SAMPLES_PER_RECORD_FIELD_OFFSET = 16 + 80 + 8 + 8 + 8 + 8 + 8 + 80  # = 216
 SAMPLES_PER_RECORD_FIELD_WIDTH = 8
 
@@ -165,25 +169,38 @@ UNCALIBRATED_PHYS_MIN = "-1"
 UNCALIBRATED_PHYS_MAX = "1"
 UNCALIBRATED_PHYS_DIM = ""   # rendered as 8 spaces after ljust()
 
-
 def repair_degenerate_signal_ranges(edf_path: str, verbosity: int = 1) -> list:
-    """Detect and repair signals whose physical range header is invalid.
+    """Detect signals with invalid EDF+ physical/digital range headers.
 
-    Bad patterns caught:
-    - phys_max == phys_min for a signal (triggers pyedflib's
-      ``EDFLIB_FILE_ERRORS_PHYS_MAX`` "Physical Maximum" error; the linear
-      mapping between digital and physical values is degenerate).
-    - either field cannot be parsed as a float (rare but possible with
-      corrupted exports; pyedflib rejects with a similar format error).
+    Bad patterns detected:
+    - ``phys_max == phys_min`` (triggers ``EDFLIB_FILE_ERRORS_PHYS_MAX``;
+      linear digital-to-physical scaling is degenerate).
+    - ``dig_max <= dig_min`` (triggers ``EDFLIB_FILE_ERRORS_DIG_MAX``;
+      spec requires strict ``dig_max > dig_min``).
+    - Either phys or dig field unparseable as a number.
 
-    Repair: overwrite physical_min with ``-1``, physical_max with ``1``,
-    and physical_dimension with 8 spaces (EDF+ spec "uncalibrated signal"
-    convention). The digital range and sample data on disk are left
-    untouched — only the header's scaling interpretation changes.
+    Note: ``phys_max < phys_min`` is **allowed** by the spec and left
+    alone — it encodes a negative amplifier gain for the
+    "negativity upward" Clinical Neurophysiology convention.
 
-    Returns a list of dicts describing every signal that was repaired,
-    each with: signal_idx, label, original_phys_min, original_phys_max,
-    original_phys_dim, reason.
+    Repair policy:
+    - **Physical range issues ARE repaired** — the fix is honest because
+      we overwrite with the EDF+ "uncalibrated signal" convention
+      (phys_min=-1, phys_max=1, physical_dimension=8 spaces, section
+      2.1.3 item 5). No downstream tool should trust the scaling.
+    - **Digital range issues are NOT repaired**. Synthesising a digital
+      range would silently re-scale the physical interpretation of the
+      raw samples on disk (physical = phys_min + (dig - dig_min) *
+      (phys_max - phys_min) / (dig_max - dig_min)), producing wrong
+      amplitudes. Instead we emit a loud warning with the original
+      values and let pyedflib reject the file on read — the existing
+      per-file skip path in ``_load_edf_metadata`` then surfaces it to
+      the operator as a manual-handling case.
+
+    Returns a list of dicts describing every signal with a detected
+    issue — keys include ``signal_idx``, ``label``, ``phys_issue``,
+    ``dig_issue``, ``phys_repaired`` (always True when phys_issue is
+    set), and the original field values.
     """
     with open(edf_path, "rb") as f:
         main = f.read(MAIN_HEADER_BYTES)
@@ -201,52 +218,92 @@ def repair_degenerate_signal_ranges(edf_path: str, verbosity: int = 1) -> list:
         pmin_b = _field_slice(SIG_PHYS_MIN_OFFSET, SIG_PHYS_MIN_WIDTH, i)
         pmax_b = _field_slice(SIG_PHYS_MAX_OFFSET, SIG_PHYS_MAX_WIDTH, i)
         pdim_b = _field_slice(SIG_PHYS_DIM_OFFSET, SIG_PHYS_DIM_WIDTH, i)
+        dmin_b = _field_slice(SIG_DIG_MIN_OFFSET, SIG_DIG_MIN_WIDTH, i)
+        dmax_b = _field_slice(SIG_DIG_MAX_OFFSET, SIG_DIG_MAX_WIDTH, i)
         label = label_b.decode("ascii", errors="replace").rstrip()
         pmin_str = pmin_b.decode("ascii", errors="replace").rstrip()
         pmax_str = pmax_b.decode("ascii", errors="replace").rstrip()
         pdim_str = pdim_b.decode("ascii", errors="replace").rstrip()
+        dmin_str = dmin_b.decode("ascii", errors="replace").rstrip()
+        dmax_str = dmax_b.decode("ascii", errors="replace").rstrip()
 
-        reason = None
+        phys_reason = None
         try:
             pmin_val = float(pmin_str)
             pmax_val = float(pmax_str)
             if pmin_val == pmax_val:
-                reason = (f"phys_min == phys_max == {pmin_val} (degenerate "
-                          "scaling would divide by zero)")
+                phys_reason = (f"phys_min == phys_max == {pmin_val} "
+                               "(degenerate scaling would divide by zero)")
         except ValueError as e:
-            reason = (f"unparseable: phys_min={pmin_str!r} "
-                      f"phys_max={pmax_str!r} ({e})")
+            phys_reason = (f"unparseable: phys_min={pmin_str!r} "
+                           f"phys_max={pmax_str!r} ({e})")
 
-        if reason is None:
+        dig_reason = None
+        try:
+            dmin_val = int(dmin_str)
+            dmax_val = int(dmax_str)
+            # EDF+ spec requires strict dmax > dmin. edflib.c also rejects
+            # equality: `if (dig_max < dig_min + 1) error`.
+            if dmax_val <= dmin_val:
+                dig_reason = (f"dig_max ({dmax_val}) <= dig_min ({dmin_val}); "
+                              "EDF+ requires strict dig_max > dig_min")
+        except ValueError as e:
+            dig_reason = (f"unparseable: dig_min={dmin_str!r} "
+                          f"dig_max={dmax_str!r} ({e})")
+
+        if phys_reason is None and dig_reason is None:
             continue
 
-        if verbosity >= 1:
-            print(
-                f"WARNING: Signal {i} ({label!r}) has an invalid EDF+ "
-                f"physical range: {reason}. Rewriting phys_min="
-                f"{UNCALIBRATED_PHYS_MIN}, phys_max={UNCALIBRATED_PHYS_MAX}, "
-                f"units (physical_dimension)=<8 spaces> (EDF+ spec "
-                f"\"uncalibrated signal\" convention). "
-                f"Original values: phys_min={pmin_str!r}, "
-                f"phys_max={pmax_str!r}, units={pdim_str!r}."
+        # Build a single warning covering whichever side(s) of the range
+        # are invalid, for the log.
+        msg_parts = [f"Signal {i} ({label!r}) has an invalid EDF+ header:"]
+        if phys_reason:
+            msg_parts.append(
+                f"  physical range issue: {phys_reason}. Rewriting "
+                f"phys_min={UNCALIBRATED_PHYS_MIN}, "
+                f"phys_max={UNCALIBRATED_PHYS_MAX}, "
+                f"units (physical_dimension)=<8 spaces> (EDF+ "
+                f'"uncalibrated signal" convention, section 2.1.3 item 5).'
             )
+        if dig_reason:
+            msg_parts.append(
+                f"  digital range issue: {dig_reason}. NOT REPAIRED — "
+                "synthesising a digital range would silently re-scale "
+                "the signal. pyedflib will reject this file with "
+                '"(Digital Maximum)" and it will be reported in the '
+                "skipped-files summary for manual handling."
+            )
+        msg_parts.append(
+            f"  Original values: phys_min={pmin_str!r}, "
+            f"phys_max={pmax_str!r}, units={pdim_str!r}, "
+            f"dig_min={dmin_str!r}, dig_max={dmax_str!r}."
+        )
+        if verbosity >= 1:
+            print("WARNING: " + "\n".join(msg_parts))
 
-        _write_signal_field(edf_path, n_signals, i,
-                            SIG_PHYS_MIN_OFFSET, SIG_PHYS_MIN_WIDTH,
-                            UNCALIBRATED_PHYS_MIN)
-        _write_signal_field(edf_path, n_signals, i,
-                            SIG_PHYS_MAX_OFFSET, SIG_PHYS_MAX_WIDTH,
-                            UNCALIBRATED_PHYS_MAX)
-        _write_signal_field(edf_path, n_signals, i,
-                            SIG_PHYS_DIM_OFFSET, SIG_PHYS_DIM_WIDTH,
-                            UNCALIBRATED_PHYS_DIM)
+        if phys_reason:
+            _write_signal_field(edf_path, n_signals, i,
+                                SIG_PHYS_MIN_OFFSET, SIG_PHYS_MIN_WIDTH,
+                                UNCALIBRATED_PHYS_MIN)
+            _write_signal_field(edf_path, n_signals, i,
+                                SIG_PHYS_MAX_OFFSET, SIG_PHYS_MAX_WIDTH,
+                                UNCALIBRATED_PHYS_MAX)
+            _write_signal_field(edf_path, n_signals, i,
+                                SIG_PHYS_DIM_OFFSET, SIG_PHYS_DIM_WIDTH,
+                                UNCALIBRATED_PHYS_DIM)
+        # Dig range issues are detected-and-warned only; never rewritten.
         repairs.append({
             "signal_idx": i,
             "label": label,
+            "phys_issue": phys_reason,
+            "dig_issue": dig_reason,
+            "phys_repaired": phys_reason is not None,
+            "dig_repaired": False,
             "original_phys_min": pmin_str,
             "original_phys_max": pmax_str,
             "original_phys_dim": pdim_str,
-            "reason": reason,
+            "original_dig_min": dmin_str,
+            "original_dig_max": dmax_str,
         })
     return repairs
 

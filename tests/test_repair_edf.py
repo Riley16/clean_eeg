@@ -13,6 +13,8 @@ from clean_eeg.repair_edf import (
     SIG_PHYS_MIN_OFFSET, SIG_PHYS_MIN_WIDTH,
     SIG_PHYS_MAX_OFFSET, SIG_PHYS_MAX_WIDTH,
     SIG_PHYS_DIM_OFFSET, SIG_PHYS_DIM_WIDTH,
+    SIG_DIG_MIN_OFFSET, SIG_DIG_MIN_WIDTH,
+    SIG_DIG_MAX_OFFSET, SIG_DIG_MAX_WIDTH,
     N_RECORDS_OFFSET,
     N_RECORDS_WIDTH,
 )
@@ -135,26 +137,40 @@ def test_repair_prints_one_liner_report(tmp_path, capsys):
 # repair_degenerate_signal_ranges tests
 # ------------------------------------------------------------
 
+def _write_sig_field(path: str, signal_idx: int,
+                     field_offset: int, field_width: int,
+                     value: str) -> None:
+    with open(path, "rb") as f:
+        main = f.read(MAIN_HEADER_BYTES)
+    n_signals = int(main[252:256].decode().strip())
+    abs_offset = (MAIN_HEADER_BYTES
+                  + field_offset * n_signals
+                  + signal_idx * field_width)
+    with open(path, "r+b") as f:
+        f.seek(abs_offset)
+        f.write(value.ljust(field_width).encode("ascii"))
+
+
 def _corrupt_phys_fields(path: str, signal_idx: int,
                          new_min: str, new_max: str,
                          new_dim: str = None) -> None:
     """Directly write ASCII bytes to a signal's physical-range header fields."""
-    with open(path, "rb") as f:
-        main = f.read(MAIN_HEADER_BYTES)
-    n_signals = int(main[252:256].decode().strip())
-
-    def _write(field_offset, field_width, value):
-        abs_offset = (MAIN_HEADER_BYTES
-                      + field_offset * n_signals
-                      + signal_idx * field_width)
-        with open(path, "r+b") as f:
-            f.seek(abs_offset)
-            f.write(value.ljust(field_width).encode("ascii"))
-
-    _write(SIG_PHYS_MIN_OFFSET, SIG_PHYS_MIN_WIDTH, new_min)
-    _write(SIG_PHYS_MAX_OFFSET, SIG_PHYS_MAX_WIDTH, new_max)
+    _write_sig_field(path, signal_idx,
+                     SIG_PHYS_MIN_OFFSET, SIG_PHYS_MIN_WIDTH, new_min)
+    _write_sig_field(path, signal_idx,
+                     SIG_PHYS_MAX_OFFSET, SIG_PHYS_MAX_WIDTH, new_max)
     if new_dim is not None:
-        _write(SIG_PHYS_DIM_OFFSET, SIG_PHYS_DIM_WIDTH, new_dim)
+        _write_sig_field(path, signal_idx,
+                         SIG_PHYS_DIM_OFFSET, SIG_PHYS_DIM_WIDTH, new_dim)
+
+
+def _corrupt_dig_fields(path: str, signal_idx: int,
+                        new_min: str, new_max: str) -> None:
+    """Directly write ASCII bytes to a signal's digital-range header fields."""
+    _write_sig_field(path, signal_idx,
+                     SIG_DIG_MIN_OFFSET, SIG_DIG_MIN_WIDTH, new_min)
+    _write_sig_field(path, signal_idx,
+                     SIG_DIG_MAX_OFFSET, SIG_DIG_MAX_WIDTH, new_max)
 
 
 def _read_signal_phys_bytes(path: str, signal_idx: int) -> dict:
@@ -168,6 +184,23 @@ def _read_signal_phys_bytes(path: str, signal_idx: int) -> dict:
             ("phys_min", SIG_PHYS_MIN_OFFSET, SIG_PHYS_MIN_WIDTH),
             ("phys_max", SIG_PHYS_MAX_OFFSET, SIG_PHYS_MAX_WIDTH),
             ("phys_dim", SIG_PHYS_DIM_OFFSET, SIG_PHYS_DIM_WIDTH),
+        ):
+            f.seek(MAIN_HEADER_BYTES + field_offset * n_signals
+                   + signal_idx * field_width)
+            out[field_name] = f.read(field_width)
+    return out
+
+
+def _read_signal_dig_bytes(path: str, signal_idx: int) -> dict:
+    """Read the 8-byte dig_min and dig_max fields for a signal."""
+    with open(path, "rb") as f:
+        main = f.read(MAIN_HEADER_BYTES)
+    n_signals = int(main[252:256].decode().strip())
+    out = {}
+    with open(path, "rb") as f:
+        for field_name, field_offset, field_width in (
+            ("dig_min", SIG_DIG_MIN_OFFSET, SIG_DIG_MIN_WIDTH),
+            ("dig_max", SIG_DIG_MAX_OFFSET, SIG_DIG_MAX_WIDTH),
         ):
             f.seek(MAIN_HEADER_BYTES + field_offset * n_signals
                    + signal_idx * field_width)
@@ -194,7 +227,10 @@ def test_detects_and_repairs_exact_degenerate_range(tmp_path):
     assert r["signal_idx"] == 1
     assert r["original_phys_min"] == "0.00000"
     assert r["original_phys_max"] == "0.00000"
-    assert "phys_min == phys_max" in r["reason"]
+    assert "phys_min == phys_max" in r["phys_issue"]
+    assert r["dig_issue"] is None
+    assert r["phys_repaired"] is True
+    assert r["dig_repaired"] is False
 
     post = _read_signal_phys_bytes(full_path, 1)
     assert post["phys_min"].decode().rstrip() == "-1"
@@ -256,7 +292,7 @@ def test_unparseable_phys_field_is_repaired(tmp_path):
 
     assert len(repairs) == 1
     assert repairs[0]["signal_idx"] == 0
-    assert "unparseable" in repairs[0]["reason"]
+    assert "unparseable" in repairs[0]["phys_issue"]
 
     post = _read_signal_phys_bytes(full_path, 0)
     assert post["phys_min"].decode().rstrip() == "-1"
@@ -298,3 +334,123 @@ def test_repair_warning_includes_original_values(tmp_path, capsys):
     assert "0.00000" in out
     assert "-0.00000" in out
     assert "raw" in out
+
+
+# ------------------------------------------------------------
+# Digital-range: detect-and-warn only (no byte rewriting)
+# ------------------------------------------------------------
+
+def test_detects_digital_range_degeneracy_without_repair(tmp_path):
+    """dig_max <= dig_min must be detected and warned about, but the dig
+    bytes must NOT be rewritten — the caller should let pyedflib reject
+    the file so it surfaces via the skipped-files path."""
+    full_path, _ = generate_partial_record_edf(tmp_path / "dig_degen.edf",
+                                               n_channels=3,
+                                               sample_rate=100,
+                                               duration_sec=5)
+    # Corrupt signal 0's digital range so dig_max == dig_min
+    _corrupt_dig_fields(full_path, signal_idx=0,
+                        new_min="0", new_max="0")
+    before = _read_signal_dig_bytes(full_path, 0)
+
+    repairs = repair_degenerate_signal_ranges(full_path, verbosity=0)
+
+    assert len(repairs) == 1
+    r = repairs[0]
+    assert r["signal_idx"] == 0
+    assert r["phys_issue"] is None
+    assert r["dig_issue"] is not None
+    assert "dig_max" in r["dig_issue"]
+    assert r["phys_repaired"] is False
+    assert r["dig_repaired"] is False
+
+    # Dig bytes must be unchanged on disk.
+    after = _read_signal_dig_bytes(full_path, 0)
+    assert before == after
+
+
+def test_detects_digital_strict_inequality(tmp_path):
+    """EDF+ requires strict dig_max > dig_min. dig_max < dig_min + 1 must
+    fire (captures the dig_max == dig_min case and also dig_max < dig_min
+    if somehow written that way)."""
+    full_path, _ = generate_partial_record_edf(tmp_path / "dig_strict.edf",
+                                               n_channels=3,
+                                               sample_rate=100,
+                                               duration_sec=5)
+    _corrupt_dig_fields(full_path, signal_idx=1,
+                        new_min="100", new_max="50")  # dig_max < dig_min
+    repairs = repair_degenerate_signal_ranges(full_path, verbosity=0)
+    assert len(repairs) == 1
+    assert repairs[0]["signal_idx"] == 1
+    assert repairs[0]["dig_issue"] is not None
+
+
+def test_detects_unparseable_digital_field(tmp_path):
+    """Garbage bytes in the dig fields must be flagged, not repaired."""
+    full_path, _ = generate_partial_record_edf(tmp_path / "dig_garble.edf",
+                                               n_channels=3,
+                                               sample_rate=100,
+                                               duration_sec=5)
+    _corrupt_dig_fields(full_path, signal_idx=2,
+                        new_min="abc", new_max="32767")
+    before = _read_signal_dig_bytes(full_path, 2)
+
+    repairs = repair_degenerate_signal_ranges(full_path, verbosity=0)
+
+    assert len(repairs) == 1
+    assert "unparseable" in repairs[0]["dig_issue"]
+    assert repairs[0]["dig_repaired"] is False
+
+    after = _read_signal_dig_bytes(full_path, 2)
+    assert before == after
+
+
+def test_combined_phys_and_dig_issues_phys_repaired_dig_flagged(tmp_path):
+    """A signal with BOTH phys and dig problems: phys gets repaired,
+    dig gets flagged-only (dig bytes unchanged)."""
+    full_path, _ = generate_partial_record_edf(tmp_path / "combined.edf",
+                                               n_channels=3,
+                                               sample_rate=100,
+                                               duration_sec=5)
+    _corrupt_phys_fields(full_path, signal_idx=1,
+                         new_min="0.00000", new_max="-0.00000")
+    _corrupt_dig_fields(full_path, signal_idx=1,
+                        new_min="0", new_max="0")
+    dig_before = _read_signal_dig_bytes(full_path, 1)
+
+    repairs = repair_degenerate_signal_ranges(full_path, verbosity=0)
+
+    assert len(repairs) == 1
+    r = repairs[0]
+    assert r["phys_issue"] is not None
+    assert r["dig_issue"] is not None
+    assert r["phys_repaired"] is True
+    assert r["dig_repaired"] is False
+
+    # Phys bytes should now be the uncalibrated convention.
+    phys_after = _read_signal_phys_bytes(full_path, 1)
+    assert phys_after["phys_min"].decode().rstrip() == "-1"
+    assert phys_after["phys_max"].decode().rstrip() == "1"
+    assert phys_after["phys_dim"].decode() == " " * 8
+
+    # Dig bytes must be unchanged.
+    dig_after = _read_signal_dig_bytes(full_path, 1)
+    assert dig_before == dig_after
+
+
+def test_dig_warning_message_includes_not_repaired(tmp_path, capsys):
+    """The dig warning must make it obvious to the operator that the dig
+    bytes were NOT rewritten, so downstream pyedflib rejection is expected."""
+    full_path, _ = generate_partial_record_edf(tmp_path / "dig_msg.edf",
+                                               n_channels=3,
+                                               sample_rate=100,
+                                               duration_sec=5)
+    _corrupt_dig_fields(full_path, signal_idx=0,
+                        new_min="42", new_max="42")
+    repair_degenerate_signal_ranges(full_path, verbosity=1)
+    out = capsys.readouterr().out
+    assert "digital range issue" in out
+    assert "NOT REPAIRED" in out
+    # Original values must appear so the operator knows which signal.
+    assert "dig_min='42'" in out
+    assert "dig_max='42'" in out

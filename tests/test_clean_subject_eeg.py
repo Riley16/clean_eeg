@@ -265,3 +265,140 @@ def test_clean_subject_edf_files_empty_dir_raises(tmp_path):
             subject_name=PATIENT_NAME,
             inplace=True,
         )
+
+
+# ---------------------------------------------------------------------
+# End-to-end regression: degenerate physical_min/physical_max (NK-style
+# "0.00000" / "-0.00000" pair) must not kill clean_subject_edf_files.
+# The whole pipeline — repair, load, redact, write, optional audit —
+# must produce an output file pyedflib can re-open cleanly, with the
+# degenerate signal's phys range rewritten to -1/1.
+# ---------------------------------------------------------------------
+
+def _corrupt_one_signal_phys_range(edf_path: str,
+                                    signal_idx: int,
+                                    new_min: str,
+                                    new_max: str) -> None:
+    """Overwrite a signal's phys_min/phys_max bytes with the given ASCII
+    values (left-padded to 8 bytes). No mutation to signal data."""
+    from clean_eeg.repair_edf import (
+        MAIN_HEADER_BYTES,
+        SIG_PHYS_MIN_OFFSET, SIG_PHYS_MIN_WIDTH,
+        SIG_PHYS_MAX_OFFSET, SIG_PHYS_MAX_WIDTH,
+    )
+    with open(edf_path, "rb") as f:
+        main = f.read(MAIN_HEADER_BYTES)
+    n_signals = int(main[252:256].decode().strip())
+
+    def write(field_offset, field_width, value):
+        off = (MAIN_HEADER_BYTES
+               + field_offset * n_signals
+               + signal_idx * field_width)
+        with open(edf_path, "r+b") as f:
+            f.seek(off)
+            f.write(value.ljust(field_width).encode("ascii"))
+
+    write(SIG_PHYS_MIN_OFFSET, SIG_PHYS_MIN_WIDTH, new_min)
+    write(SIG_PHYS_MAX_OFFSET, SIG_PHYS_MAX_WIDTH, new_max)
+
+
+def _write_minimal_edfplus_with_annotations(path: str,
+                                             n_channels: int = 3,
+                                             sample_rate: int = 100,
+                                             duration_s: int = 5) -> None:
+    """Write a small EDF+C with a couple of user annotations.
+
+    The annotations are needed because the inplace pipeline creates an
+    ``_annotations.edf`` stub and re-opens it to validate; pyedflib rejects
+    stubs that contain zero records, so the input must have at least one
+    annotation for the inplace path to work end-to-end.
+    """
+    import pyedflib
+    from datetime import datetime
+    signal_headers = [
+        {'label': f'CH{i}', 'dimension': 'uV',
+         'sample_frequency': sample_rate,
+         'physical_max': 3200.0, 'physical_min': -3200.0,
+         'digital_max': 32767, 'digital_min': -32768,
+         'prefilter': '', 'transducer': ''}
+        for i in range(n_channels)
+    ]
+    t = np.arange(0, duration_s, 1.0 / sample_rate, dtype=np.float32)
+    signals = [
+        (1000.0 * np.sin(2 * np.pi * (i + 1) * t)).astype(np.float64)
+        for i in range(n_channels)
+    ]
+    with pyedflib.EdfWriter(path, n_channels,
+                             file_type=pyedflib.FILETYPE_EDFPLUS) as f:
+        f.setHeader({
+            'technician': 'T', 'recording_additional': '',
+            'patientname': f'{PATIENT_NAME.first_name} {PATIENT_NAME.last_name}',
+            'patient_additional': '',
+            'patientcode': SUBJECT_CODE, 'equipment': 'test',
+            'admincode': '', 'sex': 'Male',
+            'startdate': datetime(2023, 1, 1, 10, 0, 0),
+            'birthdate': '01 feb 1970', 'gender': 'Male',
+        })
+        f.setSignalHeaders(signal_headers)
+        f.writeSamples(signals)
+        f.writeAnnotation(0.5, -1, "START")
+        f.writeAnnotation(float(duration_s) - 0.5, -1, "END")
+
+
+@pytest.mark.parametrize("inplace", [False, True])
+def test_clean_subject_edf_files_repairs_degenerate_phys_range(monkeypatch, tmp_path, inplace):
+    """A file with phys_min == phys_max (exact NK pattern: "0.00000" /
+    "-0.00000") must flow through the full pipeline without error and the
+    output must open cleanly in pyedflib with phys_min=-1, phys_max=1 on
+    the previously-degenerate channel."""
+    import pyedflib
+
+    responses = iter(["y", "y", "y"])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    output_dir = input_dir if inplace else tmp_path / "out"
+    if not inplace:
+        output_dir.mkdir()
+
+    edf_path = input_dir / "degen.edf"
+    _write_minimal_edfplus_with_annotations(str(edf_path),
+                                             n_channels=3,
+                                             sample_rate=100,
+                                             duration_s=5)
+    # Corrupt signal 1 the exact NK way: phys_min == 0.0, phys_max == -0.0
+    # (numerically equal, string-different).
+    _corrupt_one_signal_phys_range(str(edf_path), signal_idx=1,
+                                   new_min="0.00000", new_max="-0.00000")
+
+    # Sanity: corrupted file is NOT pyedflib-openable before the pipeline
+    with pytest.raises(OSError, match=r"(?i)physical\s*max"):
+        pyedflib.EdfReader(str(edf_path)).close()
+
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(output_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=inplace,
+        raise_errors=True,
+    )
+
+    # Locate the cleaned output file (named with timestamp suffix), skipping
+    # the annotations stub.
+    out_files = [
+        p for p in os.listdir(str(output_dir))
+        if p.endswith('.edf') and '_annotations' not in p
+           and p != 'degen.edf'
+    ]
+    assert len(out_files) == 1, f"expected 1 cleaned file, got: {out_files}"
+    out_path = os.path.join(str(output_dir), out_files[0])
+
+    # Full pipeline must have produced a pyedflib-openable output with the
+    # degenerate signal now carrying a valid -1 / 1 range.
+    with pyedflib.EdfReader(out_path) as r:
+        assert r.signals_in_file == 3
+        sh = r.getSignalHeader(1)
+        assert sh['physical_min'] == -1.0
+        assert sh['physical_max'] == 1.0
