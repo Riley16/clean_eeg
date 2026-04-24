@@ -101,7 +101,8 @@ def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: Per
         assert isinstance(text, str)
         redacted_text = redact_string(str(text),
                                       field_name='annotation',
-                                      subject_name=subject_name)
+                                      subject_name=subject_name,
+                                      alert=True)
         clean_start_times.append(start_time)
         clean_durations.append(duration)
         clean_descriptions.append(redacted_text)
@@ -134,13 +135,14 @@ def deidentify_start_date_time(recording_start_time, earliest_recording_start_ti
     return shifted_time
 
 
-def redact_string(text: str, field_name: str, subject_name: PersonalName) -> str:
+def redact_string(text: str, field_name: str, subject_name: PersonalName,
+                  alert: bool = False) -> str:
     redacted = redact_subject_name(text, subject_full_name=subject_name)
     redacted = remove_gendered_pronouns(redacted)
-    if text != redacted:
-        print('Subject protected health information detected in EDF header field '
-            f'"{field_name}" with value "{text}"... redacting. '
-            'Alert the data analysis team.')
+    if alert and text != redacted:
+        print('Subject protected health information detected in EDF '
+              f'{field_name} with value "{text}"... redacting. '
+              'Alert the data analysis team.')
     return redacted
 
 
@@ -203,50 +205,69 @@ def clean_subject_edf_files(
 
     # de-identify EDF files and save out
     print("Cleaning EDF files... Saving to output path:", output_path)
+    failed_files: list[tuple[str, str]] = []
     for filename, _ in tqdm(EDF_meta_data.items()):
-        input_file_path = os.path.join(input_path, filename)
-        edf = load_edf(input_file_path, load_method=load_method, preload=True)
-        assert isinstance(edf, dict)
+        try:
+            input_file_path = os.path.join(input_path, filename)
+            edf = load_edf(input_file_path, load_method=load_method, preload=True)
+            assert isinstance(edf, dict)
 
-        # Stash original signals before de-identification for audited files
-        if filename in audit_filenames:
-            orig_signals = [sig.copy() for sig in edf['signals']]
+            # Stash original signals before de-identification for audited files
+            if filename in audit_filenames:
+                orig_signals = [sig.copy() for sig in edf['signals']]
 
-        edf = deidentify_edf(
-            edf_data=edf,
-            subject_name=subject_name,
-            subject_code=subject_code,
-            earliest_recording_start_time=min_start_time
-        )
-        truncation_warnings = validate_header_roundtrip(
-            edf['header'], edf['signal_headers'])
-        for warning in truncation_warnings:
-            print(f"WARNING: {warning}")
+            edf = deidentify_edf(
+                edf_data=edf,
+                subject_name=subject_name,
+                subject_code=subject_code,
+                earliest_recording_start_time=min_start_time
+            )
+            truncation_warnings = validate_header_roundtrip(
+                edf['header'], edf['signal_headers'])
+            for warning in truncation_warnings:
+                print(f"WARNING: {warning}")
 
-        clean_start_time = edf['header']['startdate']
-        filename_no_ext = os.path.splitext(filename)[0]
-        subject_val = subject_code
-        clean_filename = f"{filename_no_ext}_{subject_val}_{clean_start_time.strftime('%Y.%m.%d__%H.%M.%S')}.edf"
-        clean_full_path = os.path.join(output_path, clean_filename)
-        if inplace:
-            shutil.move(input_file_path, clean_full_path)
-            clean_annotations_path = str(clean_full_path).replace('.edf', '_annotations.edf')
-            create_annotations_only_edf(clean_annotations_path,
-                                        header=edf['header'],
-                                        annotations=edf['annotations'])
-            update_edf_header_inplace(clean_full_path,
-                                      header_updates=edf['header'],
-                                      signal_header_updates=edf['signal_headers'])
-            clear_edf_annotations_inplace(clean_full_path)
-        else:
-            write_edf_pyedflib(edf, clean_full_path)
-        print(f"Cleaned EDF file at: {clean_filename}")
+            clean_start_time = edf['header']['startdate']
+            filename_no_ext = os.path.splitext(filename)[0]
+            subject_val = subject_code
+            clean_filename = f"{filename_no_ext}_{subject_val}_{clean_start_time.strftime('%Y.%m.%d__%H.%M.%S')}.edf"
+            clean_full_path = os.path.join(output_path, clean_filename)
+            if inplace:
+                shutil.move(input_file_path, clean_full_path)
+                clean_annotations_path = str(clean_full_path).replace('.edf', '_annotations.edf')
+                create_annotations_only_edf(clean_annotations_path,
+                                            header=edf['header'],
+                                            annotations=edf['annotations'])
+                update_edf_header_inplace(clean_full_path,
+                                          header_updates=edf['header'],
+                                          signal_header_updates=edf['signal_headers'])
+                clear_edf_annotations_inplace(clean_full_path)
+            else:
+                write_edf_pyedflib(edf, clean_full_path)
+            print(f"Cleaned EDF file at: {clean_filename}")
 
-        # Audit signal integrity immediately after write
-        if filename in audit_filenames:
-            _audit_signal_integrity(orig_signals, clean_full_path, filename, inplace=inplace)
+            # Audit signal integrity immediately after write
+            if filename in audit_filenames:
+                _audit_signal_integrity(orig_signals, clean_full_path, filename, inplace=inplace)
+        except Exception as e:
+            if raise_errors:
+                raise e
+            failed_files.append((filename, f"{type(e).__name__}: {e}"))
+            print(f"\nERROR: Failed to de-identify EDF file {filename}:\n\n{e}\n\n"
+                  f"Skipping this file and continuing...\n")
 
     print("Done cleaning EDF files. Saved to output path:", output_path)
+    if failed_files:
+        print(
+            f"\nWARNING: {len(failed_files)} EDF file(s) were skipped during "
+            f"de-identification and will need to be handled manually:"
+        )
+        for fname, err in failed_files:
+            print(f"  - {fname}: {err}")
+        print(
+            "Please send the log file (log.out, in the EDF directory) to the "
+            "data management team so these files can be investigated.\n"
+        )
     site_code = subject_code[-1]  # last character of subject code is site code
     site_code_incoming_folder = SITE_CODE_TO_INCOMING_FOLDER.get(site_code, 'UNKNOWN_SITE')
     remote_dir = f"/data10/RAM/incoming/{site_code_incoming_folder}/{subject_code}/all_clinical_eeg"
@@ -292,20 +313,39 @@ def _load_edf_metadata(input_path: str,
                        load_method: str = "pyedflib",
                        verbosity: int = 1,
                        convert_to_edfC: bool = True,
+                       repair_truncated: bool = True,
                        raise_errors: bool = False):
+    from clean_eeg.repair_edf import repair_truncated_edf_header
     EDF_meta_data = dict()
+    failed_files: list[tuple[str, str]] = []  # (filename, error_message)
     for filename in tqdm(os.listdir(input_path), desc="Loading EDF meta-data..."):
+        if not filename.lower().endswith('.edf'):
+            continue
+        full_path = os.path.join(input_path, filename)
         try:
-            if filename.lower().endswith('.edf'):
-                full_path = os.path.join(input_path, filename)
-                if convert_to_edfC:
-                    convert_edfC_to_edfD(full_path)
-                data = load_edf(full_path, load_method=load_method, preload=False)
-                EDF_meta_data[filename] = {'data': data}
+            if convert_to_edfC:
+                convert_edfC_to_edfD(full_path)
+            if repair_truncated:
+                repair_truncated_edf_header(full_path, verbosity=verbosity)
+            data = load_edf(full_path, load_method=load_method, preload=False)
+            EDF_meta_data[filename] = {'data': data}
         except Exception as e:
             if raise_errors:
                 raise e
-            print(f"ERROR: Failed to load EDF file {filename}:\n\n{e}\n\nCheck if the file is corrupted. Skipping this file...\n")
+            failed_files.append((filename, f"{type(e).__name__}: {e}"))
+            print(f"ERROR: Failed to load EDF file {filename}:\n\n{e}\n\n"
+                  f"Check if the file is corrupted. Skipping this file...\n")
+    if failed_files:
+        print(
+            f"\nWARNING: {len(failed_files)} EDF file(s) were skipped during "
+            f"loading and will not be de-identified:"
+        )
+        for fname, err in failed_files:
+            print(f"  - {fname}: {err}")
+        print(
+            "Please send the log file (log.out, in the EDF directory) to the "
+            "data management team so these files can be investigated.\n"
+        )
     return EDF_meta_data
 
 
