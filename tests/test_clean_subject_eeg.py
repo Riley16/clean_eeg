@@ -4,7 +4,8 @@ import shutil
 import pytest
 
 from clean_eeg.clean_subject_eeg import remove_gendered_pronouns, _GENDERED_PRONOUNS, BASE_START_DATE,\
-        DEFAULT_REDACT_HEADER_KEYS, REDACT_REPLACEMENT, REDACT_PRONOUN_REPLACEMENT, clean_subject_edf_files
+        DEFAULT_REDACT_HEADER_KEYS, REDACT_REPLACEMENT, REDACT_PRONOUN_REPLACEMENT, clean_subject_edf_files, \
+        _check_subject_name_consistency
 from clean_eeg.load_eeg import load_edf
 from tests.generate_edf import format_edf_config_json
 from clean_eeg.paths import TEST_DATA_DIR, TEST_CONFIG_FILE, TEST_SUBJECT_DATA_DIR, INCONSISTENT_SUBJECT_DATA_DIR
@@ -186,7 +187,7 @@ def test_clean_subject_edf_files_w_inconsistent_signal_headers(monkeypatch):
     output_path = INCONSISTENT_SUBJECT_DATA_DIR / 'temp_clean_output'
     if not output_path.exists():
         os.makedirs(output_path)
-    
+
     try:
         clean_subject_edf_files(subject_name=PATIENT_NAME,
                                 subject_code=SUBJECT_CODE,
@@ -197,3 +198,55 @@ def test_clean_subject_edf_files_w_inconsistent_signal_headers(monkeypatch):
         assert str(e).startswith('Aborting EDF de-identification conversion due to inconsistent signal headers')
     else:
         assert False, 'RuntimeError was not raised for inconsistent signal headers'
+
+
+# --- _check_subject_name_consistency unit tests ---
+
+def _make_edf_meta(filenames_and_names: dict) -> dict:
+    """Build a minimal EDF_meta_data dict for testing name consistency."""
+    return {
+        fname: {'data': {'header': {'patientname': name}}}
+        for fname, name in filenames_and_names.items()
+    }
+
+
+def test_name_consistency_matching_name():
+    """CLI name matches EDF header name — should pass without prompting."""
+    cli_name = PersonalName(first_name='John', middle_names=[], last_name='Doe')
+    meta = _make_edf_meta({'file1.edf': 'John Doe'})
+    # No prompt needed, should not raise
+    _check_subject_name_consistency(meta, command_line_subject_name=cli_name)
+
+
+def test_name_consistency_already_redacted():
+    """EDF header already redacted as 'X' — should pass without prompting."""
+    cli_name = PersonalName(first_name='John', middle_names=[], last_name='Doe')
+    meta = _make_edf_meta({'file1.edf': 'X'})
+    _check_subject_name_consistency(meta, command_line_subject_name=cli_name)
+
+
+def test_name_consistency_mismatch_user_confirms(monkeypatch):
+    """CLI name differs from EDF header — user confirms yes, should pass."""
+    responses = iter(['yes'])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+
+    cli_name = PersonalName(first_name='John', middle_names=[], last_name='Doe')
+    meta = _make_edf_meta({'file1.edf': 'Jane Smith'})
+    _check_subject_name_consistency(meta, command_line_subject_name=cli_name)
+
+
+def test_name_consistency_mismatch_user_denies(monkeypatch):
+    """CLI name differs from EDF header — user says no, should raise RuntimeError."""
+    responses = iter(['no'])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+
+    cli_name = PersonalName(first_name='John', middle_names=[], last_name='Doe')
+    meta = _make_edf_meta({'file1.edf': 'Jane Smith'})
+    with pytest.raises(RuntimeError, match='inconsistent subject names'):
+        _check_subject_name_consistency(meta, command_line_subject_name=cli_name)
+
+
+def test_name_consistency_no_cli_name():
+    """No CLI name provided — should pass without prompting regardless of header name."""
+    meta = _make_edf_meta({'file1.edf': 'Jane Smith'})
+    _check_subject_name_consistency(meta, command_line_subject_name=None)
