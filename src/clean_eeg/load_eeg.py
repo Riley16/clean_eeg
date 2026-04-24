@@ -4,7 +4,8 @@ import argparse
 RESERVED_FIELD_EDF_HEADER_BYTE_OFFSET = 192
 
 
-def load_edf(filename, load_method='pyedflib', preload=False, read_digital=False):
+def load_edf(filename, load_method='pyedflib', preload=False, read_digital=False,
+             use_mmap=False):
     """
     Load an EDF file using pyedflib or lunapi.
 
@@ -13,6 +14,13 @@ def load_edf(filename, load_method='pyedflib', preload=False, read_digital=False
         load_method (str): one of 'pyedflib' or 'lunapi'.
         preload (bool): If True, preload the EEG data into memory.
         read_digital (bool): If True, read digital signals if available.
+        use_mmap (bool): If True (and ``preload=True, read_digital=True``),
+            use the record-based mmap signal reader instead of pyedflib's
+            per-channel loop. Orders of magnitude faster on multi-GB NK
+            files because it avoids pyedflib's interleaved-layout seeks.
+            Headers / signal_headers / annotations still come from pyedflib.
+            Ignored when ``preload=False`` or ``read_digital=False``
+            (float / physical conversion is not supported by the mmap path).
 
     Returns:
         object: Loaded data object (depends on backend).
@@ -22,7 +30,32 @@ def load_edf(filename, load_method='pyedflib', preload=False, read_digital=False
         import pyedflib
         reader = pyedflib.EdfReader(filename)
         if preload:
-            signals = [reader.readSignal(i, digital=read_digital) for i in range(reader.signals_in_file)]
+            if use_mmap and read_digital:
+                # Fast path — mmap-based record-deinterleaving reader.
+                # Returns byte-identical int32 arrays to readSignal(digital=True).
+                # Helper reads on-disk geometry (including annotation channels)
+                # directly from the header bytes, then filters annotations out
+                # of the output so the return value matches pyedflib's
+                # signals_in_file count and ordering.
+                #
+                # Any failure (unexpected layout, truncation missed by
+                # pyedflib, OS mmap limit, etc.) falls back to pyedflib's
+                # per-channel readSignal loop with a warning, so the
+                # pipeline never regresses below the baseline behaviour.
+                try:
+                    signals = _read_signals_via_mmap(filename)
+                except Exception as e:
+                    print(
+                        f"WARNING: mmap signal loader failed for {filename}: "
+                        f"{type(e).__name__}: {e}. "
+                        "Falling back to pyedflib's per-channel readSignal loop "
+                        "(slower but widely tested)."
+                    )
+                    signals = [reader.readSignal(i, digital=read_digital)
+                               for i in range(reader.signals_in_file)]
+            else:
+                signals = [reader.readSignal(i, digital=read_digital)
+                           for i in range(reader.signals_in_file)]
         else:
             signals = None
         header = reader.getHeader()
@@ -41,6 +74,137 @@ def load_edf(filename, load_method='pyedflib', preload=False, read_digital=False
         return inst
     else:
         raise ValueError("Invalid load method specified. Use 'pyedflib' or 'lunapi'.")
+
+
+def _read_signals_via_mmap(filename: str) -> list:
+    """Read all non-annotation signals from an EDF file via a single mmap pass.
+
+    Returns a list of ``np.int32`` arrays — one per data (non-annotation)
+    signal, in header order — matching the output of
+    ``[pyedflib.EdfReader(filename).readSignal(i, digital=True) for i in
+    range(signals_in_file)]`` byte-for-byte.
+
+    Why this exists: EDF stores samples in an interleaved per-record
+    layout (record 0: [sig0, sig1, ..., sigN], record 1: [sig0, sig1,
+    ..., sigN], ...). pyedflib's ``readSignal(i)`` walks the file once
+    per channel, which means ``N_signals * N_records`` small disk
+    seeks to gather each channel's scattered samples. For a 3.8 GB NK
+    file (~178 ch, ~62k records) that's ~11 million tiny I/O ops —
+    minutes of wall time even on fast SSDs.
+
+    This helper mmap's the file once, reshapes the data region to
+    ``(n_records, record_samples)`` as a zero-copy ``int16`` view, and
+    slices each signal's columns out. OS page cache handles the actual
+    disk reads as one big sequential scan — seconds instead of minutes.
+
+    The function parses on-disk header geometry itself (n_signals,
+    n_records, samples_per_record, labels) from the EDF header bytes.
+    It does NOT reuse pyedflib's ``signals_in_file``, because that
+    count excludes EDF+ Annotations channels while the on-disk layout
+    includes them — using the pyedflib count would miss the
+    annotations-channel bytes in every record and corrupt every read.
+
+    Annotation channels are identified by the EDF+ label ``"EDF
+    Annotations"`` and filtered out of the returned list so the output
+    matches pyedflib's ``readSignal`` contract.
+
+    Output dtype is ``np.int32`` to stay drop-in compatible with
+    ``readSignal(digital=True)``; the underlying data is int16 on disk
+    and in the mmap, the int32 upcast is the only copy.
+    """
+    import mmap
+    import os
+    import numpy as np
+
+    # --- parse on-disk geometry straight from the header bytes ---
+    with open(filename, "rb") as f:
+        main = f.read(256)
+        n_signals = int(main[252:256].decode().strip())
+        n_records = int(main[236:244].decode().strip())
+        sig_header = f.read(256 * n_signals)
+
+    if n_signals <= 0:
+        return []
+    if n_records <= 0:
+        return []
+
+    # Per-signal fields are stored FIELD-by-FIELD across all signals,
+    # not per-signal. i.e. all N labels first, then all N transducers,
+    # ..., then all N samples_per_record, then all N reserved.
+    LABEL_OFFSET = 0
+    LABEL_WIDTH = 16
+    SPR_OFFSET = 216   # cumulative after label+transducer+dim+pmin+pmax+dmin+dmax+prefilter
+    SPR_WIDTH = 8
+    labels = []
+    samples_per_record = []
+    for i in range(n_signals):
+        lab_b = sig_header[LABEL_OFFSET * n_signals + i * LABEL_WIDTH:
+                           LABEL_OFFSET * n_signals + (i + 1) * LABEL_WIDTH]
+        spr_b = sig_header[SPR_OFFSET * n_signals + i * SPR_WIDTH:
+                           SPR_OFFSET * n_signals + (i + 1) * SPR_WIDTH]
+        labels.append(lab_b.decode("ascii", errors="replace").rstrip())
+        try:
+            samples_per_record.append(int(spr_b.decode("ascii").strip()))
+        except ValueError as e:
+            raise ValueError(
+                f"Unparseable samples_per_record for signal {i} "
+                f"({lab_b!r}): {e}"
+            ) from e
+
+    if any(spr <= 0 for spr in samples_per_record):
+        raise ValueError(
+            f"samples_per_record contains non-positive value(s): "
+            f"{samples_per_record}"
+        )
+
+    record_samples = sum(samples_per_record)
+    total_samples = n_records * record_samples
+    header_bytes = 256 * (1 + n_signals)
+
+    file_size = os.path.getsize(filename)
+    expected_data_bytes = total_samples * 2
+    if file_size < header_bytes + expected_data_bytes:
+        raise ValueError(
+            f"File {filename} is smaller than expected: {file_size} bytes "
+            f"< header({header_bytes}) + data({expected_data_bytes})."
+        )
+
+    # --- mmap and de-interleave all signals ---
+    with open(filename, "rb") as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            data = np.frombuffer(
+                mm,
+                dtype=np.int16,
+                count=total_samples,
+                offset=header_bytes,
+            )
+            records = data.reshape(n_records, record_samples)
+
+            all_signals = []
+            col_offset = 0
+            for i in range(n_signals):
+                spr = samples_per_record[i]
+                # .astype(int32, copy=True) allocates a fresh buffer;
+                # subsequent .ravel() returns a 1D view into that new
+                # buffer, not into mmap.
+                sig = records[:, col_offset:col_offset + spr].astype(
+                    np.int32, copy=True)
+                all_signals.append(sig.ravel())
+                col_offset += spr
+
+            # Drop mmap-backed views before the mmap context exits.
+            # mmap.__exit__ raises BufferError if any ndarray still
+            # references the buffer, even when all *data* has already
+            # been copied into standalone arrays.
+            del records
+            del data
+
+    # --- filter out annotation channels to match pyedflib's output ---
+    data_signals = [
+        sig for sig, lab in zip(all_signals, labels)
+        if lab.strip().lower() != "edf annotations"
+    ]
+    return data_signals
     
 
 def write_edf_pyedflib(data, filename, digital: bool = False):

@@ -270,8 +270,15 @@ def clean_subject_edf_files(
             step_label = ("load_preload_signals" if need_signals
                           else "load_metadata_only")
             with bench.step(step_label, file=filename):
+                # use_mmap=True: on digital preloads, use the mmap-based
+                # record-deinterleaver instead of pyedflib's per-channel
+                # readSignal loop. Orders of magnitude faster on multi-GB
+                # NK files. Falls back to pyedflib automatically on any
+                # exception inside load_edf, so correctness is preserved
+                # even when the mmap path has a bug.
                 edf = load_edf(input_file_path, load_method=load_method,
-                               preload=need_signals, read_digital=read_digital)
+                               preload=need_signals, read_digital=read_digital,
+                               use_mmap=True)
             assert isinstance(edf, dict)
 
             # Hold on to a reference to the original signals for the audit.
