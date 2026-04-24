@@ -11,7 +11,7 @@ from presidio_anonymizer.entities import OperatorConfig
 from rapidfuzz.distance import Levenshtein
 from nicknames import NickNamer
 
-REDACT_NAME_REPLACEMENT = "REDACT-NAME"
+REDACT_NAME_REPLACEMENT = "X"
 
 
 # ---------- tokenization helpers (keep internal apostrophes & hyphens) ----------

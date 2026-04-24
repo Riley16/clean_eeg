@@ -215,7 +215,8 @@ def test_redact_log_file_catches_name_variants(tmp_path):
     assert "O'Connor" not in content
     assert "OConnor" not in content
     assert "R1234A" in content
-    assert "REDACT-NAME" in content
+    from clean_eeg.anonymize import REDACT_NAME_REPLACEMENT
+    assert REDACT_NAME_REPLACEMENT in content
 
 
 def test_redact_log_file_with_middle_name(tmp_path):

@@ -148,7 +148,7 @@ _GENDERED_PRONOUNS = [
     "he", "him", "his", "himself",
     "she", "her", "hers", "herself",
 ]
-REDACT_PRONOUN_REPLACEMENT = "[REDACTED_PRONOUN]"
+REDACT_PRONOUN_REPLACEMENT = "X"
 
 # \b-boundaries ensure we don't hit substrings (e.g., "her" in "other").
 PRONOUN_RE = re.compile(r"\b(" + "|".join(map(re.escape, _GENDERED_PRONOUNS)) + r")\b",
