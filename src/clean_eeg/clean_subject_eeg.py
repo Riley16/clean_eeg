@@ -243,12 +243,14 @@ def clean_subject_edf_files(
     # the set stays empty so no files are audited; inplace runs then also
     # skip the signal preload for every file (see need_signals below),
     # which is the bulk of the I/O time on multi-GB NK recordings.
+    # Otherwise every file in the subject is audited — the mmap-based
+    # streamed comparison plus a single-channel pyedflib cross-check are
+    # both fast enough that exhaustive auditing is the right default.
     all_filenames = list(EDF_meta_data.keys())
     if skip_audit:
         audit_filenames: set = set()
     else:
-        n_audit = min(2, len(all_filenames))
-        audit_filenames = set(random.sample(all_filenames, n_audit))
+        audit_filenames = set(all_filenames)
 
     # Build Presidio once per subject and reuse across all redact_string calls.
     # This amortizes the spaCy-model + recognizer-registry construction cost.
@@ -257,8 +259,16 @@ def clean_subject_edf_files(
 
     # de-identify EDF files and save out
     print("Cleaning EDF files... Saving to output path:", output_path)
-    failed_files: list[tuple[str, str]] = []
+    # Quarantine subdir for partial outputs from any file that fails
+    # mid-pipeline. Only created on demand (the directory must not be
+    # left empty in the output for clean runs). The end-of-run summary
+    # tells operators NOT to send anything in this subdir.
+    quarantine_dir = os.path.join(output_path, "quarantine")
+    failed_files: list[tuple[str, str, list]] = []  # (filename, error, moved_paths)
     for filename, _ in tqdm(EDF_meta_data.items()):
+        # Track output artifacts created for this file so we can move
+        # them to quarantine if anything fails mid-pipeline.
+        output_artifacts: list = []
         try:
             input_file_path = os.path.join(input_path, filename)
             # In inplace mode, signals are never rewritten — the pipeline only
@@ -305,13 +315,15 @@ def clean_subject_edf_files(
             subject_val = subject_code
             clean_filename = f"{filename_no_ext}_{subject_val}_{clean_start_time.strftime('%Y.%m.%d__%H.%M.%S')}.edf"
             clean_full_path = os.path.join(output_path, clean_filename)
+            clean_annotations_path = str(clean_full_path).replace('.edf', '_annotations.edf')
             if inplace:
                 with bench.step("write_inplace", file=filename):
                     shutil.move(input_file_path, clean_full_path)
-                    clean_annotations_path = str(clean_full_path).replace('.edf', '_annotations.edf')
+                    output_artifacts.append(clean_full_path)
                     create_annotations_only_edf(clean_annotations_path,
                                                 header=edf['header'],
                                                 annotations=edf['annotations'])
+                    output_artifacts.append(clean_annotations_path)
                     update_edf_header_inplace(clean_full_path,
                                               header_updates=edf['header'],
                                               signal_header_updates=edf['signal_headers'])
@@ -319,6 +331,7 @@ def clean_subject_edf_files(
             else:
                 with bench.step("write_edf_pyedflib", file=filename):
                     write_edf_pyedflib(edf, clean_full_path, digital=read_digital)
+                    output_artifacts.append(clean_full_path)
             print(f"Cleaned EDF file at: {clean_filename}")
 
             # Audit signal integrity immediately after write
@@ -329,23 +342,58 @@ def clean_subject_edf_files(
         except Exception as e:
             if raise_errors:
                 raise e
-            failed_files.append((filename, f"{type(e).__name__}: {e}"))
-            print(f"\nERROR: Failed to de-identify EDF file {filename}:\n\n{e}\n\n"
-                  f"Skipping this file and continuing...\n")
+            # Move any partial output artifacts out of the standard output
+            # directory so operators using `scp output/*.edf` will not pick
+            # them up. The standard `*.edf` glob is non-recursive, so a
+            # subdir-quarantine works without further action.
+            moved = _quarantine_partial_outputs(output_artifacts, quarantine_dir)
+            failed_files.append((filename, f"{type(e).__name__}: {e}", moved))
+            err_msg_lines = [
+                f"\nERROR: Failed to de-identify EDF file {filename}:",
+                "",
+                str(e),
+                "",
+            ]
+            if moved:
+                err_msg_lines.extend([
+                    "Partially-processed output files for this EDF have been "
+                    "moved to the 'quarantine/' subdirectory:",
+                    *[f"  {p}" for p in moved],
+                    "",
+                    "DO NOT send these quarantined files to the data "
+                    "management team. They may not be fully de-identified.",
+                    "",
+                ])
+            err_msg_lines.append("Skipping this file and continuing...")
+            print("\n".join(err_msg_lines))
 
     print("Done cleaning EDF files. Saved to output path:", output_path)
     if benchmark:
         print(bench.report())
     if failed_files:
+        any_quarantined = any(moved for _, _, moved in failed_files)
         print(
-            f"\nWARNING: {len(failed_files)} EDF file(s) were skipped during "
-            f"de-identification and will need to be handled manually:"
+            f"\nWARNING: {len(failed_files)} EDF file(s) were not successfully "
+            f"de-identified:"
         )
-        for fname, err in failed_files:
+        for fname, err, moved in failed_files:
             print(f"  - {fname}: {err}")
+            for p in moved:
+                print(f"      → moved to quarantine: {p}")
+        print()
+        if any_quarantined:
+            print(
+                "Files in the 'quarantine/' subdirectory have NOT been fully "
+                "de-identified and MUST NOT be sent to the data management "
+                "team. The standard `scp <output>/*.edf` command (printed "
+                "below) is non-recursive and will skip quarantine/ "
+                "automatically — but if you copy files manually, do NOT "
+                "include the quarantine/ subdirectory."
+            )
+            print()
         print(
-            "Please send the log file (log.out, in the EDF directory) to the "
-            "data management team so these files can be investigated.\n"
+            "Please send log.out (in the EDF directory) to the data "
+            "management team so the failures above can be investigated.\n"
         )
     site_code = subject_code[-1]  # last character of subject code is site code
     site_code_incoming_folder = SITE_CODE_TO_INCOMING_FOLDER.get(site_code, 'UNKNOWN_SITE')
@@ -353,6 +401,42 @@ def clean_subject_edf_files(
     print("Example commands to transfer cleaned EDF files to the CML rhino server (make sure to change USER to appropriate username):")
     print(f'ssh USER@rhino2.psych.upenn.edu "mkdir -p {remote_dir}"')
     print(f"scp {os.path.join(output_path, '*.edf')} USER@rhino2.psych.upenn.edu:{remote_dir}")
+
+
+def _quarantine_partial_outputs(artifact_paths: list, quarantine_dir: str) -> list:
+    """Move any existing output artifacts out of the standard output
+    directory and into a ``quarantine/`` subdirectory.
+
+    Used when a file fails mid-pipeline. The standard transfer command
+    (``scp <output_dir>/*.edf user@host:dest``) is non-recursive, so files
+    in the quarantine subdirectory are NOT picked up by the operator's
+    upload — even if they forget to read the warning. This is the
+    primary safety guarantee against accidentally sending a file that
+    was renamed to the cleaned filename pattern but whose
+    de-identification did not complete.
+
+    Returns the list of paths the artifacts were moved to (empty if
+    none of the listed paths existed).
+    """
+    moved: list = []
+    if not artifact_paths:
+        return moved
+    for src in artifact_paths:
+        if not src or not os.path.exists(src):
+            continue
+        os.makedirs(quarantine_dir, exist_ok=True)
+        dest = os.path.join(quarantine_dir, os.path.basename(src))
+        # If the same name already exists in quarantine (re-run after a
+        # prior failure), append a counter to avoid clobbering.
+        counter = 1
+        base = dest
+        while os.path.exists(dest):
+            stem, ext = os.path.splitext(base)
+            dest = f"{stem}.{counter}{ext}"
+            counter += 1
+        shutil.move(src, dest)
+        moved.append(dest)
+    return moved
 
 
 def _audit_signal_integrity(orig_signals: list, clean_file_path: str, filename: str,
@@ -402,9 +486,15 @@ def _audit_signal_integrity(orig_signals: list, clean_file_path: str, filename: 
     ]
     if len(orig_signals) != len(data_signal_disk_indices):
         raise RuntimeError(
-            f"AUDIT FAILURE: {filename}: orig_signals has "
-            f"{len(orig_signals)} signals but clean file contains "
-            f"{len(data_signal_disk_indices)} non-annotation signals."
+            f"AUDIT FAILURE for {filename}: the audit cross-checks that "
+            "the de-identified file still contains exactly the same "
+            "signal data as the original. The number of (non-annotation) "
+            f"signal channels does not match — the file was loaded with "
+            f"{len(orig_signals)} channels, but the de-identified file "
+            f"on disk now reports {len(data_signal_disk_indices)} "
+            "channels. Do NOT use this output file. Stop the run, save "
+            "log.out, and send it to the data management team for "
+            "investigation."
         )
 
     record_samples = sum(samples_per_record)
@@ -421,29 +511,74 @@ def _audit_signal_integrity(orig_signals: list, clean_file_path: str, filename: 
             )
             records = data.reshape(n_records, record_samples)
 
-            for data_idx, disk_idx in enumerate(data_signal_disk_indices):
-                spr = samples_per_record[disk_idx]
-                col_offset = sum(samples_per_record[:disk_idx])
-                # .copy() materialises one channel (~MB-scale on a 3.8 GB
-                # file, ~20 MB per channel for 178-channel NK exports).
-                clean_sig = records[:, col_offset:col_offset + spr].copy().ravel()
+            # The try/finally guarantees the mmap-backed views are
+            # dropped before mmap.__exit__ runs, even when the audit
+            # raises mid-loop. Without it, mmap.close() raises
+            # BufferError because records/data still hold pointers
+            # into its buffer — masking the real AUDIT FAILURE we want
+            # the caller to see.
+            try:
+                for data_idx, disk_idx in enumerate(data_signal_disk_indices):
+                    spr = samples_per_record[disk_idx]
+                    col_offset = sum(samples_per_record[:disk_idx])
+                    # .copy() materialises one channel (~20 MB per channel
+                    # for a 178-channel NK export). Freed before next loop
+                    # iteration so peak stays at one channel, not N.
+                    clean_sig = records[:, col_offset:col_offset + spr].copy().ravel()
 
-                orig_sig = orig_signals[data_idx]
-                min_len = min(len(orig_sig), len(clean_sig))
-                if not np.array_equal(orig_sig[:min_len], clean_sig[:min_len]):
-                    raise RuntimeError(
-                        f"AUDIT FAILURE: Signal {data_idx} in {filename} "
-                        "was modified during in-place de-identification."
-                    )
-                # Explicit free — next iteration allocates a fresh buffer
-                # of the same size, so peak stays at one channel, not N.
-                del clean_sig
-
-            del records
-            del data
+                    orig_sig = orig_signals[data_idx]
+                    min_len = min(len(orig_sig), len(clean_sig))
+                    if not np.array_equal(orig_sig[:min_len], clean_sig[:min_len]):
+                        raise RuntimeError(
+                            f"AUDIT FAILURE for {filename}: signal channel "
+                            f"{data_idx} differs between the original file "
+                            "(loaded into memory before de-identification) "
+                            "and the de-identified file on disk. The "
+                            "de-identification pipeline is supposed to only "
+                            "modify header fields and annotations — signal "
+                            "samples must remain bit-identical. Do NOT use "
+                            "this output file. Save log.out and send it to "
+                            "the data management team for investigation."
+                        )
+                    del clean_sig
+            finally:
+                del records
+                del data
 
     n_data_signals = len(data_signal_disk_indices)
-    print(f"Audit passed for {filename}: all {n_data_signals} signals unchanged.")
+
+    # Independent-code-path cross-check: read ONE random non-annotation
+    # channel via pyedflib's per-channel readSignal and compare to the
+    # corresponding orig_signals[i]. Catches subtle layout bugs in the
+    # mmap helper that would otherwise be hidden because both orig and
+    # clean came from the same mmap code path (self-consistency would
+    # mask the bug).
+    #
+    # pyedflib's readSignal does ~n_records small disk seeks for one
+    # channel — slower than mmap but bounded to a single channel, so
+    # cost is ~1-2 s on a 3.8 GB file. Negligible vs the rest of the
+    # pipeline; worth it for the defensive cross-validation.
+    if n_data_signals > 0:
+        spot_idx = random.randrange(n_data_signals)
+        with pyedflib.EdfReader(clean_file_path) as f:
+            pyedflib_sig = f.readSignal(spot_idx, digital=digital)
+        orig_sig = orig_signals[spot_idx]
+        min_len = min(len(orig_sig), len(pyedflib_sig))
+        if not np.array_equal(orig_sig[:min_len], pyedflib_sig[:min_len]):
+            raise RuntimeError(
+                f"AUDIT FAILURE for {filename} (pyedflib cross-check): "
+                f"signal channel {spot_idx} appears unchanged when read "
+                "via the fast mmap path, but disagrees with pyedflib's "
+                "per-channel read of the same file's bytes. This means "
+                "the two independent readers see different signal values "
+                "in the de-identified file — most likely a bug in the "
+                "fast loader. Do NOT use this output file. Save log.out "
+                "and send it to the data management team for "
+                "investigation."
+            )
+
+    print(f"Audit passed for {filename}: all {n_data_signals} signals "
+          f"unchanged (pyedflib cross-check on signal {spot_idx if n_data_signals > 0 else 'n/a'}).")
 
 
 def convert_edfC_to_edfD(input_file: str):
