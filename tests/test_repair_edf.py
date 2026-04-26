@@ -8,17 +8,36 @@ from clean_eeg.repair_edf import (
     _read_header_fields,
     is_edf_truncated,
     repair_truncated_edf_header,
+    repair_main_header_numeric_fields,
     repair_degenerate_signal_ranges,
     MAIN_HEADER_BYTES,
+    SIGNAL_HEADER_BYTES_PER_SIGNAL,
     SIG_PHYS_MIN_OFFSET, SIG_PHYS_MIN_WIDTH,
     SIG_PHYS_MAX_OFFSET, SIG_PHYS_MAX_WIDTH,
     SIG_PHYS_DIM_OFFSET, SIG_PHYS_DIM_WIDTH,
     SIG_DIG_MIN_OFFSET, SIG_DIG_MIN_WIDTH,
     SIG_DIG_MAX_OFFSET, SIG_DIG_MAX_WIDTH,
+    BYTES_IN_HEADER_OFFSET,
+    BYTES_IN_HEADER_WIDTH,
     N_RECORDS_OFFSET,
     N_RECORDS_WIDTH,
+    RECORD_DURATION_OFFSET,
+    RECORD_DURATION_WIDTH,
+    N_SIGNALS_OFFSET,
+    N_SIGNALS_WIDTH,
+    SAMPLES_PER_RECORD_FIELD_OFFSET,
+    SAMPLES_PER_RECORD_FIELD_WIDTH,
+    DEFAULT_RECORD_DURATION_S,
 )
 from tests.generate_edf import generate_partial_record_edf
+
+
+def _zero_bytes(edf_path: str, offset: int, width: int) -> None:
+    """Overwrite ``width`` bytes at ``offset`` with ASCII spaces (the EDF
+    convention for blank field-slots, as observed in problem NK files)."""
+    with open(edf_path, "r+b") as f:
+        f.seek(offset)
+        f.write(b" " * width)
 
 
 def test_detects_truncation(tmp_path):
@@ -488,3 +507,253 @@ def test_dig_warning_message_reports_original_values(tmp_path, capsys):
     assert "uncalibrated" in out
     assert "dig_min='42'" in out
     assert "dig_max='42'" in out
+
+
+# ---------------------------------------------------------------------------
+# Empty numeric header fields (Nihon Kohden anomaly).
+#
+# These tests synthesize the failure mode reported in the field
+# (``ValueError: invalid literal for int() with base 10: ''``) by zeroing
+# out specific byte ranges of a freshly-generated EDF and then exercising
+# the repair pass. We DO NOT have the offending source file (it contains
+# PHI), so reproducing via byte-edits is the only avenue.
+# ---------------------------------------------------------------------------
+
+def _make_clean_edf(tmp_path, n_channels=3, sample_rate=100, duration_sec=5):
+    """Helper: generate a small intact EDF and return its path."""
+    full_path, _ = generate_partial_record_edf(tmp_path / "src.edf",
+                                                n_channels=n_channels,
+                                                sample_rate=sample_rate,
+                                                duration_sec=duration_sec)
+    return full_path
+
+
+def _on_disk_n_signals(edf_path: str) -> int:
+    """Read the actual on-disk n_signals (pyedflib's writer auto-adds an
+    'EDF Annotations' channel for FILETYPE_EDFPLUS, so this is one more
+    than the n_channels passed to the generator)."""
+    with open(edf_path, "rb") as f:
+        f.seek(N_SIGNALS_OFFSET)
+        return int(f.read(N_SIGNALS_WIDTH).decode().strip())
+
+
+def test_empty_n_records_repairs_from_filesize(tmp_path, capsys):
+    """Empty bytes 236-244 (n_records) must not crash. The repair pass
+    should compute n_records from the actual file size and write it back."""
+    edf = _make_clean_edf(tmp_path, n_channels=3, sample_rate=100, duration_sec=5)
+    expected = _read_header_fields(edf)["n_records"]
+    assert expected is not None and expected > 0
+
+    _zero_bytes(edf, N_RECORDS_OFFSET, N_RECORDS_WIDTH)
+
+    new_n = repair_truncated_edf_header(edf, verbosity=1)
+    assert new_n == expected
+    out = capsys.readouterr().out
+    assert "empty" in out.lower()
+    # File now opens normally.
+    fields = _read_header_fields(edf)
+    assert fields["n_records"] == expected
+
+
+def test_empty_n_records_sentinel_is_resolved(tmp_path, capsys):
+    """EDF+ spec sentinel n_records=-1 ('recording in progress') must
+    also be resolved to the actual count from filesize."""
+    edf = _make_clean_edf(tmp_path)
+    expected = _read_header_fields(edf)["n_records"]
+    # Write '-1' padded to 8 bytes.
+    with open(edf, "r+b") as f:
+        f.seek(N_RECORDS_OFFSET)
+        f.write(b"-1      ")
+    new_n = repair_truncated_edf_header(edf, verbosity=1)
+    assert new_n == expected
+    out = capsys.readouterr().out
+    assert "sentinel" in out.lower() or "recording in progress" in out.lower()
+
+
+def test_empty_n_signals_raises_clear_error(tmp_path):
+    """Empty bytes 252-256 (n_signals) cannot be safely defaulted —
+    every per-signal field-slice depends on knowing N. Must raise with
+    field name and value in the message."""
+    edf = _make_clean_edf(tmp_path)
+    _zero_bytes(edf, N_SIGNALS_OFFSET, N_SIGNALS_WIDTH)
+    with pytest.raises(ValueError) as excinfo:
+        repair_truncated_edf_header(edf)
+    msg = str(excinfo.value)
+    assert "'n_signals'" in msg
+    assert "''" in msg, f"error must show the empty value: {msg!r}"
+    assert "Cannot proceed" in msg or "unrecoverable" in msg.lower() \
+        or "no safe" in msg.lower()
+
+
+def test_unparseable_n_signals_error_shows_field_and_value(tmp_path):
+    """A non-empty but garbage n_signals value must produce a message
+    that names the field AND shows the offending value."""
+    edf = _make_clean_edf(tmp_path)
+    with open(edf, "r+b") as f:
+        f.seek(N_SIGNALS_OFFSET)
+        f.write(b"abcd")
+    with pytest.raises(ValueError) as excinfo:
+        repair_truncated_edf_header(edf)
+    msg = str(excinfo.value)
+    assert "'n_signals'" in msg
+    assert "'abcd'" in msg
+
+
+def test_empty_samples_per_record_one_signal_raises(tmp_path):
+    """Empty samples_per_record slot for ANY signal is unrecoverable —
+    record geometry is undefined. Error must name the field, the signal
+    index, and show the empty value."""
+    edf = _make_clean_edf(tmp_path, n_channels=3)
+    # pyedflib auto-adds an 'EDF Annotations' channel for FILETYPE_EDFPLUS,
+    # so on-disk n_signals is 4 (not 3). Field-block offsets depend on N.
+    n_signals_disk = _on_disk_n_signals(edf)
+    block_start = (MAIN_HEADER_BYTES
+                   + SAMPLES_PER_RECORD_FIELD_OFFSET * n_signals_disk)
+    _zero_bytes(edf, block_start + 0 * SAMPLES_PER_RECORD_FIELD_WIDTH,
+                SAMPLES_PER_RECORD_FIELD_WIDTH)
+    with pytest.raises(ValueError) as excinfo:
+        repair_truncated_edf_header(edf)
+    msg = str(excinfo.value)
+    assert "'samples_per_record'" in msg
+    assert "signal=0" in msg
+    assert "''" in msg
+    assert "byte layout" in msg.lower() or "stride" in msg.lower() \
+        or "no safe" in msg.lower()
+
+
+def test_empty_samples_per_record_middle_signal_double_space_pattern(tmp_path):
+    """When only the middle signal's slot is blank, the on-disk pattern
+    is the populated value, then 8 spaces, then the next populated
+    value — the 'double space' case the field operator described.
+    Repair must still raise with the correct signal index."""
+    edf = _make_clean_edf(tmp_path, n_channels=3)
+    n_signals_disk = _on_disk_n_signals(edf)
+    block_start = (MAIN_HEADER_BYTES
+                   + SAMPLES_PER_RECORD_FIELD_OFFSET * n_signals_disk)
+    # Blank signal 1 (a middle data signal), leaving signals 0/2/3 intact.
+    _zero_bytes(edf, block_start + 1 * SAMPLES_PER_RECORD_FIELD_WIDTH,
+                SAMPLES_PER_RECORD_FIELD_WIDTH)
+    with pytest.raises(ValueError) as excinfo:
+        repair_truncated_edf_header(edf)
+    msg = str(excinfo.value)
+    assert "'samples_per_record'" in msg
+    assert "signal=1" in msg
+
+
+def test_empty_samples_per_record_all_signals_raises(tmp_path):
+    """Sanity: blanking every slot still raises (on the first signal)
+    rather than silently accepting an all-empty array."""
+    edf = _make_clean_edf(tmp_path, n_channels=3)
+    n_signals_disk = _on_disk_n_signals(edf)
+    block_start = (MAIN_HEADER_BYTES
+                   + SAMPLES_PER_RECORD_FIELD_OFFSET * n_signals_disk)
+    _zero_bytes(edf, block_start,
+                SAMPLES_PER_RECORD_FIELD_WIDTH * n_signals_disk)
+    with pytest.raises(ValueError) as excinfo:
+        repair_truncated_edf_header(edf)
+    msg = str(excinfo.value)
+    assert "'samples_per_record'" in msg
+    # First failing signal is reported.
+    assert "signal=0" in msg
+
+
+def test_empty_bytes_in_header_repaired_to_derived_value(tmp_path, capsys):
+    """Empty bytes 184-192 (bytes_in_header) are repaired in place by
+    writing 256 * (1 + n_signals). Verify both the side-effect on disk
+    and the warning text."""
+    edf = _make_clean_edf(tmp_path, n_channels=3)
+    n_signals_disk = _on_disk_n_signals(edf)
+    expected = MAIN_HEADER_BYTES * (1 + n_signals_disk)
+    _zero_bytes(edf, BYTES_IN_HEADER_OFFSET, BYTES_IN_HEADER_WIDTH)
+
+    repaired = repair_main_header_numeric_fields(edf, verbosity=1)
+    assert repaired.get("bytes_in_header") == expected
+
+    # Field is now populated on disk.
+    with open(edf, "rb") as f:
+        f.seek(BYTES_IN_HEADER_OFFSET)
+        assert int(f.read(BYTES_IN_HEADER_WIDTH).decode().strip()) == expected
+    out = capsys.readouterr().out
+    assert "bytes_in_header" in out
+    assert str(expected) in out
+
+
+def test_empty_record_duration_repaired_with_implied_rate_warning(tmp_path, capsys):
+    """Empty record_duration is repaired to the 1.0s default with a
+    WARNING that includes the implied sample rate (samples_per_record
+    signal 0 / record_duration). The 'implied rate' line is the user
+    visibility check that flags wrong defaults."""
+    sample_rate = 100   # samples_per_record will equal this for spr=rate*1s
+    edf = _make_clean_edf(tmp_path, n_channels=3, sample_rate=sample_rate)
+    _zero_bytes(edf, RECORD_DURATION_OFFSET, RECORD_DURATION_WIDTH)
+
+    repaired = repair_main_header_numeric_fields(edf, verbosity=1)
+    assert repaired.get("record_duration") == DEFAULT_RECORD_DURATION_S
+
+    # Field on disk now reads as 1.
+    with open(edf, "rb") as f:
+        f.seek(RECORD_DURATION_OFFSET)
+        assert float(f.read(RECORD_DURATION_WIDTH).decode().strip()) == 1.0
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "record_duration" in out
+    # Implied-rate line: samples_per_record signal 0 (= sample_rate * 1s
+    # = sample_rate) divided by 1.0 = sample_rate Hz.
+    assert f"{sample_rate} Hz" in out
+
+
+def test_empty_record_duration_implied_rate_unknown_when_spr_also_empty(tmp_path):
+    """If samples_per_record signal 0 is also empty, record_duration
+    repair never runs — _read_header_fields raises on the empty SPR
+    first. Locks in the dependency order."""
+    edf = _make_clean_edf(tmp_path, n_channels=3)
+    n_signals_disk = _on_disk_n_signals(edf)
+    # Blank record_duration AND samples_per_record signal 0.
+    _zero_bytes(edf, RECORD_DURATION_OFFSET, RECORD_DURATION_WIDTH)
+    block_start = (MAIN_HEADER_BYTES
+                   + SAMPLES_PER_RECORD_FIELD_OFFSET * n_signals_disk)
+    _zero_bytes(edf, block_start, SAMPLES_PER_RECORD_FIELD_WIDTH)
+    with pytest.raises(ValueError) as excinfo:
+        repair_main_header_numeric_fields(edf)
+    msg = str(excinfo.value)
+    assert "'samples_per_record'" in msg
+    assert "signal=0" in msg
+
+
+def test_repair_main_header_is_idempotent_on_clean_file(tmp_path, capsys):
+    """Calling the merged repair on a healthy file should be a no-op:
+    no fields reported, no warnings printed."""
+    edf = _make_clean_edf(tmp_path, n_channels=3)
+    repaired = repair_main_header_numeric_fields(edf, verbosity=1)
+    assert repaired == {}
+    out = capsys.readouterr().out
+    assert "Repairing" not in out
+    assert "WARNING" not in out
+
+
+def test_legacy_repair_truncated_alias_still_works(tmp_path):
+    """The old function name is preserved as a thin alias. Smoke test
+    that the existing import path still functions and returns the
+    n_records value (matching the legacy contract)."""
+    edf = _make_clean_edf(tmp_path, n_channels=3)
+    expected = _read_header_fields(edf)["n_records"]
+    _zero_bytes(edf, N_RECORDS_OFFSET, N_RECORDS_WIDTH)
+    n = repair_truncated_edf_header(edf, verbosity=0)
+    assert n == expected
+
+
+def test_empty_phys_min_already_handled_by_existing_repair(tmp_path, capsys):
+    """Empty phys_min (8 spaces) was already handled implicitly because
+    ``float('')`` raises ValueError. Locking in the contract: blank
+    phys/dig fields trigger the existing 'mark uncalibrated' repair."""
+    edf = _make_clean_edf(tmp_path, n_channels=3)
+    n_signals_disk = _on_disk_n_signals(edf)
+    # Blank phys_min for signal 0.
+    pmin_offset = (MAIN_HEADER_BYTES
+                   + SIG_PHYS_MIN_OFFSET * n_signals_disk
+                   + 0 * SIG_PHYS_MIN_WIDTH)
+    _zero_bytes(edf, pmin_offset, SIG_PHYS_MIN_WIDTH)
+    repairs = repair_degenerate_signal_ranges(edf, verbosity=1)
+    assert any(r["signal_idx"] == 0 for r in repairs)
+    out = capsys.readouterr().out
+    assert "uncalibrated" in out

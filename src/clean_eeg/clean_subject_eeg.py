@@ -2,6 +2,7 @@ import random
 import re
 import os
 import shutil
+import traceback
 import numpy as np
 import pyedflib
 from copy import deepcopy
@@ -353,6 +354,9 @@ def clean_subject_edf_files(
                 "",
                 str(e),
                 "",
+                "Stack trace (for the data team):",
+                traceback.format_exc().rstrip(),
+                "",
             ]
             if moved:
                 err_msg_lines.extend([
@@ -620,7 +624,7 @@ def _load_edf_metadata(input_path: str,
                        raise_errors: bool = False,
                        bench=None):
     from clean_eeg.repair_edf import (
-        repair_truncated_edf_header,
+        repair_main_header_numeric_fields,
         repair_degenerate_signal_ranges,
     )
     from clean_eeg.benchmark import BenchmarkCollector
@@ -637,8 +641,12 @@ def _load_edf_metadata(input_path: str,
                 with bench.step("convert_edfD_to_edfC", file=filename):
                     convert_edfC_to_edfD(full_path)
             if repair_truncated:
-                with bench.step("repair_truncated_header", file=filename):
-                    repair_truncated_edf_header(full_path, verbosity=verbosity)
+                # Single pass: repairs bytes_in_header, record_duration,
+                # and n_records (truncation / sentinel / empty). n_signals
+                # empty is surfaced as a ValueError here.
+                with bench.step("repair_main_header_numeric_fields", file=filename):
+                    repair_main_header_numeric_fields(full_path,
+                                                       verbosity=verbosity)
             if repair_phys_ranges:
                 with bench.step("repair_phys_ranges", file=filename):
                     repair_degenerate_signal_ranges(full_path, verbosity=verbosity)
@@ -649,8 +657,13 @@ def _load_edf_metadata(input_path: str,
             if raise_errors:
                 raise e
             failed_files.append((filename, f"{type(e).__name__}: {e}"))
-            print(f"ERROR: Failed to load EDF file {filename}:\n\n{e}\n\n"
-                  f"Check if the file is corrupted. Skipping this file...\n")
+            print(
+                f"ERROR: Failed to load EDF file {filename}:\n\n"
+                f"{e}\n\n"
+                f"Stack trace (for the data team):\n"
+                f"{traceback.format_exc().rstrip()}\n\n"
+                f"Check if the file is corrupted. Skipping this file...\n"
+            )
     if failed_files:
         print(
             f"\nWARNING: {len(failed_files)} EDF file(s) were skipped during "
