@@ -398,25 +398,47 @@ def clean_subject_edf_files(
     site_code = subject_code[-1]  # last character of subject code is site code
     site_code_incoming_folder = SITE_CODE_TO_INCOMING_FOLDER.get(site_code, 'UNKNOWN_SITE')
     remote_dir = f"/data10/RAM/incoming/{site_code_incoming_folder}/{subject_code}/all_clinical_eeg"
-    print("Example commands to transfer cleaned EDF files to the CML rhino server (make sure to change USER to appropriate username):")
-    print(f'ssh USER@rhino2.psych.upenn.edu "mkdir -p {remote_dir}"')
-    print(f"scp {os.path.join(output_path, '*.edf')} USER@rhino2.psych.upenn.edu:{remote_dir}")
+    print("\nExample commands to transfer cleaned EDF files to the CML "
+          "rhino server (replace USER with your username):")
+    print()
+    print(f'  ssh USER@rhino2.psych.upenn.edu "mkdir -p {remote_dir}"')
+    print()
+    # Prefer rsync where available (resumable, --exclude='quarantine/').
+    # Fall back to scp on systems without rsync (typically Windows
+    # without WSL); the scp form must include log.out explicitly since
+    # *.edf does not match it.
+    if shutil.which("rsync"):
+        print(f"  rsync -avzh --partial --progress --exclude='quarantine/' \\")
+        print(f"    {output_path}/ \\")
+        print(f"    USER@rhino2.psych.upenn.edu:{remote_dir}/")
+    else:
+        print(f"  scp {os.path.join(output_path, '*.edf')} \\")
+        print(f"    {os.path.join(output_path, LOG_FILENAME)} \\")
+        print(f"    USER@rhino2.psych.upenn.edu:{remote_dir}")
+
+
+QUARANTINE_SUFFIX = ".QUARANTINED-DO-NOT-USE"
 
 
 def _quarantine_partial_outputs(artifact_paths: list, quarantine_dir: str) -> list:
     """Move any existing output artifacts out of the standard output
-    directory and into a ``quarantine/`` subdirectory.
+    directory and into a ``quarantine/`` subdirectory, with a renamed
+    extension that does not match the standard ``*.edf`` glob.
 
-    Used when a file fails mid-pipeline. The standard transfer command
-    (``scp <output_dir>/*.edf user@host:dest``) is non-recursive, so files
-    in the quarantine subdirectory are NOT picked up by the operator's
-    upload — even if they forget to read the warning. This is the
-    primary safety guarantee against accidentally sending a file that
-    was renamed to the cleaned filename pattern but whose
-    de-identification did not complete.
+    Defense-in-depth against accidental upload of partially-processed
+    files:
+    1. Files live in a subdirectory, so non-recursive glob copies
+       (``scp output/*.edf`` or ``rsync --exclude='quarantine/'``) skip
+       them automatically.
+    2. The trailing extension is renamed from ``.edf`` to
+       ``.edf.QUARANTINED-DO-NOT-USE``. Even if an operator runs a
+       fully recursive transfer (``scp -r``, ``rsync`` without an
+       ``--exclude``), any subsequent ``*.edf`` glob — server-side
+       or client-side — will not match these files, and the data
+       team can identify mis-uploaded files at a glance.
 
-    Returns the list of paths the artifacts were moved to (empty if
-    none of the listed paths existed).
+    Returns the list of new paths (in quarantine) the artifacts were
+    moved to. Empty if none of the listed paths existed on disk.
     """
     moved: list = []
     if not artifact_paths:
@@ -425,14 +447,14 @@ def _quarantine_partial_outputs(artifact_paths: list, quarantine_dir: str) -> li
         if not src or not os.path.exists(src):
             continue
         os.makedirs(quarantine_dir, exist_ok=True)
-        dest = os.path.join(quarantine_dir, os.path.basename(src))
-        # If the same name already exists in quarantine (re-run after a
-        # prior failure), append a counter to avoid clobbering.
+        dest_name = os.path.basename(src) + QUARANTINE_SUFFIX
+        dest = os.path.join(quarantine_dir, dest_name)
+        # If a prior failure already quarantined a file with the same
+        # name, append a counter to avoid clobbering its evidence.
         counter = 1
-        base = dest
+        base_dest = dest
         while os.path.exists(dest):
-            stem, ext = os.path.splitext(base)
-            dest = f"{stem}.{counter}{ext}"
+            dest = f"{base_dest}.{counter}"
             counter += 1
         shutil.move(src, dest)
         moved.append(dest)

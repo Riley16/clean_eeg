@@ -644,16 +644,26 @@ def test_failed_file_is_quarantined_not_left_in_output_dir(monkeypatch,
         f"{main_dir_edfs}"
     )
 
-    # The quarantine subdir MUST contain the file.
+    # The quarantine subdir MUST contain the file, with a renamed
+    # extension that does not end in '.edf' so any *.edf glob (server
+    # or client side) cannot accidentally pick it up.
     quarantine_dir = input_dir / "quarantine"
     assert quarantine_dir.is_dir(), \
         "quarantine/ subdirectory must be created on failure"
-    quarantined_edfs = [
-        f for f in os.listdir(str(quarantine_dir))
-        if f.endswith('.edf')
-    ]
-    assert any(SUBJECT_CODE in f for f in quarantined_edfs), \
-        f"failed file should be in quarantine: {quarantined_edfs}"
+    quarantined = os.listdir(str(quarantine_dir))
+    assert quarantined, "quarantine should not be empty after audit failure"
+    # Defense-in-depth: no quarantined file may end in '.edf' — even if
+    # the operator runs `scp -r` or `rsync` without --exclude, the
+    # standard *.edf glob cannot match these names.
+    edf_in_quarantine = [f for f in quarantined if f.endswith('.edf')]
+    assert edf_in_quarantine == [], (
+        f"quarantined files must NOT end in .edf (defense-in-depth "
+        f"against recursive copies): {edf_in_quarantine}"
+    )
+    # And the marker suffix must be present so the data team can spot
+    # a mis-uploaded file at a glance.
+    assert any('QUARANTINED-DO-NOT-USE' in f for f in quarantined), \
+        f"quarantined files should carry the QUARANTINED suffix: {quarantined}"
 
     # End-of-run summary must explicitly warn about quarantine.
     out = capsys.readouterr().out
@@ -661,6 +671,111 @@ def test_failed_file_is_quarantined_not_left_in_output_dir(monkeypatch,
         "summary must mention quarantine"
     assert "MUST NOT" in out or "DO NOT" in out, \
         "summary must use strong language about not sending these"
+
+
+def _run_pipeline_for_transfer_command(tmp_path):
+    """Helper: run a minimal pipeline and return the captured stdout.
+    Used by the rsync/scp transfer-command tests."""
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    edf_path = input_dir / "ok.edf"
+    _write_minimal_edfplus_with_annotations(str(edf_path),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=True,
+    )
+
+
+def test_transfer_command_uses_rsync_when_available(monkeypatch,
+                                                     tmp_path,
+                                                     capsys):
+    """When rsync is available on the system, the printed transfer
+    recommendation must be rsync only:
+    - --exclude='quarantine/' so partially-processed files are skipped
+    - --partial so long uploads resume cleanly on connection failure
+    - source path with trailing slash so log.out is picked up
+    No scp command should be printed in this branch."""
+    responses = iter(["y"] * 5)
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+    # Force rsync-available branch regardless of the test host.
+    import shutil as _sh
+    monkeypatch.setattr(
+        "clean_eeg.clean_subject_eeg.shutil.which",
+        lambda cmd: "/usr/bin/rsync" if cmd == "rsync" else _sh.which(cmd),
+    )
+
+    _run_pipeline_for_transfer_command(tmp_path)
+
+    out = capsys.readouterr().out
+    assert "rsync" in out, "transfer recommendation must include rsync"
+    assert "--exclude='quarantine/'" in out or '--exclude="quarantine/"' in out, \
+        "rsync command must --exclude='quarantine/'"
+    assert "--partial" in out, \
+        "rsync command must use --partial for resume-on-failure"
+
+    transfer_block_start = out.find("Example commands to transfer")
+    assert transfer_block_start != -1
+    transfer_block = out[transfer_block_start:]
+    for line in transfer_block.splitlines():
+        stripped = line.lstrip()
+        assert not stripped.startswith("scp "), \
+            f"no scp command should be printed when rsync is available: {line!r}"
+    # The rsync command's source path must end with a trailing slash —
+    # that's what makes rsync copy directory *contents* (including
+    # log.out which lives in output_path) rather than the directory
+    # itself.
+    rsync_lines = [l for l in transfer_block.splitlines()
+                   if l.lstrip().startswith("rsync ") or "/ \\" in l]
+    assert any(line.rstrip().rstrip("\\").rstrip().endswith("/")
+               for line in rsync_lines), \
+        "rsync source path must have trailing slash to copy contents (incl log.out)"
+
+
+def test_transfer_command_falls_back_to_scp_when_rsync_unavailable(monkeypatch,
+                                                                     tmp_path,
+                                                                     capsys):
+    """When rsync is NOT available (e.g. Windows without WSL), the
+    transfer recommendation must fall back to scp — and that scp
+    command must explicitly include log.out (the *.edf glob misses
+    it)."""
+    responses = iter(["y"] * 5)
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+    # Simulate a system without rsync.
+    import shutil as _sh
+    monkeypatch.setattr(
+        "clean_eeg.clean_subject_eeg.shutil.which",
+        lambda cmd: None if cmd == "rsync" else _sh.which(cmd),
+    )
+
+    _run_pipeline_for_transfer_command(tmp_path)
+
+    out = capsys.readouterr().out
+    transfer_block_start = out.find("Example commands to transfer")
+    assert transfer_block_start != -1
+    transfer_block = out[transfer_block_start:]
+
+    # rsync command line must NOT appear in the transfer block.
+    for line in transfer_block.splitlines():
+        stripped = line.lstrip()
+        assert not stripped.startswith("rsync "), \
+            f"rsync should not be printed when unavailable: {line!r}"
+
+    # scp command line must appear, with both *.edf and log.out.
+    scp_lines = [l for l in transfer_block.splitlines()
+                 if l.lstrip().startswith("scp ")]
+    assert scp_lines, "scp fallback command must be printed"
+    # log.out can be on the same scp line OR continued on the next line
+    # via a trailing backslash. Search the whole transfer block.
+    assert "log.out" in transfer_block, \
+        "scp fallback must explicitly include log.out (the *.edf glob misses it)"
+    assert "*.edf" in transfer_block
 
 
 def test_audit_skipped_when_skip_audit_true(monkeypatch, tmp_path, capsys):
