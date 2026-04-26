@@ -26,11 +26,12 @@ pytest
 
 ## Usage
 
+Once installed via `pip install .` (or `pip install -e .`), the pipeline can be invoked with `python -m clean_eeg.clean_subject_eeg` from any working directory — you do not need to `cd` into the `clean_eeg` repo.
+
 To de-identify a directory of EEG files for one subject (modifies files in place by default):
 ```
-cd clean_eeg
 conda activate clean_eeg
-python src/clean_eeg/clean_subject_eeg.py \
+python -m clean_eeg.clean_subject_eeg \
   --input_path /path/to/subject/edf/files \
   --subject_code SUBJECT_CODE \
   --first_name FIRST_NAME \
@@ -42,13 +43,19 @@ By default, EDF files are de-identified in place — headers are modified direct
 
 To write de-identified copies to a separate directory instead, use `--copy_path`:
 ```
-python src/clean_eeg/clean_subject_eeg.py \
+python -m clean_eeg.clean_subject_eeg \
   --input_path /path/to/subject/edf/files \
   --copy_path /path/to/output/directory \
   --subject_code SUBJECT_CODE \
   --first_name FIRST_NAME \
   --middle_name MIDDLE_NAME \
   --last_name LAST_NAME
+```
+
+Alternatively, you can still invoke the script directly from a clone of the repo:
+```
+cd clean_eeg
+python src/clean_eeg/clean_subject_eeg.py --input_path ... --subject_code ... ...
 ```
 
 If `--copy_path` is used without a value, de-identified files are written to a `deidentified_eeg_files` subdirectory within the input path.
