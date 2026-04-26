@@ -314,7 +314,12 @@ def clean_subject_edf_files(
             clean_start_time = edf['header']['startdate']
             filename_no_ext = os.path.splitext(filename)[0]
             subject_val = subject_code
-            clean_filename = f"{filename_no_ext}_{subject_val}_{clean_start_time.strftime('%Y.%m.%d__%H.%M.%S')}.edf"
+            # Year deliberately omitted: it would always be 1985 (the
+            # BASE_START_DATE used to anchor de-identified relative
+            # timestamps) and confuses operators who read the filename.
+            # Month/day still encode the relative offset between the
+            # subject's recordings within a session.
+            clean_filename = f"{filename_no_ext}_{subject_val}_{clean_start_time.strftime('%m.%d__%H.%M.%S')}.edf"
             clean_full_path = os.path.join(output_path, clean_filename)
             clean_annotations_path = str(clean_full_path).replace('.edf', '_annotations.edf')
             if inplace:

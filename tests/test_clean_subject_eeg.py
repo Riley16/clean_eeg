@@ -132,9 +132,11 @@ def test_clean_subject_edf_files(monkeypatch, inplace):
     
     # check that file was created
     filename_no_ext1 = Path(SUBJECT_EDF_PATH1).stem
-    clean_filename1 = f"{filename_no_ext1}_{SUBJECT_CODE}_1985.01.01__00.00.00.edf"
+    # Filenames carry month/day/time only — the year (always 1985, the
+    # BASE_START_DATE anchor) was omitted to avoid confusing operators.
+    clean_filename1 = f"{filename_no_ext1}_{SUBJECT_CODE}_01.01__00.00.00.edf"
     filename_no_ext2 = Path(SUBJECT_EDF_PATH2).stem
-    clean_filename2 = f"{filename_no_ext2}_{SUBJECT_CODE}_1985.01.01__01.00.00.edf"
+    clean_filename2 = f"{filename_no_ext2}_{SUBJECT_CODE}_01.01__01.00.00.edf"
     for clean_filename in [clean_filename1, clean_filename2]:
         clean_full_path = os.path.join(output_path, clean_filename)
         assert os.path.exists(clean_full_path), 'Cleaned EDF file was not created: ' + clean_full_path
