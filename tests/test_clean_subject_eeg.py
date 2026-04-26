@@ -675,6 +675,103 @@ def test_failed_file_is_quarantined_not_left_in_output_dir(monkeypatch,
         "summary must use strong language about not sending these"
 
 
+def test_audit_failure_dumps_phi_masked_header(monkeypatch, tmp_path, capsys):
+    """When a file fails mid-pipeline, the error handler must dump the
+    EDF header to log.out so the data team has everything they need to
+    triage. The four PHI-bearing main-header fields (patient_id,
+    recording_id, startdate, starttime) MUST be masked because log.out
+    is shared with the data team."""
+    responses = iter(["y"] * 5)
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    edf_path = input_dir / "will_fail.edf"
+    _write_minimal_edfplus_with_annotations(str(edf_path),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+
+    import clean_eeg.clean_subject_eeg as _csm
+    monkeypatch.setattr(_csm, "_audit_signal_integrity",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("synthetic audit failure")))
+
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=False,
+    )
+
+    out = capsys.readouterr().out
+    # Header dump section is present.
+    assert "EDF header dump (for the data team)" in out
+    assert "Main header" in out
+    # Numeric / structural fields the data team needs are unmasked.
+    assert "n_signals" in out
+    assert "n_records" in out
+    assert "samples_per_record" in out
+    # PHI-bearing main-header fields are masked.
+    assert "[PHI_REDACTED]" in out
+    main_block = out[out.index("Main header"):]
+    for phi_field in ("patient_id", "recording_id", "startdate", "starttime"):
+        # Each PHI field appears on its own line followed by the masked marker.
+        assert f"{phi_field}" in main_block, f"{phi_field} should still be labelled"
+        # Locate the row, verify it carries the redaction marker on the same line.
+        row_start = main_block.index(phi_field)
+        row = main_block[row_start:row_start + 200]
+        assert "[PHI_REDACTED]" in row, \
+            f"PHI field {phi_field!r} must be masked in the dump; got: {row!r}"
+
+
+def test_load_failure_dumps_header_for_empty_n_signals(monkeypatch, tmp_path, capsys):
+    """When the load-time repair pass raises (e.g. empty n_signals),
+    the diagnostic dump must still run so the data team gets the header
+    info even though the file never reached pyedflib. Pair the broken
+    file with a healthy one so the pipeline doesn't immediately abort
+    on 'no EDF files loaded' before we can inspect the dump."""
+    responses = iter(["y"] * 5)
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    healthy_path = input_dir / "healthy.edf"
+    _write_minimal_edfplus_with_annotations(str(healthy_path),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+    broken_path = input_dir / "broken.edf"
+    _write_minimal_edfplus_with_annotations(str(broken_path),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+    # Blank n_signals on the broken file to trigger the unrecoverable
+    # error path during the repair-truncated step (pre-pyedflib).
+    with open(broken_path, "r+b") as f:
+        f.seek(252)
+        f.write(b"    ")
+
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=False,
+    )
+
+    out = capsys.readouterr().out
+    assert "Failed to load EDF file broken.edf" in out
+    assert "EDF header dump (for the data team)" in out
+    # PHI fields masked even on a load-time failure.
+    assert "[PHI_REDACTED]" in out
+    # Numeric/structural fields are visible (n_signals shows blank '<empty>').
+    assert "n_signals" in out
+
+
 def _run_pipeline_for_transfer_command(tmp_path):
     """Helper: run a minimal pipeline and return the captured stdout.
     Used by the rsync/scp transfer-command tests."""

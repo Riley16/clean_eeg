@@ -84,10 +84,30 @@ def _parse_value(raw: bytes, kind: str):
     return text
 
 
+# Main-header fields that contain PHI per EDF+ spec:
+#   patient_id      (bytes 8-87)   — MRN, sex, birthdate, name
+#   recording_id    (bytes 88-167) — startdate, hospital admin code,
+#                                    technician/investigator name,
+#                                    equipment code
+#   startdate       (bytes 168-175) — original recording date
+#   starttime       (bytes 176-183) — original recording time
+# A header dump that lands in a shared log file (e.g. via the
+# error-handler diagnostic dump) must mask these. The remaining
+# numeric/structural fields (bytes_in_header, n_records,
+# record_duration, n_signals) carry no PHI and are exactly what a
+# data-team triage needs.
+PHI_MAIN_HEADER_FIELDS = frozenset(
+    {"patient_id", "recording_id", "startdate", "starttime"}
+)
+
+
 def _format_field_line(start: int, width: int, name: str, raw: bytes,
-                       parsed) -> str:
+                       parsed, *, redact_phi: bool = False) -> str:
     """One row of the human-readable header dump."""
     end = start + width - 1
+    if redact_phi and name in PHI_MAIN_HEADER_FIELDS:
+        return (f"  bytes {start:>4}-{end:<4} ({width:>2}B)  "
+                f"{name:<19}  raw=[PHI_REDACTED]  parsed=[PHI_REDACTED]")
     raw_text = raw.decode("ascii", errors="replace")
     # Truncate long string fields for readability — keep raw bytes
     # available via the byte range note.
@@ -144,9 +164,32 @@ def read_signal_headers(edf_path: str, n_signals: int) -> list:
 def print_header(edf_path: str, *,
                  signal_indices: Optional[list] = None,
                  print_signals: bool = True,
-                 out=sys.stdout) -> None:
-    """Print everything we can determine about ``edf_path``'s header."""
+                 redact_phi: bool = False,
+                 out=None) -> None:
+    """Print everything we can determine about ``edf_path``'s header.
+
+    When ``redact_phi=True``, the four main-header fields that carry
+    identifying information per EDF+ spec (``patient_id``,
+    ``recording_id``, ``startdate``, ``starttime``) are masked as
+    ``[PHI_REDACTED]``. Use this when the dump is going to a shared log
+    file. Default is ``False`` (full content) so the standalone
+    ``print-edf-header`` command shows the operator everything when
+    debugging their own files.
+
+    ``out`` defaults to whatever ``sys.stdout`` points to at call time
+    (late-binding) so the dump cooperates with pytest's ``capsys``,
+    Python's ``contextlib.redirect_stdout``, and the pipeline's
+    ``_TeeStream`` log capture. Pass an explicit file-like object when
+    you want a different destination."""
+    if out is None:
+        out = sys.stdout
     print(f"\n=== {edf_path} ===", file=out)
+    if redact_phi:
+        print(
+            "# (PHI fields — patient_id, recording_id, startdate, "
+            "starttime — are masked in this dump)",
+            file=out,
+        )
 
     file_size = os.path.getsize(edf_path)
     print(f"# filesize: {file_size} bytes", file=out)
@@ -162,7 +205,8 @@ def print_header(edf_path: str, *,
 
     for start, width, name, kind in MAIN_HEADER_FIELDS:
         line = _format_field_line(start, width, name,
-                                  main[f"_raw_{name}"], main[name])
+                                  main[f"_raw_{name}"], main[name],
+                                  redact_phi=redact_phi)
         print(line, file=out)
 
     # --- signal headers ---
@@ -254,6 +298,10 @@ def main():
                         "(default: all). Example: --signals 0,1,5")
     p.add_argument("--no-signals", action="store_true",
                    help="Skip the per-signal table; only print main header.")
+    p.add_argument("--redact-phi", action="store_true",
+                   help="Mask the four main-header fields that carry PHI "
+                        "(patient_id, recording_id, startdate, starttime). "
+                        "Use when sharing the output with a third party.")
     args = p.parse_args()
 
     indices = None
@@ -269,7 +317,8 @@ def main():
         try:
             print_header(edf_path,
                          signal_indices=indices,
-                         print_signals=not args.no_signals)
+                         print_signals=not args.no_signals,
+                         redact_phi=args.redact_phi)
         except Exception as e:
             print(f"\n=== {edf_path} ===", file=sys.stderr)
             print(f"  FAILED to inspect: {type(e).__name__}: {e}",

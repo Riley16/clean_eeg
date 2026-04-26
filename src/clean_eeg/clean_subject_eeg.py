@@ -375,6 +375,10 @@ def clean_subject_edf_files(
                 ])
             err_msg_lines.append("Skipping this file and continuing...")
             print("\n".join(err_msg_lines))
+            # Dump the header for the data team. Try the original input
+            # first; if the inplace-write step already moved it, fall
+            # back to whichever quarantined path now holds the file.
+            _dump_edf_header_for_diagnosis(input_file_path, *moved)
 
     print("Done cleaning EDF files. Saved to output path:", output_path)
     if benchmark:
@@ -427,6 +431,32 @@ def clean_subject_edf_files(
 
 
 QUARANTINE_SUFFIX = ".QUARANTINED-DO-NOT-USE"
+
+
+def _dump_edf_header_for_diagnosis(*candidate_paths: str) -> None:
+    """Best-effort: dump the EDF header of the first candidate path that
+    exists on disk. Output goes to stdout so the live tee captures it
+    into log.out. Always passes ``redact_phi=True`` because log.out is
+    typically shared with the data team — the four PHI-bearing
+    main-header fields (patient_id, recording_id, startdate, starttime)
+    are masked. The numeric/structural fields that the data team
+    actually needs to triage parse failures are preserved.
+
+    Swallows any exception raised by the dump itself — it must NEVER
+    mask the original error that triggered the diagnostic call."""
+    from clean_eeg.print_edf_header import print_header
+    for p in candidate_paths:
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            print(f"\nEDF header dump (for the data team) — {p}:")
+            print_header(p, redact_phi=True)
+        except Exception as dump_err:
+            print(
+                f"  (header dump failed: "
+                f"{type(dump_err).__name__}: {dump_err})"
+            )
+        return
 
 
 def _quarantine_partial_outputs(artifact_paths: list, quarantine_dir: str) -> list:
@@ -669,6 +699,7 @@ def _load_edf_metadata(input_path: str,
                 f"{traceback.format_exc().rstrip()}\n\n"
                 f"Check if the file is corrupted. Skipping this file...\n"
             )
+            _dump_edf_header_for_diagnosis(full_path)
     if failed_files:
         print(
             f"\nWARNING: {len(failed_files)} EDF file(s) were skipped during "

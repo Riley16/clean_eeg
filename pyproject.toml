@@ -25,6 +25,9 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest"]
 
+[project.scripts]
+print-edf-header = "clean_eeg.print_edf_header:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

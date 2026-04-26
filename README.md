@@ -72,6 +72,26 @@ If the subject has multiple middle names, separate them with underscores:
 
 Any required arguments not provided on the command line will be prompted for interactively. The path to the de-identified files will be printed once the process finishes.
 
+## Inspecting EDF headers (debugging)
+
+The package ships a `print-edf-header` command for dumping the raw bytes and parsed values of every EDF header field. It works even when `pyedflib` refuses to open the file (which is typically when you'd reach for it — e.g. a Nihon Kohden export with empty/blank numeric fields). Operates on a single `.edf` file or every `.edf` in a directory.
+
+```
+conda activate clean_eeg
+print-edf-header /path/to/file.edf
+print-edf-header /path/to/folder_of_edfs/
+print-edf-header /path/to/file.edf --signals 0,1,5     # only show these signals
+print-edf-header /path/to/file.edf --no-signals        # main header only
+```
+
+Equivalent module form (useful from inside Python projects):
+
+```
+python -m clean_eeg.print_edf_header /path/to/file.edf
+```
+
+For each file, the command prints (i) the main header field-by-field with offsets, raw bytes, and parsed values; (ii) per-signal headers; (iii) derived geometry and a verdict on whether the on-disk filesize matches the header. Empty or unparseable numeric fields are surfaced as `<empty>` / `<unparseable: ...>` rather than crashing the script.
+
 ## Log files
 
 The pipeline writes a log file (`log.out`) to the current working directory. All console output is duplicated to this file, with patient name parts automatically scrubbed (replaced with `[PHI_REDACTED]`). After the pipeline finishes, the log is also copied to the output directory alongside the de-identified EDF files.
