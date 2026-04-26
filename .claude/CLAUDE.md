@@ -5,6 +5,7 @@ Python package for de-identifying (removing PHI from) clinical EEG data stored i
 
 ## Git Conventions
 - Use **conventional commits** style for all git commits (e.g., `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`)
+- Don't include "Claude co-authorship" statements in commit messages.
 - Version is derived from git tags via setuptools-scm (format: `v1.2.3`)
 
 ## Project Structure

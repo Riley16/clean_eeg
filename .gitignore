@@ -98,3 +98,7 @@ Thumbs.db
 **/test_data/
 logs/
 *.log
+
+# Local-only exploration / reference material (Claude scratch space, not part of the package)
+context/
+misc_scripts/
