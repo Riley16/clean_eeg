@@ -125,8 +125,62 @@ class FuzzySubjectNameRecognizer(EntityRecognizer):
         return results
 
 
+def _initial_letter(name_token: str) -> str:
+    """First alphabetic character of ``name_token`` (e.g., 'P.' -> 'P',
+    'Marie-Claire' -> 'M'). Returns '' if the token has no letters."""
+    for c in name_token:
+        if c.isalpha():
+            return c
+    return ""
+
+
+def _build_initial_chain_pattern(first_name_token: str,
+                                 middle_name_tokens: List[str]) -> str:
+    """Regex matching the patient's initial chain — a contiguous sequence
+    of the patient's *own* first/middle initials, in their canonical
+    order, with optional dots and optional whitespace between them.
+
+    Supports:
+      - "F. Last", "F Last"            (first initial only)
+      - "F. M. Last", "F M Last"       (first + middle initials)
+      - "F.M. Last", "FM Last"         (concatenated, no/dropped spaces)
+      - "M. Last", "M Last"            (middle initial alone)
+      - "F. M1. M2. Last"              (multiple middles)
+
+    By matching only the patient's actual initials (not arbitrary
+    letters), this avoids false positives like "A clinical event"
+    being mistaken for "A. <last_name>"."""
+    first_initial = _initial_letter(first_name_token)
+    middle_initials = [m for m in (_initial_letter(t) for t in middle_name_tokens) if m]
+
+    slots: List[str] = []
+    if first_initial:
+        slots.append(first_initial)
+    slots.extend(middle_initials)
+    if not slots:
+        return ""
+
+    # An "initial slot" matches one letter, an optional dot, and any
+    # following whitespace (so "J", "J.", "J ", and "J. " all fit one slot).
+    def slot(letter: str, required: bool) -> str:
+        body = re.escape(letter) + r"\.?\s*"
+        return body if required else fr"(?:{body})?"
+
+    # An alternative starts at slot[i]: that slot is required, every
+    # later slot is optional. Iterating the start index covers
+    # "F", "F M", "F M1 M2", "M", "M M2", "M2", ... while preserving
+    # the canonical order.
+    alternatives = []
+    for start_idx in range(len(slots)):
+        parts = [slot(slots[start_idx], required=True)]
+        parts.extend(slot(s, required=False) for s in slots[start_idx + 1:])
+        alternatives.append("".join(parts))
+    return "(?:" + "|".join(alternatives) + ")"
+
+
 def build_title_name_pattern(first_name_token: str, last_name_token: str,
-                             n_middle_names: int = 0) -> str:
+                             n_middle_names: int = 0,
+                             middle_name_tokens: List[str] | None = None) -> str:
     """
     Build a regex that matches:
       [optional title] + First + optional middle initial(s) + Last(+compound) + optional possessive
@@ -134,7 +188,11 @@ def build_title_name_pattern(first_name_token: str, last_name_token: str,
     - allows apostrophes/hyphens in tokens, and treats them as optional where present
     - middle initials: single-letter tokens with optional dot
     - spacing between parts can be zero or more (handles 'DrJohnPOConnor')
+    - additionally matches initial-only chains using the patient's actual
+      first/middle initials (e.g. "J. L. Smith", "JL Smith", "L. Smith")
     """
+
+    middle_name_tokens = middle_name_tokens or []
 
     first_pat = make_token_regex_allow_optional_punct(first_name_token)
     last_pat  = make_token_regex_allow_optional_punct(last_name_token)
@@ -156,16 +214,21 @@ def build_title_name_pattern(first_name_token: str, last_name_token: str,
     # Full pattern: [prefix] First [mid initials] Last(+compound) [poss]
     pat_full = fr"{prefix}{first_pat}{mid_block}\s*{last_pat}{compound_suffix}{poss}\b"
 
-    # first initial followed by last name (e.g., "J. O'Connor")
-    first_initial = make_token_regex_allow_optional_punct(first_name_token[0])
-    pat_first_initial = fr"{prefix}{first_initial}\.?\s*{last_pat}{compound_suffix}{poss}\b"
-    pat_full = f"(?:{pat_full}|{pat_first_initial})"
+    # Initial-chain pattern: [prefix] (patient's first/middle initials in
+    # order, any subset, dots/spaces optional) Last(+compound) [poss].
+    # Subsumes the older "first initial + last" branch.
+    initial_chain = _build_initial_chain_pattern(first_name_token,
+                                                 middle_name_tokens)
+    branches = [pat_full]
+    if initial_chain:
+        pat_initials = fr"{prefix}{initial_chain}{last_pat}{compound_suffix}{poss}\b"
+        branches.append(pat_initials)
 
-    # Also match: [prefix] Last(+compound) [poss]  (covers 'Prof O'Connor', 'Dr OConnor's')
+    # [prefix] Last(+compound) [poss]  (covers 'Prof O'Connor', 'Dr OConnor's')
     pat_lastonly = fr"{prefix}{last_pat}{compound_suffix}{poss}\b"
+    branches.append(pat_lastonly)
 
-    # Combine
-    return fr"(?:{pat_full}|{pat_lastonly})"
+    return "(?:" + "|".join(branches) + ")"
 
 
 class PersonalName():
@@ -201,9 +264,12 @@ class TitleAndInitialsRecognizer(PatternRecognizer):
     - Allows dropped/optional apostrophes/hyphens inside tokens
     """
     def __init__(self, name: PersonalName):
-        pat = build_title_name_pattern(first_name_token=normalize_name_token(name.first_name),
-                                       last_name_token=normalize_name_token(name.last_name),
-                                       n_middle_names=len(name.middle_names))
+        pat = build_title_name_pattern(
+            first_name_token=normalize_name_token(name.first_name),
+            last_name_token=normalize_name_token(name.last_name),
+            n_middle_names=len(name.middle_names),
+            middle_name_tokens=[normalize_name_token(m) for m in name.middle_names],
+        )
         patterns = [Pattern(name="title_first_midinit_last", regex=pat, score=0.9)] if pat else []
         super().__init__(supported_entity="SUBJECT_NAME", name="subject_title_initials", patterns=patterns)
 
@@ -214,17 +280,28 @@ def build_presidio():
                 "models": [{"lang_code": "en", "model_name": "en_core_web_sm"}]}
     nlp_engine = NlpEngineProvider(nlp_configuration=nlp_conf).create_engine()
     registry = RecognizerRegistry()
-    registry.load_predefined_recognizers(nlp_engine=nlp_engine)
     return AnalyzerEngine(nlp_engine=nlp_engine, registry=registry), AnonymizerEngine(), registry
+
+def _alpha_len(token: str) -> int:
+    """Number of alphabetic characters in ``token`` (ignores apostrophes,
+    hyphens, dots). Used to distinguish a real name token from a middle
+    initial like ``"L"`` or ``"P."``."""
+    return sum(c.isalpha() for c in token)
+
 
 def add_subject_name_detectors(registry: RecognizerRegistry,
                                name: PersonalName):
-    tokens = name.get_normalized_tokens()
+    # Single-letter initials (e.g. middle name "L" or "P.") are excluded
+    # from the deny-list and fuzzy targets — including them would match
+    # every standalone letter in EDF text. Initials are still redacted
+    # when they appear in a "Dr. F. M. Last" context via
+    # TitleAndInitialsRecognizer below.
+    tokens = [t for t in name.get_normalized_tokens() if _alpha_len(t) >= 2]
 
     # add nickname variants for first name and middle names
     nicknames = get_name_variants(name.first_name, levels=2)
     for mn in name.middle_names:
-        if len(mn) >= 2:  # skip single-char initials
+        if _alpha_len(mn) >= 2:
             nicknames |= get_name_variants(mn, levels=2)
     tokens.extend(nicknames)
 

@@ -187,6 +187,78 @@ def test_empty_phi_ignored(tmp_path):
     assert "[PHI_REDACTED]" not in content
 
 
+def test_short_phi_pattern_ignored(tmp_path):
+    """Patterns with fewer than 3 alphabetic characters must NOT be
+    registered — otherwise a single-letter middle initial like 'L' would
+    replace every L in 'Loading', 'Volumes', 'False', etc., mangling
+    the entire log file. Regression test for that exact incident."""
+    log_path = str(tmp_path / "log.out")
+    logger = PipelineLogger(log_path)
+    logger.add_phi("L")
+    logger.add_phi("P.")  # 1 alpha char even though len > 1
+    logger.add_phi("Jo")  # 2 alpha chars — still below threshold
+    try:
+        print("Loading EDF files from /Volumes/KahaDrive — Failed: False")
+    finally:
+        logger.close()
+
+    content = open(log_path).read()
+    assert "Loading EDF files from /Volumes/KahaDrive" in content
+    assert "Failed: False" in content
+    assert "[PHI_REDACTED]" not in content
+
+
+def test_realistic_log_with_lane_middle_name(tmp_path):
+    """End-to-end scenario that previously mutilated the field log.
+
+    Patient is 'John Lane Smith'. The pipeline registers each name part as
+    PHI. Standalone 'L' characters in realistic stdout — file paths
+    ('/Volumes/...'), status text ('Loading', 'Failed: False',
+    'log.out') — must all survive intact. Only the actual word 'Lane'
+    should be redacted, not every L."""
+    log_path = str(tmp_path / "log.out")
+    logger = PipelineLogger(log_path)
+    for part in ["John", "Lane", "Smith"]:
+        logger.add_phi(part)
+    try:
+        print("Loading EDF files from /Volumes/KahaDrive/R1760A/")
+        print("Cleaned EDF file at /Volumes/log.out — Failed: False")
+        print("All Lane signed.")
+    finally:
+        logger.close()
+
+    content = open(log_path).read()
+    # Every readable bit of the log must survive intact — the bug
+    # replaced every 'l'/'L' with [PHI_REDACTED].
+    assert "Loading EDF files from /Volumes/KahaDrive/R1760A/" in content
+    assert "Cleaned EDF file at /Volumes/log.out" in content
+    assert "Failed: False" in content
+    # The actual middle-name word IS redacted.
+    assert "Lane" not in content
+    assert "[PHI_REDACTED] signed." in content
+
+
+def test_phi_pattern_uses_word_boundaries(tmp_path):
+    """A PHI pattern for 'Mark' must NOT match inside 'Marks', 'Markup',
+    or 'remark' — only at word boundaries."""
+    log_path = str(tmp_path / "log.out")
+    logger = PipelineLogger(log_path)
+    logger.add_phi("Mark")
+    try:
+        print("Marks the spot. Markup language. A remark.")
+        print("Mark arrived.")
+    finally:
+        logger.close()
+
+    content = open(log_path).read()
+    assert "Marks the spot." in content
+    assert "Markup language." in content
+    assert "A remark." in content
+    # The standalone 'Mark' must still be redacted.
+    assert "Mark arrived." not in content
+    assert "[PHI_REDACTED] arrived." in content
+
+
 def test_redact_log_file_catches_name_variants(tmp_path):
     """redact_log_file() should catch fuzzy name matches and nicknames that
     pattern-based scrubbing would miss."""

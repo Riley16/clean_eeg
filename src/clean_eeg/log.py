@@ -27,12 +27,23 @@ class PipelineLogger:
         self.write_to_log(f"=== clean_eeg log started {ts} ===\n\n")
 
     def add_phi(self, text: str):
-        """Register a string as PHI to be scrubbed from all log output."""
+        """Register a string as PHI to be scrubbed from all log output.
+
+        Patterns with fewer than 3 alphabetic characters are ignored — a
+        single-letter middle initial like ``"L"`` would otherwise replace
+        every ``L`` in the log (in ``Loading``, ``Volumes``, ``False``, ...).
+        Initials are still redacted in context by the title-and-initials
+        regex via the end-of-run ``redact_log_file`` Presidio pass.
+
+        The pattern is anchored with ``\\b`` boundaries so ``"Mark"`` does
+        not match inside ``"Marks"`` or ``"Markup"``.
+        """
         text = text.strip()
-        if text:
-            self._phi_patterns.append(
-                re.compile(re.escape(text), re.IGNORECASE)
-            )
+        if sum(c.isalpha() for c in text) < 3:
+            return
+        self._phi_patterns.append(
+            re.compile(r"\b" + re.escape(text) + r"\b", re.IGNORECASE)
+        )
 
     def scrub(self, text: str) -> str:
         """Replace all registered PHI patterns in text."""

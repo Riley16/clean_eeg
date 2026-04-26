@@ -253,6 +253,108 @@ def test_redactor_cache_calls_presidio_once_per_unique_text(monkeypatch):
     assert call_count["n"] == 3
 
 
+LANE_NAME = PersonalName(first_name='John', middle_names=['Lane'], last_name='Smith')
+
+
+@pytest.mark.parametrize("text,expected", [
+    # Initial-chain forms (patient initials = J, L)
+    ("L. Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+    ("L Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),       # no period
+    ("J. Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),      # first initial alone
+    ("J Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),       # no period
+    ("J. L. Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+    ("J L Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),     # no periods
+    ("J.L. Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),    # no spaces between initials
+    ("JL Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),      # concatenated
+    ("Dr. J. L. Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+    ("Dr. JL Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+    ("Dr. L. Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),  # title + middle initial only
+])
+def test_initial_chain_redaction(text, expected):
+    """Patient initials (in any order/combo, with/without dots and spaces)
+    plus the last name should be fully redacted."""
+    assert redact_subject_name(text, LANE_NAME) == expected
+
+
+def test_initial_chain_does_not_match_wrong_initials():
+    """Initial chain must match the patient's *actual* initials. Random
+    F/M letters should not get consumed — only the last name redacts
+    via the last-name-only branch."""
+    out = redact_subject_name("F. M. Smith arrived.", LANE_NAME)
+    # Smith is still redacted (pat_lastonly). The F. M. survive intact.
+    assert "F. M." in out
+    assert "Smith" not in out
+    assert REDACT_NAME_REPLACEMENT in out
+
+
+def test_initial_chain_does_not_match_prose_with_letters():
+    """Initial-chain regex must not fire on prose like 'A clinical event'
+    even when the patient's first initial happens to appear as a
+    standalone uppercase letter."""
+    name = PersonalName(first_name='Andrew', middle_names=[], last_name='Smith')
+    text = "A clinical event was logged at noon."
+    assert redact_subject_name(text, name) == text
+
+
+def test_initial_chain_with_no_middle_names():
+    """For a patient with no middle name, the initial chain reduces to
+    'first_initial + last' (the previous pat_first_initial behavior)."""
+    name = PersonalName(first_name='Alice', middle_names=[], last_name='Johnson')
+    cases = [
+        ("A. Johnson arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+        ("A Johnson arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+        ("Dr. A. Johnson arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+    ]
+    for text, expected in cases:
+        assert redact_subject_name(text, name) == expected
+
+
+def test_initial_chain_with_multiple_middles():
+    """Patient with multiple middle names: each middle's initial is in
+    the chain, and any contiguous subset of the chain (preserving order)
+    matches."""
+    name = PersonalName(first_name='John', middle_names=['Paul', 'Angelina'], last_name='Smith')
+    cases = [
+        ("J. P. A. Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+        ("J P A Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+        ("JPA Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),
+        ("P. A. Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),  # middle initials only
+        ("A. Smith arrived.", f"{REDACT_NAME_REPLACEMENT} arrived."),     # last middle initial alone
+    ]
+    for text, expected in cases:
+        assert redact_subject_name(text, name) == expected
+
+
+def test_single_letter_middle_initial_does_not_overredact():
+    """A middle name of 'L' must not cause every standalone 'L' in EDF
+    text to be redacted. The deny-list and fuzzy targets must skip
+    initials; only TitleAndInitialsRecognizer redacts initials, and
+    only in a 'Dr. F. M. Last' context."""
+    name = PersonalName(first_name='John', middle_names=['L'], last_name='Smith')
+    text = "Channel L was annotated. The L lead detached briefly."
+    assert redact_subject_name(text, name) == text
+
+
+def test_dotted_initial_middle_name_does_not_overredact():
+    """A middle name of 'P.' (single alpha char) is also an initial —
+    must not redact every standalone 'P' or 'P.' in the input."""
+    name = PersonalName(first_name='John', middle_names=['P.'], last_name='Smith')
+    text = "Channel P was logged. Then P. picked up noise."
+    assert redact_subject_name(text, name) == text
+
+
+def test_single_letter_middle_initial_still_redacts_in_title_pattern():
+    """When a single-letter middle initial appears between the first
+    name and last name (the only context where an initial unambiguously
+    identifies the patient), the title-and-initials regex must still
+    consume it."""
+    name = PersonalName(first_name='John', middle_names=['L'], last_name='Smith')
+    out = redact_subject_name("Dr. John L. Smith spoke.", name)
+    assert "John" not in out
+    assert "Smith" not in out
+    assert REDACT_NAME_REPLACEMENT in out
+
+
 def test_redactor_caches_are_independent_per_subject():
     """Two redactors for different subjects must have independent caches
     so a hit for one can't leak the wrong redacted value to the other."""
