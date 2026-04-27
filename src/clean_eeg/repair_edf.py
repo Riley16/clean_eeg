@@ -68,6 +68,24 @@ SAMPLES_PER_RECORD_FIELD_OFFSET = 16 + 80 + 8 + 8 + 8 + 8 + 8 + 80  # = 216
 SAMPLES_PER_RECORD_FIELD_WIDTH = 8
 
 
+def validate_edf_minimum_size(edf_path: str) -> None:
+    """Reject 0-byte and sub-main-header files with a user-readable error
+    before any parse is attempted."""
+    size = os.path.getsize(edf_path)
+    if size == 0:
+        raise ValueError(
+            f"EDF file is empty (0 bytes): {edf_path!r}. "
+            f"Likely an interrupted copy or an EEG export that never "
+            f"finalized. Verify the source file size and re-copy if needed."
+        )
+    if size < MAIN_HEADER_BYTES:
+        raise ValueError(
+            f"EDF file is too small to contain a header: "
+            f"{edf_path!r} is {size} bytes (main header alone is "
+            f"{MAIN_HEADER_BYTES} bytes)."
+        )
+
+
 def _parse_int_field(raw: bytes, field_name: str, signal_idx: int = -1,
                      edf_path: str = "") -> int | None:
     """Parse a numeric EDF header field.

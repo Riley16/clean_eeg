@@ -119,19 +119,20 @@ def _format_field_line(start: int, width: int, name: str, raw: bytes,
 
 def read_main_header(edf_path: str) -> dict:
     """Read and parse the EDF main header. Always returns a dict — never
-    raises. Each field is in the dict with its parsed value or a sentinel
-    string ('<empty>' / '<unparseable: ...>')."""
+    raises. Fields whose byte range falls past end-of-file are marked
+    ``<missing — file ends at byte N>`` instead of dropped, so a partial
+    header still tells the data team what bytes were present."""
     with open(edf_path, "rb") as f:
         main = f.read(MAIN_HEADER_BYTES)
-    if len(main) < MAIN_HEADER_BYTES:
-        return {
-            "_truncated_main_header": True,
-            "_main_bytes_read": len(main),
-        }
-    out = {"_main_bytes_read": MAIN_HEADER_BYTES, "_raw_main": main}
+    n_read = len(main)
+    out = {"_main_bytes_read": n_read, "_raw_main": main,
+           "_truncated_main_header": n_read < MAIN_HEADER_BYTES}
     for start, width, name, kind in MAIN_HEADER_FIELDS:
         raw = main[start:start + width]
-        out[name] = _parse_value(raw, kind)
+        if len(raw) < width:
+            out[name] = f"<missing — file ends at byte {n_read}>"
+        else:
+            out[name] = _parse_value(raw, kind)
         out[f"_raw_{name}"] = raw
     return out
 
@@ -198,16 +199,20 @@ def print_header(edf_path: str, *,
     print(f"\n# Main header (bytes 0..{MAIN_HEADER_BYTES - 1})", file=out)
     main = read_main_header(edf_path)
     if main.get("_truncated_main_header"):
-        print(f"  ! WARNING: file is shorter than 256 bytes — only "
-              f"{main['_main_bytes_read']} bytes available. Cannot parse.",
+        print(f"  ! WARNING: file is shorter than {MAIN_HEADER_BYTES} bytes — "
+              f"only {main['_main_bytes_read']} bytes available. "
+              f"Showing fields that fit; the rest are marked missing.",
               file=out)
-        return
 
     for start, width, name, kind in MAIN_HEADER_FIELDS:
         line = _format_field_line(start, width, name,
                                   main[f"_raw_{name}"], main[name],
                                   redact_phi=redact_phi)
         print(line, file=out)
+
+    # Signal headers live past the main header — skip if main is incomplete.
+    if main.get("_truncated_main_header"):
+        return
 
     # --- signal headers ---
     n_signals = main.get("n_signals")

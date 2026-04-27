@@ -742,6 +742,36 @@ def test_legacy_repair_truncated_alias_still_works(tmp_path):
     assert n == expected
 
 
+def test_validate_edf_minimum_size_rejects_empty_file(tmp_path):
+    from clean_eeg.repair_edf import validate_edf_minimum_size
+    edf = tmp_path / "empty.edf"
+    edf.write_bytes(b"")
+    with pytest.raises(ValueError) as excinfo:
+        validate_edf_minimum_size(str(edf))
+    msg = str(excinfo.value)
+    assert "empty" in msg.lower()
+    assert "0 bytes" in msg
+    assert "interrupted" in msg.lower() or "re-cop" in msg.lower()
+
+
+def test_validate_edf_minimum_size_rejects_subheader_file(tmp_path):
+    from clean_eeg.repair_edf import validate_edf_minimum_size
+    edf = tmp_path / "tiny.edf"
+    edf.write_bytes(b"0       partial header")  # 22 bytes
+    with pytest.raises(ValueError) as excinfo:
+        validate_edf_minimum_size(str(edf))
+    msg = str(excinfo.value)
+    assert "too small" in msg.lower()
+    assert "22 bytes" in msg
+    assert "256" in msg
+
+
+def test_validate_edf_minimum_size_passes_valid_file(tmp_path):
+    from clean_eeg.repair_edf import validate_edf_minimum_size
+    edf = _make_clean_edf(tmp_path)
+    validate_edf_minimum_size(edf)  # must not raise
+
+
 def test_empty_phys_min_already_handled_by_existing_repair(tmp_path, capsys):
     """Empty phys_min (8 spaces) was already handled implicitly because
     ``float('')`` raises ValueError. Locking in the contract: blank

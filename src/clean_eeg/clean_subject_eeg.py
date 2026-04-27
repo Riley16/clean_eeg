@@ -659,6 +659,7 @@ def _load_edf_metadata(input_path: str,
                        raise_errors: bool = False,
                        bench=None):
     from clean_eeg.repair_edf import (
+        validate_edf_minimum_size,
         repair_main_header_numeric_fields,
         repair_degenerate_signal_ranges,
     )
@@ -672,6 +673,7 @@ def _load_edf_metadata(input_path: str,
             continue
         full_path = os.path.join(input_path, filename)
         try:
+            validate_edf_minimum_size(full_path)
             if convert_to_edfC:
                 with bench.step("convert_edfD_to_edfC", file=filename):
                     convert_edfC_to_edfD(full_path)

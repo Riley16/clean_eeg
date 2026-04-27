@@ -727,6 +727,46 @@ def test_audit_failure_dumps_phi_masked_header(monkeypatch, tmp_path, capsys):
             f"PHI field {phi_field!r} must be masked in the dump; got: {row!r}"
 
 
+def test_empty_edf_file_produces_user_readable_error(monkeypatch, tmp_path, capsys):
+    """A 0-byte EDF must surface a clear 'file is empty' message rather
+    than the obscure spec-level 'n_signals empty' that the repair pass
+    would otherwise emit. Pair with a healthy file so the pipeline
+    doesn't abort on 'no EDFs loaded' before we can inspect the message."""
+    responses = iter(["y"] * 5)
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    healthy = input_dir / "healthy.edf"
+    _write_minimal_edfplus_with_annotations(str(healthy),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+    empty = input_dir / "empty.edf"
+    empty.write_bytes(b"")
+
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=False,
+    )
+
+    out = capsys.readouterr().out
+    assert "Failed to load EDF file empty.edf" in out
+    assert "is empty (0 bytes)" in out
+    # The obscure spec-level n_signals error should NOT be the lead message.
+    err_section_start = out.index("Failed to load EDF file empty.edf")
+    next_file_or_done = out.find("Failed to load EDF file ", err_section_start + 1)
+    if next_file_or_done == -1:
+        next_file_or_done = out.index("Done cleaning EDF files")
+    err_section = out[err_section_start:next_file_or_done]
+    assert "n_signals" not in err_section.split("Stack trace")[0], \
+        "the empty-file message should fire BEFORE the n_signals parse"
+
+
 def test_load_failure_dumps_header_for_empty_n_signals(monkeypatch, tmp_path, capsys):
     """When the load-time repair pass raises (e.g. empty n_signals),
     the diagnostic dump must still run so the data team gets the header
