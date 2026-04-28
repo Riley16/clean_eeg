@@ -876,15 +876,20 @@ def test_transfer_command_uses_rsync_when_available(monkeypatch,
                for line in rsync_lines), \
         "rsync source path must have trailing slash to copy contents (incl log.out)"
 
-    # Permission flags: group-rwx + no-world for transferred files/dirs,
-    # and `umask 007` on the mkdir so newly-created intermediate dirs
-    # also get group rwx without world access.
+    # Permissions: umask 007 on mkdir (so new intermediate dirs are
+    # group-rwx) plus a follow-up recursive chgrp + chmod on the
+    # subject folder so the data team's group (taken via --reference
+    # from the site's incoming dir) owns and can rwx everything.
     assert "umask 007" in transfer_block, \
         "mkdir step must use 'umask 007' so new intermediate dirs are group-rwx"
-    assert ("--chmod=ug+rwX,o-rwx" in transfer_block
-            or "--chmod=Dug+rwx,Do-rwx" in transfer_block
-            or "--chmod=u+rwX,g+rwX,o-rwx" in transfer_block), \
-        "rsync command must --chmod files/dirs to ug+rwX,o-rwx"
+    chgrp_lines = [l for l in transfer_block.splitlines()
+                   if "chgrp -R" in l and "--reference=" in l]
+    assert chgrp_lines, \
+        "transfer block must include a recursive chgrp with --reference=<site dir>"
+    chmod_lines = [l for l in transfer_block.splitlines()
+                   if "chmod -R g+rwX,o-rwx" in l]
+    assert chmod_lines, \
+        "transfer block must include a recursive chmod -R g+rwX,o-rwx"
 
 
 def test_transfer_command_falls_back_to_scp_when_rsync_unavailable(monkeypatch,
@@ -926,21 +931,19 @@ def test_transfer_command_falls_back_to_scp_when_rsync_unavailable(monkeypatch,
         "scp fallback must explicitly include log.out (the *.edf glob misses it)"
     assert "*.edf" in transfer_block
 
-    # Permission flags: scp itself can't set --chmod, so the fallback
-    # uses an `ssh ... chmod g+rwX,o-rwx` line targeting only the dir
-    # we transferred to + the files we sent (so pre-existing ancestor
-    # dirs are NOT touched). And mkdir step must use `umask 007`.
+    # Permissions: umask 007 on mkdir + follow-up recursive chgrp +
+    # chmod on the subject folder. chgrp uses --reference so the group
+    # matches the site's incoming dir.
     assert "umask 007" in transfer_block, \
         "mkdir step must use 'umask 007' so new intermediate dirs are group-rwx"
+    chgrp_lines = [l for l in transfer_block.splitlines()
+                   if "chgrp -R" in l and "--reference=" in l]
+    assert chgrp_lines, \
+        "scp fallback must include a recursive chgrp with --reference=<site dir>"
     chmod_lines = [l for l in transfer_block.splitlines()
-                   if "chmod g+rwX,o-rwx" in l]
+                   if "chmod -R g+rwX,o-rwx" in l]
     assert chmod_lines, \
-        "scp fallback must include a follow-up ssh chmod g+rwX,o-rwx"
-    # The chmod line must NOT be recursive (no -R) so ancestor dirs
-    # untouched.
-    for line in chmod_lines:
-        assert "-R " not in line, \
-            f"chmod must not be recursive (would touch ancestors): {line!r}"
+        "scp fallback must include a recursive chmod -R g+rwX,o-rwx"
 
 
 def test_audit_skipped_when_skip_audit_true(monkeypatch, tmp_path, capsys):

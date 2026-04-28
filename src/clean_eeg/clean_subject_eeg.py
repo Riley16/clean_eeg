@@ -410,36 +410,37 @@ def clean_subject_edf_files(
         )
     site_code = subject_code[-1]  # last character of subject code is site code
     site_code_incoming_folder = SITE_CODE_TO_INCOMING_FOLDER.get(site_code, 'UNKNOWN_SITE')
-    remote_dir = f"/data10/RAM/incoming/{site_code_incoming_folder}/{subject_code}/all_clinical_eeg"
+    site_parent_dir = f"/data10/RAM/incoming/{site_code_incoming_folder}"
+    subject_remote_dir = f"{site_parent_dir}/{subject_code}"
+    remote_dir = f"{subject_remote_dir}/all_clinical_eeg"
     print("\nExample commands to transfer cleaned EDF files to the CML "
           "rhino server (replace USER with your username):")
     print()
-    # `umask 007` before `mkdir -p` makes any newly-created intermediate
-    # directories 770 (rwxrwx---) so the operator's group can read/write
-    # them. Pre-existing ancestor dirs are untouched (mkdir -p only
-    # creates missing ones), so we don't accidentally tighten or loosen
-    # perms that were already in place upstream.
+    # umask 007 → newly-created intermediate dirs are 770. Pre-existing
+    # dirs are untouched.
     print(f'  ssh USER@rhino2.psych.upenn.edu "umask 007 && mkdir -p {remote_dir}"')
     print()
-    # Prefer rsync where available (resumable, --exclude='quarantine/',
-    # and --chmod sets group-rwx / no-world on every file and directory
-    # rsync creates without touching pre-existing ones).
-    # Fall back to scp on systems without rsync (typically Windows
-    # without WSL); the scp form must include log.out explicitly (the
-    # *.edf glob misses it) and the trailing ssh chmod fixes perms on
-    # exactly the files we transferred + the destination dir, leaving
-    # ancestor dirs alone.
+    # Prefer rsync (resumable, --exclude). scp fallback for systems
+    # without rsync (typically Windows without WSL); log.out must be
+    # listed explicitly since *.edf misses it.
     if shutil.which("rsync"):
-        print(f"  rsync -avzh --partial --progress \\")
-        print(f"    --chmod=ug+rwX,o-rwx --exclude='quarantine/' \\")
+        print(f"  rsync -avzh --partial --progress --exclude='quarantine/' \\")
         print(f"    {output_path}/ \\")
         print(f"    USER@rhino2.psych.upenn.edu:{remote_dir}/")
     else:
         print(f"  scp {os.path.join(output_path, '*.edf')} \\")
         print(f"    {os.path.join(output_path, LOG_FILENAME)} \\")
         print(f"    USER@rhino2.psych.upenn.edu:{remote_dir}")
-        print(f"  ssh USER@rhino2.psych.upenn.edu \"chmod g+rwX,o-rwx "
-              f"{remote_dir} {remote_dir}/*.edf {remote_dir}/{LOG_FILENAME}\"")
+    print()
+    # Recursive chgrp+chmod on the subject folder so the data team's
+    # group (taken from the site's incoming dir) owns everything and
+    # has rwx. Bounded to {subject_remote_dir} so ancestors aren't
+    # touched. `;` (not `&&`) so chmod still runs if chgrp can't touch
+    # a few entries the operator doesn't own — those failures are
+    # printed but non-fatal.
+    print(f'  ssh USER@rhino2.psych.upenn.edu "'
+          f'chgrp -R --reference={site_parent_dir} {subject_remote_dir}; '
+          f'chmod -R g+rwX,o-rwx {subject_remote_dir}"')
 
 
 QUARANTINE_SUFFIX = ".QUARANTINED-DO-NOT-USE"
