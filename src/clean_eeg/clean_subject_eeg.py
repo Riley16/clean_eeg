@@ -414,20 +414,32 @@ def clean_subject_edf_files(
     print("\nExample commands to transfer cleaned EDF files to the CML "
           "rhino server (replace USER with your username):")
     print()
-    print(f'  ssh USER@rhino2.psych.upenn.edu "mkdir -p {remote_dir}"')
+    # `umask 007` before `mkdir -p` makes any newly-created intermediate
+    # directories 770 (rwxrwx---) so the operator's group can read/write
+    # them. Pre-existing ancestor dirs are untouched (mkdir -p only
+    # creates missing ones), so we don't accidentally tighten or loosen
+    # perms that were already in place upstream.
+    print(f'  ssh USER@rhino2.psych.upenn.edu "umask 007 && mkdir -p {remote_dir}"')
     print()
-    # Prefer rsync where available (resumable, --exclude='quarantine/').
+    # Prefer rsync where available (resumable, --exclude='quarantine/',
+    # and --chmod sets group-rwx / no-world on every file and directory
+    # rsync creates without touching pre-existing ones).
     # Fall back to scp on systems without rsync (typically Windows
-    # without WSL); the scp form must include log.out explicitly since
-    # *.edf does not match it.
+    # without WSL); the scp form must include log.out explicitly (the
+    # *.edf glob misses it) and the trailing ssh chmod fixes perms on
+    # exactly the files we transferred + the destination dir, leaving
+    # ancestor dirs alone.
     if shutil.which("rsync"):
-        print(f"  rsync -avzh --partial --progress --exclude='quarantine/' \\")
+        print(f"  rsync -avzh --partial --progress \\")
+        print(f"    --chmod=ug+rwX,o-rwx --exclude='quarantine/' \\")
         print(f"    {output_path}/ \\")
         print(f"    USER@rhino2.psych.upenn.edu:{remote_dir}/")
     else:
         print(f"  scp {os.path.join(output_path, '*.edf')} \\")
         print(f"    {os.path.join(output_path, LOG_FILENAME)} \\")
         print(f"    USER@rhino2.psych.upenn.edu:{remote_dir}")
+        print(f"  ssh USER@rhino2.psych.upenn.edu \"chmod g+rwX,o-rwx "
+              f"{remote_dir} {remote_dir}/*.edf {remote_dir}/{LOG_FILENAME}\"")
 
 
 QUARANTINE_SUFFIX = ".QUARANTINED-DO-NOT-USE"
