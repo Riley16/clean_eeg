@@ -89,4 +89,4 @@ python src/clean_eeg/clean_subject_eeg.py \
 Current TODOs are tracked in `TODO.md` at the project root (gitignored).
 
 ## Environment
-Run all code from the conda environment `clean_eeg`
+Run all code from the conda environment `clean_eeg`. Its absolute path is exposed to Bash tool calls as `$CONDA_ENV_PATH` (set per-machine via the `env` block in `.claude/settings.local.json`). Invoke env binaries directly — e.g. `"$CONDA_ENV_PATH/bin/pytest"` — instead of `conda activate` (which fails non-interactively).

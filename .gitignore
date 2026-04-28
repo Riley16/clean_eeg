@@ -61,6 +61,7 @@ target/
 
 # --- Environments ---
 .env
+env_copy_w_keys
 .venv
 env/
 venv/
