@@ -974,3 +974,144 @@ def test_audit_skipped_when_skip_audit_true(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Audit passed" not in out
     assert "pyedflib cross-check" not in out
+
+# ---- CLI: --no_middle_name flag ----
+# Cross-platform alternative to --middle_name "" — added because
+# Windows cmd.exe strips empty quoted arguments, so a collaborator
+# could not express "no middle name" on the command line.
+
+def _parse_cli(argv, monkeypatch):
+    """Run get_clean_eeg_cli_arguments() with a synthetic argv.
+    Mock out the interactive prompt so the test never blocks; if
+    prompt_if_missing reaches the middle-name prompt, raise instead so
+    the test fails loudly rather than hanging."""
+    from clean_eeg import clean_subject_eeg as mod
+
+    def _no_prompt(_msg):
+        raise AssertionError(
+            "logged_input was called — test should have provided all "
+            "required args via argv. msg=" + repr(_msg))
+
+    monkeypatch.setattr("sys.argv", ["clean_subject_eeg.py"] + argv)
+    monkeypatch.setattr(mod, "logged_input", _no_prompt)
+    return mod.get_clean_eeg_cli_arguments()
+
+
+def test_no_middle_name_flag_sets_empty_middle_name(monkeypatch):
+    """--no_middle_name should leave args.middle_name == "" so the
+    downstream validator accepts it (instead of erroring on the
+    "NOT_SPECIFIED" sentinel)."""
+    args = _parse_cli([
+        "--input_path", "/tmp/x",
+        "--subject_code", "R1764A",
+        "--first_name", "John",
+        "--last_name", "Doe",
+        "--no_middle_name",
+    ], monkeypatch)
+    assert args.middle_name == ""
+    assert args.no_middle_name is True
+
+
+def test_no_middle_name_conflicts_with_middle_name_value(monkeypatch):
+    """Passing both --no_middle_name AND --middle_name <value> is
+    ambiguous — argparse should exit (parser.error → SystemExit)."""
+    with pytest.raises(SystemExit):
+        _parse_cli([
+            "--input_path", "/tmp/x",
+            "--subject_code", "R1764A",
+            "--first_name", "John",
+            "--last_name", "Doe",
+            "--middle_name", "Paul",
+            "--no_middle_name",
+        ], monkeypatch)
+
+
+def test_empty_string_middle_name_still_works_on_posix(monkeypatch):
+    """The legacy --middle_name "" path must still resolve to "" for
+    shells that DO pass empty quoted args (zsh, bash). The prompt-if-
+    missing block currently re-prompts on "" (a pre-existing quirk —
+    --no_middle_name avoids it entirely), so simulate the user
+    pressing Enter at that prompt by returning an empty string."""
+    from clean_eeg import clean_subject_eeg as mod
+
+    monkeypatch.setattr("sys.argv", [
+        "clean_subject_eeg.py",
+        "--input_path", "/tmp/x",
+        "--subject_code", "R1764A",
+        "--first_name", "John",
+        "--last_name", "Doe",
+        "--middle_name", "",
+    ])
+    monkeypatch.setattr(mod, "logged_input", lambda _msg: "")
+    args = mod.get_clean_eeg_cli_arguments()
+    assert args.middle_name == ""
+    assert args.no_middle_name is False
+
+
+# ---- validate_cli_arguments: empty first_name / last_name rejected ----
+# prompt_if_missing catches missing names interactively, but a batch
+# invocation passing --first_name "" or --last_name "" on POSIX (where
+# empty quoted args DO survive) would otherwise slip through. The
+# backstop in validate_cli_arguments rejects them.
+
+def _validate_args(tmp_path, **overrides):
+    """Build a minimal argparse.Namespace good enough to reach the
+    first/last-name checks, apply overrides, and run
+    validate_cli_arguments. Uses copy_path to skip the inplace
+    confirmation prompt."""
+    from argparse import Namespace
+    from clean_eeg.clean_subject_eeg import validate_cli_arguments
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    copy_dir = tmp_path / "out"
+
+    base = dict(
+        input_path=str(input_dir),
+        output_path=str(copy_dir),
+        copy_path=str(copy_dir),
+        first_name="John",
+        middle_name="Paul",
+        last_name="Doe",
+        subject_code="R1764A",
+        no_middle_name=False,
+    )
+    base.update(overrides)
+    validate_cli_arguments(Namespace(**base))
+
+
+def test_empty_first_name_rejected_by_validate(tmp_path):
+    """Empty --first_name must error with a message that points the
+    user at the fix."""
+    with pytest.raises(ValueError, match="First name is required"):
+        _validate_args(tmp_path, first_name="")
+
+
+def test_whitespace_only_first_name_rejected_by_validate(tmp_path):
+    """Whitespace-only counts as empty for our purposes — otherwise
+    `--first_name " "` could sneak past the check and produce
+    nonsense downstream."""
+    with pytest.raises(ValueError, match="First name is required"):
+        _validate_args(tmp_path, first_name="   ")
+
+
+def test_empty_last_name_rejected_by_validate(tmp_path):
+    """Empty --last_name must error."""
+    with pytest.raises(ValueError, match="Last name is required"):
+        _validate_args(tmp_path, last_name="")
+
+
+def test_whitespace_only_last_name_rejected_by_validate(tmp_path):
+    """Whitespace-only --last_name is treated the same as empty."""
+    with pytest.raises(ValueError, match="Last name is required"):
+        _validate_args(tmp_path, last_name="\t \n")
+
+
+def test_valid_names_pass_validate(tmp_path, capsys):
+    """Sanity check: with all three names supplied, validate returns
+    cleanly. Sole purpose is to prove the new backstop hasn't broken
+    the happy path."""
+    _validate_args(tmp_path)  # no exception
+    # validate_cli_arguments prints a "Loading EDF files" line as a
+    # side effect — drain it so test isolation isn't surprising.
+    capsys.readouterr()

@@ -879,12 +879,18 @@ def get_clean_eeg_cli_arguments():
                 value = logged_input(prompt).strip()
                 setattr(args, attr, value)
 
-        # Middle name: optional, but still prompt if missing
-        # If user presses Enter, leave default "NOT_SPECIFIED"
-        if args.middle_name in (None, "", "NOT_SPECIFIED"):
+        # Middle name: optional, but still prompt if missing.
+        # --no_middle_name short-circuits the prompt entirely (the flag
+        # is the cross-platform way to say "subject has no middle name"
+        # since Windows cmd.exe drops empty quoted args).
+        if getattr(args, "no_middle_name", False):
+            args.middle_name = ""
+        elif args.middle_name in (None, "", "NOT_SPECIFIED"):
             mn = logged_input(
                 "Enter subject middle name(s) "
-                "(use underscores between multiple names; press Enter to skip): "
+                "(use underscores between multiple names; press Enter to skip; "
+                "or pass --no_middle_name on the command line for a "
+                "non-interactive skip): "
             ).strip()
             if mn:  # Only override default if user typed something
                 args.middle_name = mn
@@ -910,7 +916,14 @@ def get_clean_eeg_cli_arguments():
                         help="Subject first name (required)")
     parser.add_argument("--middle_name", type=str, default="NOT_SPECIFIED",
                         help='Subject middle name(s). Use underscores between '
-                             'multiple middle names. If no middle name, use ""')
+                             'multiple middle names. If no middle name, pass '
+                             '--no_middle_name (works on Windows cmd.exe, '
+                             'which strips empty quoted args).')
+    parser.add_argument("--no_middle_name", action="store_true",
+                        help='Subject has no middle name. Cross-platform '
+                             'alternative to --middle_name "" — needed on '
+                             'shells that drop empty quoted arguments. '
+                             'Mutually exclusive with --middle_name.')
     parser.add_argument("--last_name", type=str, default='',
                         help="Subject last name (required)")
     parser.add_argument("--raise_errors", action="store_true",
@@ -935,6 +948,13 @@ def get_clean_eeg_cli_arguments():
                              "that signals survived byte-identical is skipped.")
 
     args = parser.parse_args()
+
+    # Mutually-exclusive guard. ``--middle_name`` keeps its
+    # "NOT_SPECIFIED" sentinel default, so equality with the sentinel
+    # is how we tell that the user didn't actually pass it.
+    if args.no_middle_name and args.middle_name != "NOT_SPECIFIED":
+        parser.error("--no_middle_name and --middle_name are mutually "
+                     "exclusive; pick one")
 
     # Prompt for anything missing (including middle name)
     args = prompt_if_missing(args)
@@ -970,10 +990,22 @@ def validate_cli_arguments(args):
             raise RuntimeError("Aborting. Re-run with --copy_path to write to a separate directory.")
 
     if args.middle_name == 'NOT_SPECIFIED':
-        raise ValueError('Middle name must be specified with --middle-name argument. '
-                         'If subject has no middle name, use --middle-name "" to leave blank. '
+        raise ValueError('Middle name must be specified. Pass --middle_name '
+                         'with the name(s), or --no_middle_name if the '
+                         'subject has none (the latter works on Windows '
+                         'cmd.exe; --middle_name "" does not). '
                          'If subject has only a middle initial, provide the initial instead. '
                          'Separate multiple middle names with underscores (e.g., Paul_Angelina)')
+    # First/last name backstop. prompt_if_missing handles the
+    # interactive case, but a batch invocation passing e.g.
+    # --first_name "" on POSIX would slip past it. Reject here so the
+    # pipeline does not silently produce wrong output downstream.
+    if not args.first_name.strip():
+        raise ValueError('First name is required. Pass --first_name <name>. '
+                         'Empty/whitespace-only values are not accepted.')
+    if not args.last_name.strip():
+        raise ValueError('Last name is required. Pass --last_name <name>. '
+                         'Empty/whitespace-only values are not accepted.')
 
     print('Loading EDF files from path:', args.input_path)
     is_valid_subject_code(args.subject_code)
