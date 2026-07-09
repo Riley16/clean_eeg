@@ -99,11 +99,8 @@ Thumbs.db
 **/test_data/
 logs/
 *.log
+temp/
 
 # Local-only exploration / reference material (Claude scratch space, not part of the package)
 context/
 misc_scripts/
-# Notebooks: executed outputs can balloon to 100s of MB (embedded
-# matplotlib PNGs). Force-add with `git add -f` if you intentionally
-# want a notebook tracked.
-notebooks/

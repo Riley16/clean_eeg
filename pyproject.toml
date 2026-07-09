@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "pytest-cov"]
 
 [project.scripts]
 print-edf-header = "clean_eeg.print_edf_header:main"
@@ -50,3 +50,23 @@ markers = [
     "benchmark_heavy: large (~150 MB, many annotations) benchmark; minutes + GB of RAM",
 ]
 addopts = "-m 'not benchmark and not benchmark_heavy'"
+
+# Coverage config: opt-in via `pytest --cov` (kept off in default addopts to
+# keep quick test runs fast). Measures both the main package and the isolated
+# text-PHI scripts module.
+[tool.coverage.run]
+source = ["src/clean_eeg", "scripts/text_phi"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/__main__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
