@@ -226,3 +226,97 @@ def test_redact_csv_with_name_column_and_date_flow(tmp_path):
     assert out.at[0, "admission_date"] == "1985-01-01"
     assert out.at[0, "note_date"] == "1985-01-06"  # 5-day interval preserved
     assert out.at[0, "channel"] == "LFPx1"
+
+
+# ---------- LLM config wiring ----------
+
+def _llm_schema_path(tmp_path):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({
+        "schema_version": "1", "format": "csv",
+        "fields": {
+            "note": {
+                "dtype": "string",
+                "operations": [
+                    {"name": "llm_scan",
+                     "params": {"prompt": "generic_phi", "report_only": True}},
+                ],
+            },
+        },
+    }))
+    return str(p)
+
+
+def test_llm_op_without_config_errors(tmp_path, capsys):
+    schema_path = _llm_schema_path(tmp_path)
+    in_path = tmp_path / "in.csv"
+    pd.DataFrame([{"note": "hello"}]).to_csv(in_path, index=False)
+    rc = main([
+        "redact",
+        "--input", str(in_path), "--output", str(tmp_path / "out.csv"),
+        "--schema", schema_path,
+        "--mode", "generic",
+    ])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "llm_*" in err or "llm-config" in err
+
+
+def test_auto_apply_llm_rewrites_report_only(tmp_path):
+    """--auto-apply-llm should flip report_only=False in the loaded schema.
+
+    We inspect the effect indirectly: the schema's operations should surface
+    with report_only=False after CLI loading (verified via the helper that
+    _apply_auto_apply_llm mutates)."""
+    from scripts.text_phi.cli import _apply_auto_apply_llm
+
+    raw = {
+        "schema_version": "1", "format": "csv",
+        "fields": {
+            "note": {"dtype": "string",
+                     "operations": [
+                         "subject_name_scan",
+                         {"name": "llm_scan", "params": {"report_only": True}},
+                     ]},
+        },
+    }
+    _apply_auto_apply_llm(raw)
+    ops = raw["fields"]["note"]["operations"]
+    # subject_name_scan untouched
+    assert ops[0] == "subject_name_scan"
+    # llm_scan flipped
+    assert ops[1]["name"] == "llm_scan"
+    assert ops[1]["params"]["report_only"] is False
+
+
+def test_auto_apply_llm_promotes_bare_string_op(tmp_path):
+    """`"llm_date_scan"` (string form) → dict with report_only=False."""
+    from scripts.text_phi.cli import _apply_auto_apply_llm
+
+    raw = {
+        "schema_version": "1", "format": "csv",
+        "fields": {
+            "note": {"dtype": "string", "operations": ["llm_date_scan"]},
+        },
+    }
+    _apply_auto_apply_llm(raw)
+    ops = raw["fields"]["note"]["operations"]
+    assert ops[0] == {"name": "llm_date_scan",
+                      "params": {"report_only": False}}
+
+
+def test_schema_uses_llm_ops_detector():
+    from scripts.text_phi.cli import _schema_uses_llm_ops
+    llm_schema = Schema.from_dict({
+        "schema_version": "1", "format": "csv",
+        "fields": {
+            "note": {"dtype": "string",
+                     "operations": [{"name": "llm_scan"}]},
+        },
+    })
+    non_llm = Schema.from_dict({
+        "schema_version": "1", "format": "csv",
+        "fields": {"note": {"dtype": "string", "operations": ["passthrough"]}},
+    })
+    assert _schema_uses_llm_ops(llm_schema) is True
+    assert _schema_uses_llm_ops(non_llm) is False

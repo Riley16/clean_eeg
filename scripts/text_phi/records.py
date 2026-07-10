@@ -12,6 +12,10 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from clean_eeg.anonymize import PersonalName
 
+    from .llm.cache import LLMCache
+    from .llm.client import LLMClient
+    from .llm.review_report import ReviewReport
+    from .llm.template import PromptRegistry
     from .redactor import RedactionSpan, TextRedactor
     from .schema import FieldSpec, Schema
 
@@ -57,6 +61,11 @@ class OperationContext:
     record_context: RecordContext
     schema: "Schema"
     text_redactor: "TextRedactor | None"
+    llm_client: "LLMClient | None" = None
+    llm_cache: "LLMCache | None" = None
+    prompt_registry: "PromptRegistry | None" = None
+    review_report: "ReviewReport | None" = None
+    record_location: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -89,10 +98,18 @@ class RecordRedactor:
         schema: "Schema",
         text_redactor: "TextRedactor | None" = None,
         default_subject: "PersonalName | None" = None,
+        llm_client: "LLMClient | None" = None,
+        llm_cache: "LLMCache | None" = None,
+        prompt_registry: "PromptRegistry | None" = None,
+        review_report: "ReviewReport | None" = None,
     ):
         self.schema = schema
         self.text_redactor = text_redactor
         self.default_subject = default_subject
+        self.llm_client = llm_client
+        self.llm_cache = llm_cache
+        self.prompt_registry = prompt_registry
+        self.review_report = review_report
         self._processing_order = schema.processing_order()
 
     def process_records(
@@ -141,6 +158,11 @@ class RecordRedactor:
                     record_context=ctx_state,
                     schema=self.schema,
                     text_redactor=self.text_redactor,
+                    llm_client=self.llm_client,
+                    llm_cache=self.llm_cache,
+                    prompt_registry=self.prompt_registry,
+                    review_report=self.review_report,
+                    record_location=dict(record.location),
                 )
                 current_value, new_spans = op.apply(current_value, op_ctx)
                 spans_for_field.extend(new_spans)

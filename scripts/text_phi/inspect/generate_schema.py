@@ -145,10 +145,47 @@ def _pick_operations(
     )
 
 
+_LLM_SCAN_TRIGGER_OPS: frozenset[tuple[str, ...]] = frozenset({
+    ("subject_name_scan", "generic_phi_scan"),
+})
+
+
+def _maybe_append_llm(
+    ops: list[Any],
+    deps: dict[str, str],
+    anchor_date: str,
+    name_field: str,
+    enable_llm: bool,
+) -> tuple[list[Any], dict[str, str]]:
+    """When --enable-llm is on: any field currently getting the standard
+    subject+generic scan pipeline also gets an `llm_scan` op appended in
+    report-only mode. Context inherits patient_name / admission_date
+    references so the LLM can spot indirect mentions."""
+    if not enable_llm:
+        return ops, deps
+    if tuple(ops) not in _LLM_SCAN_TRIGGER_OPS:
+        return ops, deps
+
+    llm_call: dict[str, Any] = {
+        "name": "llm_scan",
+        "params": {
+            "prompt": "generic_phi",
+            "context": {
+                "patient_name": f"{{{{ record.{name_field} }}}}",
+                "admission_date": f"{{{{ record.{anchor_date} }}}}",
+            },
+            "model_hint": "phi_detector",
+            "report_only": True,
+        },
+    }
+    return list(ops) + [llm_call], deps
+
+
 def build_schema(
     inspection: dict[str, Any],
     anchor_date: str,
     name_field: str,
+    enable_llm: bool = False,
 ) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     for col_name, col in inspection["columns"].items():
@@ -162,6 +199,9 @@ def build_schema(
             dtype = "date"
 
         ops, deps = _pick_operations(col_name, col, anchor_date, name_field)
+        ops, deps = _maybe_append_llm(
+            ops, deps, anchor_date, name_field, enable_llm,
+        )
         spec: dict[str, Any] = {
             "dtype": dtype,
             "description": (col.get("xml") or {}).get("question") or col_name,
@@ -191,6 +231,10 @@ def main(argv: list[str] | None = None) -> int:
                         "(Default: implant_date)")
     p.add_argument("--name-field", default="subject_name",
                    help="Column carrying the subject name (Default: subject_name)")
+    p.add_argument("--enable-llm", action="store_true", default=False,
+                   help="Append an `llm_scan` op (report-only) to every "
+                        "field currently getting subject+generic scan. "
+                        "Requires runtime --llm-config on the redact CLI.")
     args = p.parse_args(argv)
 
     inspection = json.loads(Path(args.inspection).read_text(encoding="utf-8"))
@@ -198,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         inspection,
         anchor_date=args.anchor_date,
         name_field=args.name_field,
+        enable_llm=args.enable_llm,
     )
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

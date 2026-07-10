@@ -28,6 +28,33 @@ from .redactor import TextRedactor
 from .schema import Schema, derive_schema_from_columns
 
 
+_LLM_OP_NAMES: frozenset[str] = frozenset({
+    "llm_scan", "llm_date_scan", "llm_name_scan",
+})
+
+
+def _schema_uses_llm_ops(schema: Schema) -> bool:
+    for fs in schema.fields.values():
+        for op in fs.operations:
+            if op.name in _LLM_OP_NAMES:
+                return True
+    return False
+
+
+def _apply_auto_apply_llm(schema_raw: dict) -> None:
+    """When --auto-apply-llm is set, force report_only=False on every llm_*
+    operation in the schema. Modifies `schema_raw` in place."""
+    for _fname, fspec in schema_raw.get("fields", {}).items():
+        ops = fspec.get("operations")
+        if not isinstance(ops, list):
+            continue
+        for i, op in enumerate(ops):
+            if isinstance(op, str) and op in _LLM_OP_NAMES:
+                ops[i] = {"name": op, "params": {"report_only": False}}
+            elif isinstance(op, dict) and op.get("name") in _LLM_OP_NAMES:
+                op.setdefault("params", {})["report_only"] = False
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="text_phi",
@@ -78,6 +105,25 @@ def _build_parser() -> argparse.ArgumentParser:
     r.add_argument("--literal-replacement", default="X")
     r.add_argument("--entities", default=None,
                    help="Comma-separated entity types to keep from the generic layer.")
+    # --- LLM ---
+    r.add_argument("--llm-config", default=None,
+                   help="Path to llm_config.json. Required when the schema "
+                        "uses any llm_* operation.")
+    r.add_argument("--llm-server-url", default=None,
+                   help="Override server_url from the config.")
+    r.add_argument("--llm-model", default=None,
+                   help="Override the concrete model resolved for the "
+                        "'phi_detector' hint.")
+    r.add_argument("--review-out", default=None,
+                   help="Where to write the human-reviewable LLM findings "
+                        "report. Default: <output>.llm_review.json")
+    r.add_argument("--auto-apply-llm", action="store_true", default=False,
+                   help="Apply LLM-recommended redactions automatically. "
+                        "Off by default — LLM findings are report-only.")
+    r.add_argument("--enable-record-review", action="store_true", default=False,
+                   help="Run the post-scan per-record LLM review pass.")
+    r.add_argument("--llm-cache-clear", action="store_true", default=False,
+                   help="Wipe the LLM response cache before running.")
 
     # --- schema derive ---
     s = subs.add_parser("schema", help="Schema helpers.")
@@ -144,13 +190,72 @@ def _cmd_redact(args) -> int:
 
     schema: Schema | None
     if args.schema:
-        schema = Schema.load(args.schema)
+        schema_raw = json.loads(Path(args.schema).read_text(encoding="utf-8"))
+        if args.auto_apply_llm:
+            _apply_auto_apply_llm(schema_raw)
+        schema = Schema.from_dict(schema_raw)
     else:
         schema = fmt.default_schema()
         if schema is None:
             print(f"{fmt.name}: --schema is required (no default schema for "
                   f"this format).", file=sys.stderr)
             return 2
+
+    # LLM resources setup — must happen before schema→records processing.
+    llm_client = None
+    llm_cache = None
+    prompt_registry = None
+    review_report = None
+    llm_model_used: str | None = None
+    if _schema_uses_llm_ops(schema):
+        if not args.llm_config:
+            print("Schema uses llm_* operations but --llm-config was not "
+                  "supplied. Point at a JSON config with server_url + models.",
+                  file=sys.stderr)
+            return 2
+        from .llm.cache import LLMCache
+        from .llm.client import LLMClient
+        from .llm.config import LLMConfig
+        from .llm.review_report import ReviewReport
+        from .llm.template import PromptRegistry
+        try:
+            cfg = LLMConfig.load(args.llm_config)
+        except (ValueError, IOError) as e:
+            print(f"failed to load llm config: {e}", file=sys.stderr)
+            return 2
+        if args.llm_server_url:
+            cfg = cfg.__class__(
+                server_type=cfg.server_type,
+                server_url=args.llm_server_url.rstrip("/"),
+                models=cfg.models, cache_path=cfg.cache_path,
+                seed=cfg.seed, temperature=cfg.temperature,
+                timeout_seconds=cfg.timeout_seconds,
+                max_retries=cfg.max_retries, api_key=cfg.api_key,
+            )
+        if args.llm_model:
+            models = dict(cfg.models)
+            models["phi_detector"] = args.llm_model
+            cfg = cfg.__class__(
+                server_type=cfg.server_type, server_url=cfg.server_url,
+                models=models, cache_path=cfg.cache_path,
+                seed=cfg.seed, temperature=cfg.temperature,
+                timeout_seconds=cfg.timeout_seconds,
+                max_retries=cfg.max_retries, api_key=cfg.api_key,
+            )
+        llm_client = LLMClient(cfg)
+        llm_model_used = cfg.resolve_model("phi_detector")
+        if cfg.cache_path is not None:
+            llm_cache = LLMCache(cfg.cache_path)
+            if args.llm_cache_clear:
+                n = llm_cache.clear()
+                print(f"cleared {n} entries from llm cache "
+                      f"{cfg.cache_path}", file=sys.stderr)
+        prompt_root = Path(__file__).parent / "llm" / "prompts"
+        prompt_registry = PromptRegistry(prompt_root)
+        review_out = args.review_out or f"{args.output}.llm_review.json"
+        review_report = ReviewReport(
+            path=review_out, source=in_path, schema_sha256=schema.sha256(),
+        )
 
     subject = _parse_subject(args)
     entities = _split_csv_list(args.entities)
@@ -213,8 +318,34 @@ def _cmd_redact(args) -> int:
         schema=schema,
         text_redactor=text_redactor,
         default_subject=subject,
+        llm_client=llm_client,
+        llm_cache=llm_cache,
+        prompt_registry=prompt_registry,
+        review_report=review_report,
     )
-    redacted_records, events = rr.process_records(records)
+    try:
+        redacted_records, events = rr.process_records(records)
+
+        if args.enable_record_review:
+            if llm_client is None or prompt_registry is None or review_report is None:
+                print("--enable-record-review requires --llm-config.",
+                      file=sys.stderr)
+                return 2
+            from .llm.record_reviewer import RecordReviewer
+            reviewer = RecordReviewer(
+                client=llm_client,
+                prompt_registry=prompt_registry,
+                review_report=review_report,
+                cache=llm_cache,
+            )
+            reviewer.review_records(redacted_records, schema)
+    finally:
+        if review_report is not None:
+            review_report.close()
+        if llm_cache is not None:
+            llm_cache.close()
+        if llm_client is not None:
+            llm_client.close()
 
     fmt.save(args.output, redacted_records, schema)
     fmt.validate_output(
@@ -237,6 +368,9 @@ def _cmd_redact(args) -> int:
         ) as aw:
             for ev in events:
                 aw.add_event(ev)
+
+    if llm_model_used:
+        print(f"llm_model used: {llm_model_used}", file=sys.stderr)
 
     return 0
 
