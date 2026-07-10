@@ -17,6 +17,11 @@ from .dates import (
     DateShiftToBaseOperation,
     DateYearOnlyOperation,
 )
+from .llm import (
+    LlmDateScanOperation,
+    LlmNameScanOperation,
+    LlmScanOperation,
+)
 from .passthrough import (
     ConstantReplaceOperation,
     HashFieldOperation,
@@ -45,6 +50,7 @@ _ALL_OPERATIONS: list[type[Operation]] = [
     DateYearOnlyOperation, DateRedactFullOperation,
     ZipRedactOperation, PhoneRedactOperation, EmailRedactOperation,
     SsnRedactOperation, MrnRedactOperation, UrlRedactOperation, IpRedactOperation,
+    LlmScanOperation, LlmDateScanOperation, LlmNameScanOperation,
 ]
 
 OPERATIONS: dict[str, Operation] = {cls.name: cls() for cls in _ALL_OPERATIONS}

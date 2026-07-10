@@ -1,0 +1,2277 @@
+[
+  {
+    "id": "name_01",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. John Smith for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "John Smith"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_02",
+    "categories": [
+      "name"
+    ],
+    "text": "Ann Johnson performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Ann Johnson"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_03",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: Michael Chen. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Michael Chen"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_04",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to Maria Rodriguez at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Maria Rodriguez"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_05",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse David Nguyen escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "David Nguyen"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_06",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. Sarah Williams for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Sarah Williams"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_07",
+    "categories": [
+      "name"
+    ],
+    "text": "James Brown performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "James Brown"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_08",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: Emily Davis. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Emily Davis"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_09",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to Robert Miller at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Robert Miller"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_10",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse Jennifer Wilson escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Jennifer Wilson"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_11",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. Priya Patel for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Priya Patel"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_12",
+    "categories": [
+      "name"
+    ],
+    "text": "Wei Zhang performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Wei Zhang"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_13",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: Aisha Ali. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Aisha Ali"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_14",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to Carlos Garcia at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Carlos Garcia"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_15",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse Ling Wu escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Ling Wu"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_16",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. Yusuf Ahmed for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Yusuf Ahmed"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_17",
+    "categories": [
+      "name"
+    ],
+    "text": "Olivia Martinez performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Olivia Martinez"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_18",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: Ethan Anderson. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Ethan Anderson"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_19",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to Sophia Thomas at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Sophia Thomas"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_20",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse Liam Taylor escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Liam Taylor"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_21",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. Amelia Moore for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Amelia Moore"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_22",
+    "categories": [
+      "name"
+    ],
+    "text": "Noah Jackson performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Noah Jackson"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_23",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: Isabella White. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Isabella White"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_24",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to Ava Harris at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Ava Harris"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_25",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse Mason Martin escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Mason Martin"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_01",
+    "categories": [
+      "date"
+    ],
+    "text": "The patient was admitted on 3/15/2019. Testing began the next day and continued through the week.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "3/15/2019"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_02",
+    "categories": [
+      "date"
+    ],
+    "text": "First seizure recorded on March 15, 2019. No further events over 48 hours of monitoring.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "March 15, 2019"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_03",
+    "categories": [
+      "date"
+    ],
+    "text": "Wada testing performed 2019-03-15. Results supported left-hemisphere language dominance.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "2019-03-15"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_04",
+    "categories": [
+      "date"
+    ],
+    "text": "Explant scheduled for Mar 15 pending pathology review. Family has been notified.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "Mar 15"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_05",
+    "categories": [
+      "date"
+    ],
+    "text": "Post-op MRI on March 15 showed no new lesions. Wound healing well.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "March 15"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_06",
+    "categories": [
+      "date"
+    ],
+    "text": "The patient was admitted on 07-04-2020. Testing began the next day and continued through the week.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "07-04-2020"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_07",
+    "categories": [
+      "date"
+    ],
+    "text": "First seizure recorded on December 25, 2021. No further events over 48 hours of monitoring.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "December 25, 2021"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_08",
+    "categories": [
+      "date"
+    ],
+    "text": "Wada testing performed 1/1/2022. Results supported left-hemisphere language dominance.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "1/1/2022"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_09",
+    "categories": [
+      "date"
+    ],
+    "text": "Explant scheduled for the following Tuesday pending pathology review. Family has been notified.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "the following Tuesday"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_10",
+    "categories": [
+      "date"
+    ],
+    "text": "Post-op MRI on three weeks after implant showed no new lesions. Wound healing well.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "three weeks after implant"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_11",
+    "categories": [
+      "date"
+    ],
+    "text": "The patient was admitted on two months post-op. Testing began the next day and continued through the week.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "two months post-op"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_12",
+    "categories": [
+      "date"
+    ],
+    "text": "First seizure recorded on the day after admission. No further events over 48 hours of monitoring.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "the day after admission"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_13",
+    "categories": [
+      "date"
+    ],
+    "text": "Wada testing performed early spring 2019. Results supported left-hemisphere language dominance.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "early spring 2019"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_14",
+    "categories": [
+      "date"
+    ],
+    "text": "Explant scheduled for mid-March pending pathology review. Family has been notified.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "mid-March"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_15",
+    "categories": [
+      "date"
+    ],
+    "text": "Post-op MRI on late fall of 2020 showed no new lesions. Wound healing well.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "late fall of 2020"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_16",
+    "categories": [
+      "date"
+    ],
+    "text": "The patient was admitted on Christmas 2020. Testing began the next day and continued through the week.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "Christmas 2020"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_17",
+    "categories": [
+      "date"
+    ],
+    "text": "First seizure recorded on the fourth of July. No further events over 48 hours of monitoring.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "the fourth of July"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_18",
+    "categories": [
+      "date"
+    ],
+    "text": "Wada testing performed 3/15/2019. Results supported left-hemisphere language dominance.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "3/15/2019"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_19",
+    "categories": [
+      "date"
+    ],
+    "text": "Explant scheduled for March 15, 2019 pending pathology review. Family has been notified.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "March 15, 2019"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_20",
+    "categories": [
+      "date"
+    ],
+    "text": "Post-op MRI on 2019-03-15 showed no new lesions. Wound healing well.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "2019-03-15"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_21",
+    "categories": [
+      "date"
+    ],
+    "text": "The patient was admitted on Mar 15. Testing began the next day and continued through the week.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "Mar 15"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_22",
+    "categories": [
+      "date"
+    ],
+    "text": "First seizure recorded on March 15. No further events over 48 hours of monitoring.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "March 15"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_23",
+    "categories": [
+      "date"
+    ],
+    "text": "Wada testing performed 07-04-2020. Results supported left-hemisphere language dominance.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "07-04-2020"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_24",
+    "categories": [
+      "date"
+    ],
+    "text": "Explant scheduled for December 25, 2021 pending pathology review. Family has been notified.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "December 25, 2021"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "date_25",
+    "categories": [
+      "date"
+    ],
+    "text": "Post-op MRI on 1/1/2022 showed no new lesions. Wound healing well.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "1/1/2022"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "both_01",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Sarah Williams was seen on 2019-03-15 for the annual follow-up. All AEDs at their previous doses; no side effects reported.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Sarah Williams"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "2019-03-15"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "both_02",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Note by Robert Miller on 1/1/2022: patient reports mild HA, no new seizures. Continuing current regimen.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Robert Miller"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "1/1/2022"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "both_03",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Recording session with Wei Zhang on early spring 2019 completed without issue. Task 4 was skipped due to fatigue.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Wei Zhang"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "early spring 2019"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "both_04",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Ling Wu was seen on 3/15/2019 for the annual follow-up. All AEDs at their previous doses; no side effects reported.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Ling Wu"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "3/15/2019"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "both_05",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Note by Ethan Anderson on 07-04-2020: patient reports mild HA, no new seizures. Continuing current regimen.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Ethan Anderson"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "07-04-2020"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "both_06",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Recording session with Amelia Moore on two months post-op completed without issue. Task 4 was skipped due to fatigue.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Amelia Moore"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "two months post-op"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "both_07",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Ava Harris was seen on Christmas 2020 for the annual follow-up. All AEDs at their previous doses; no side effects reported.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Ava Harris"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "Christmas 2020"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "both_08",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Note by Ann Johnson on Mar 15: patient reports mild HA, no new seizures. Continuing current regimen.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Ann Johnson"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "Mar 15"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "both_09",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Recording session with David Nguyen on the following Tuesday completed without issue. Task 4 was skipped due to fatigue.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "David Nguyen"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "the following Tuesday"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "both_10",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Emily Davis was seen on mid-March for the annual follow-up. All AEDs at their previous doses; no side effects reported.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Emily Davis"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "mid-March"
+      }
+    ],
+    "parent_id": null,
+    "perturbation": null
+  },
+  {
+    "id": "name_01__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. john smith for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "john smith"
+      }
+    ],
+    "parent_id": "name_01",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_01__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. John Simth for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "John Simth"
+      }
+    ],
+    "parent_id": "name_01",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_02__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "ann johnson performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "ann johnson"
+      }
+    ],
+    "parent_id": "name_02",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_02__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "An nJohnson performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "An nJohnson"
+      }
+    ],
+    "parent_id": "name_02",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_03__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: michael chen. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "michael chen"
+      }
+    ],
+    "parent_id": "name_03",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_03__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: Mcihael Chen. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Mcihael Chen"
+      }
+    ],
+    "parent_id": "name_03",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_04__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to maria rodriguez at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "maria rodriguez"
+      }
+    ],
+    "parent_id": "name_04",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_04__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to Maria Rodrigeuz at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Maria Rodrigeuz"
+      }
+    ],
+    "parent_id": "name_04",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_05__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse david nguyen escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "david nguyen"
+      }
+    ],
+    "parent_id": "name_05",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_05__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse DavidN guyen escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "DavidN guyen"
+      }
+    ],
+    "parent_id": "name_05",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_06__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. sarah williams for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "sarah williams"
+      }
+    ],
+    "parent_id": "name_06",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_06__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. Sara hWilliams for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Sara hWilliams"
+      }
+    ],
+    "parent_id": "name_06",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_07__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "james brown performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "james brown"
+      }
+    ],
+    "parent_id": "name_07",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_07__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Jame sBrown performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Jame sBrown"
+      }
+    ],
+    "parent_id": "name_07",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_08__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: emily davis. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "emily davis"
+      }
+    ],
+    "parent_id": "name_08",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_08__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: Emiyl Davis. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Emiyl Davis"
+      }
+    ],
+    "parent_id": "name_08",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_09__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to robert miller at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "robert miller"
+      }
+    ],
+    "parent_id": "name_09",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_09__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to Roebrt Miller at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Roebrt Miller"
+      }
+    ],
+    "parent_id": "name_09",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_10__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse jennifer wilson escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "jennifer wilson"
+      }
+    ],
+    "parent_id": "name_10",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_10__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse Jennifer Wislon escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Jennifer Wislon"
+      }
+    ],
+    "parent_id": "name_10",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_11__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. priya patel for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "priya patel"
+      }
+    ],
+    "parent_id": "name_11",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_11__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. Pryia Patel for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Pryia Patel"
+      }
+    ],
+    "parent_id": "name_11",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_12__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "wei zhang performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "wei zhang"
+      }
+    ],
+    "parent_id": "name_12",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_12__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Wei Zahng performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Wei Zahng"
+      }
+    ],
+    "parent_id": "name_12",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_13__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: aisha ali. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "aisha ali"
+      }
+    ],
+    "parent_id": "name_13",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_13__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: Aish aAli. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Aish aAli"
+      }
+    ],
+    "parent_id": "name_13",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_14__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to carlos garcia at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "carlos garcia"
+      }
+    ],
+    "parent_id": "name_14",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_14__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to Cralos Garcia at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Cralos Garcia"
+      }
+    ],
+    "parent_id": "name_14",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_15__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse ling wu escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "ling wu"
+      }
+    ],
+    "parent_id": "name_15",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_15__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse Lnig Wu escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Lnig Wu"
+      }
+    ],
+    "parent_id": "name_15",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_16__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. yusuf ahmed for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "yusuf ahmed"
+      }
+    ],
+    "parent_id": "name_16",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_16__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. Yuusf Ahmed for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Yuusf Ahmed"
+      }
+    ],
+    "parent_id": "name_16",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_17__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "olivia martinez performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "olivia martinez"
+      }
+    ],
+    "parent_id": "name_17",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_17__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Olivai Martinez performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Olivai Martinez"
+      }
+    ],
+    "parent_id": "name_17",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_18__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: ethan anderson. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "ethan anderson"
+      }
+    ],
+    "parent_id": "name_18",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_18__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: Etha nAnderson. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Etha nAnderson"
+      }
+    ],
+    "parent_id": "name_18",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_19__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to sophia thomas at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "sophia thomas"
+      }
+    ],
+    "parent_id": "name_19",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_19__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to Sophia Thmoas at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Sophia Thmoas"
+      }
+    ],
+    "parent_id": "name_19",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_20__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse liam taylor escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "liam taylor"
+      }
+    ],
+    "parent_id": "name_20",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_20__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse Laim Taylor escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Laim Taylor"
+      }
+    ],
+    "parent_id": "name_20",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_21__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. amelia moore for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "amelia moore"
+      }
+    ],
+    "parent_id": "name_21",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_21__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "The patient was seen by Dr. Amelia Moroe for the initial workup. Vitals were stable. Follow-up scheduled.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Amelia Moroe"
+      }
+    ],
+    "parent_id": "name_21",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_22__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "noah jackson performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "noah jackson"
+      }
+    ],
+    "parent_id": "name_22",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_22__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "NoahJ ackson performed the amplitude determination. No afterdischarges were noted. The patient tolerated the session well.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "NoahJ ackson"
+      }
+    ],
+    "parent_id": "name_22",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_23__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: isabella white. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "isabella white"
+      }
+    ],
+    "parent_id": "name_23",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_23__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Family present at bedside: Isabella Whtie. The patient's daughter helped translate the discussion.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Isabella Whtie"
+      }
+    ],
+    "parent_id": "name_23",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "name_24__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Provider handoff to ava harris at shift change. Recording continued without interruption.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "ava harris"
+      }
+    ],
+    "parent_id": "name_24",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_25__lower",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse mason martin escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "mason martin"
+      }
+    ],
+    "parent_id": "name_25",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "name_25__typo",
+    "categories": [
+      "name"
+    ],
+    "text": "Nurse Mason Maritn escalated concern about the patient's fatigue. Testing paused briefly.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Mason Maritn"
+      }
+    ],
+    "parent_id": "name_25",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "date_01__altdate",
+    "categories": [
+      "date"
+    ],
+    "text": "The patient was admitted on March 15, 2019. Testing began the next day and continued through the week.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "March 15, 2019"
+      }
+    ],
+    "parent_id": "date_01",
+    "perturbation": "alt_date_form"
+  },
+  {
+    "id": "date_03__altdate",
+    "categories": [
+      "date"
+    ],
+    "text": "Wada testing performed March 15, 2019. Results supported left-hemisphere language dominance.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "March 15, 2019"
+      }
+    ],
+    "parent_id": "date_03",
+    "perturbation": "alt_date_form"
+  },
+  {
+    "id": "date_05__altdate",
+    "categories": [
+      "date"
+    ],
+    "text": "Post-op MRI on 3/15 showed no new lesions. Wound healing well.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "3/15"
+      }
+    ],
+    "parent_id": "date_05",
+    "perturbation": "alt_date_form"
+  },
+  {
+    "id": "date_06__altdate",
+    "categories": [
+      "date"
+    ],
+    "text": "The patient was admitted on the fourth of July, 2020. Testing began the next day and continued through the week.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "the fourth of July, 2020"
+      }
+    ],
+    "parent_id": "date_06",
+    "perturbation": "alt_date_form"
+  },
+  {
+    "id": "date_07__altdate",
+    "categories": [
+      "date"
+    ],
+    "text": "First seizure recorded on Christmas 2021. No further events over 48 hours of monitoring.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "Christmas 2021"
+      }
+    ],
+    "parent_id": "date_07",
+    "perturbation": "alt_date_form"
+  },
+  {
+    "id": "date_18__altdate",
+    "categories": [
+      "date"
+    ],
+    "text": "Wada testing performed March 15, 2019. Results supported left-hemisphere language dominance.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "March 15, 2019"
+      }
+    ],
+    "parent_id": "date_18",
+    "perturbation": "alt_date_form"
+  },
+  {
+    "id": "date_20__altdate",
+    "categories": [
+      "date"
+    ],
+    "text": "Post-op MRI on March 15, 2019 showed no new lesions. Wound healing well.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "March 15, 2019"
+      }
+    ],
+    "parent_id": "date_20",
+    "perturbation": "alt_date_form"
+  },
+  {
+    "id": "date_22__altdate",
+    "categories": [
+      "date"
+    ],
+    "text": "First seizure recorded on 3/15. No further events over 48 hours of monitoring.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "3/15"
+      }
+    ],
+    "parent_id": "date_22",
+    "perturbation": "alt_date_form"
+  },
+  {
+    "id": "date_23__altdate",
+    "categories": [
+      "date"
+    ],
+    "text": "Wada testing performed the fourth of July, 2020. Results supported left-hemisphere language dominance.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "the fourth of July, 2020"
+      }
+    ],
+    "parent_id": "date_23",
+    "perturbation": "alt_date_form"
+  },
+  {
+    "id": "date_24__altdate",
+    "categories": [
+      "date"
+    ],
+    "text": "Explant scheduled for Christmas 2021 pending pathology review. Family has been notified.",
+    "ground_truth": [
+      {
+        "type": "DATE",
+        "matched_text": "Christmas 2021"
+      }
+    ],
+    "parent_id": "date_24",
+    "perturbation": "alt_date_form"
+  },
+  {
+    "id": "both_01__lower",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "sarah williams was seen on 2019-03-15 for the annual follow-up. All AEDs at their previous doses; no side effects reported.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "sarah williams"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "2019-03-15"
+      }
+    ],
+    "parent_id": "both_01",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "both_01__typo",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Sarah Wliliams was seen on 2019-03-15 for the annual follow-up. All AEDs at their previous doses; no side effects reported.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Sarah Wliliams"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "2019-03-15"
+      }
+    ],
+    "parent_id": "both_01",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "both_01__altdate",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Sarah Williams was seen on March 15, 2019 for the annual follow-up. All AEDs at their previous doses; no side effects reported.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Sarah Williams"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "March 15, 2019"
+      }
+    ],
+    "parent_id": "both_01",
+    "perturbation": "alt_date_form"
+  },
+  {
+    "id": "both_02__lower",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Note by robert miller on 1/1/2022: patient reports mild HA, no new seizures. Continuing current regimen.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "robert miller"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "1/1/2022"
+      }
+    ],
+    "parent_id": "both_02",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "both_02__typo",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Note by Robetr Miller on 1/1/2022: patient reports mild HA, no new seizures. Continuing current regimen.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Robetr Miller"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "1/1/2022"
+      }
+    ],
+    "parent_id": "both_02",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "both_03__lower",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Recording session with wei zhang on early spring 2019 completed without issue. Task 4 was skipped due to fatigue.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "wei zhang"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "early spring 2019"
+      }
+    ],
+    "parent_id": "both_03",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "both_03__typo",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Recording session with Wei hZang on early spring 2019 completed without issue. Task 4 was skipped due to fatigue.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Wei hZang"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "early spring 2019"
+      }
+    ],
+    "parent_id": "both_03",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "both_04__lower",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "ling wu was seen on 3/15/2019 for the annual follow-up. All AEDs at their previous doses; no side effects reported.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "ling wu"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "3/15/2019"
+      }
+    ],
+    "parent_id": "both_04",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "both_04__typo",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Lin gWu was seen on 3/15/2019 for the annual follow-up. All AEDs at their previous doses; no side effects reported.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Lin gWu"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "3/15/2019"
+      }
+    ],
+    "parent_id": "both_04",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "both_04__altdate",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Ling Wu was seen on March 15, 2019 for the annual follow-up. All AEDs at their previous doses; no side effects reported.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Ling Wu"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "March 15, 2019"
+      }
+    ],
+    "parent_id": "both_04",
+    "perturbation": "alt_date_form"
+  },
+  {
+    "id": "both_05__lower",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Note by ethan anderson on 07-04-2020: patient reports mild HA, no new seizures. Continuing current regimen.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "ethan anderson"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "07-04-2020"
+      }
+    ],
+    "parent_id": "both_05",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "both_05__typo",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Note by Ehtan Anderson on 07-04-2020: patient reports mild HA, no new seizures. Continuing current regimen.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Ehtan Anderson"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "07-04-2020"
+      }
+    ],
+    "parent_id": "both_05",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "both_05__altdate",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Note by Ethan Anderson on the fourth of July, 2020: patient reports mild HA, no new seizures. Continuing current regimen.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Ethan Anderson"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "the fourth of July, 2020"
+      }
+    ],
+    "parent_id": "both_05",
+    "perturbation": "alt_date_form"
+  },
+  {
+    "id": "both_06__lower",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Recording session with amelia moore on two months post-op completed without issue. Task 4 was skipped due to fatigue.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "amelia moore"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "two months post-op"
+      }
+    ],
+    "parent_id": "both_06",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "both_06__typo",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Recording session with Ameila Moore on two months post-op completed without issue. Task 4 was skipped due to fatigue.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Ameila Moore"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "two months post-op"
+      }
+    ],
+    "parent_id": "both_06",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "both_07__lower",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "ava harris was seen on Christmas 2020 for the annual follow-up. All AEDs at their previous doses; no side effects reported.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "ava harris"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "Christmas 2020"
+      }
+    ],
+    "parent_id": "both_07",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "both_08__lower",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Note by ann johnson on Mar 15: patient reports mild HA, no new seizures. Continuing current regimen.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "ann johnson"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "Mar 15"
+      }
+    ],
+    "parent_id": "both_08",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "both_08__typo",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Note by Ann Johsnon on Mar 15: patient reports mild HA, no new seizures. Continuing current regimen.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "Ann Johsnon"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "Mar 15"
+      }
+    ],
+    "parent_id": "both_08",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "both_09__lower",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Recording session with david nguyen on the following Tuesday completed without issue. Task 4 was skipped due to fatigue.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "david nguyen"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "the following Tuesday"
+      }
+    ],
+    "parent_id": "both_09",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "both_09__typo",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "Recording session with David gNuyen on the following Tuesday completed without issue. Task 4 was skipped due to fatigue.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "David gNuyen"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "the following Tuesday"
+      }
+    ],
+    "parent_id": "both_09",
+    "perturbation": "damerau_typo"
+  },
+  {
+    "id": "both_10__lower",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "emily davis was seen on mid-March for the annual follow-up. All AEDs at their previous doses; no side effects reported.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "emily davis"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "mid-March"
+      }
+    ],
+    "parent_id": "both_10",
+    "perturbation": "lowercase_name"
+  },
+  {
+    "id": "both_10__typo",
+    "categories": [
+      "name",
+      "date"
+    ],
+    "text": "EmilyD avis was seen on mid-March for the annual follow-up. All AEDs at their previous doses; no side effects reported.",
+    "ground_truth": [
+      {
+        "type": "PERSON",
+        "matched_text": "EmilyD avis"
+      },
+      {
+        "type": "DATE",
+        "matched_text": "mid-March"
+      }
+    ],
+    "parent_id": "both_10",
+    "perturbation": "damerau_typo"
+  }
+]

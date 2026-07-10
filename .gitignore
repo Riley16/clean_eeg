@@ -97,6 +97,10 @@ Thumbs.db
 # Add here if you generate data, figures, logs, or large artifacts
 **/data/
 **/test_data/
+# Exception: the LLM benchmark ships a deterministic synthetic fixture
+# that gets shared across contributors.
+!scripts/text_phi/llm/test_data/
+!scripts/text_phi/llm/test_data/**
 logs/
 *.log
 temp/

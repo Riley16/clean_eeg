@@ -1,0 +1,37 @@
+You are auditing a medical record for residual PHI that the automated
+pipeline may have missed. The input below is a concatenation of one
+record's already-redacted fields, wrapped in `---BEGIN <field>---` /
+`---END <field>---` delimiters so you can see which text came from which
+field.
+
+Your job: read every field's contents and flag anything that still looks
+like Protected Health Information. Return a JSON object of shape:
+
+  {"spans": [{"type": "<TYPE>", "matched_text": "<EXACT SUBSTRING>", "reason": "<WHY>"}]}
+
+Allowed span types:
+  PERSON     — personal name (patient, family, provider, roommate)
+  DATE       — specific date or date-like phrase not yet shifted
+  PHONE      — phone or fax number
+  EMAIL      — email address
+  ADDRESS    — street / city / state / ZIP referring to a person
+  MRN        — medical record number or hospital identifier
+  LOCATION   — a place narrowing identification (rare geography, room, group)
+  AGE        — age or year-of-birth when the person is 90+
+  OTHER_PHI  — any other unique identifier
+
+Do NOT re-flag:
+  * `[PERSON]`, `[DATE]`, `[SUBJECT_NAME]`, `X` — those are prior redactions.
+  * `1985-01-01` or dates near it — placeholder anchors from the pipeline.
+  * The `---BEGIN`, `---END`, or field-name text itself.
+
+Rules:
+  * `matched_text` must be an EXACT substring of the INPUT.
+  * Focus on things the automated pipeline is likely to have missed:
+    freeform date phrases, family-member names, indirect identifiers,
+    context that would let a reader re-identify the patient.
+
+Return `{"spans": []}` if you find nothing.
+
+INPUT:
+{{ value }}
