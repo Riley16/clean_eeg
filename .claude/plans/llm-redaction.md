@@ -1,35 +1,98 @@
-# Plan: LLM agent redaction pathway (v2 — local-first, model-agnostic)
+# Plan: LLM agent redaction pathway — status + runbook
 
-## Context
+## Where we are (2026-07-09)
 
-Presidio + our subject-name redactor + REDCap-driven schema handle 95% of PHI. The LLM pass exists for what they miss:
+**Architecture**: shipped. Approved plan v2 (local-first, model-agnostic, human-review-first) is fully implemented across 8 phases. All 603 unit tests pass on `text-phi-redaction` branch. The design decisions locked with the user (Ollama laptop / vLLM cluster interchangeable via config, model-agnostic through `model_hint` indirection, seed + temperature=0 for reproducibility, `report_only: true` default per LLM op, benchmark with Presidio comparison and F1 threshold) are all in code.
 
-- **Freeform dates** in prose: `"three weeks after implant"`, `"early spring '19"`.
-- **Names embedded in prose that don't match the deny-list**: family members, providers.
-- **Paraphrased identifiers**: `"the pt from the Colorado group"`, `"her son's college"`.
-- **Novel PHI patterns**: implant serial numbers with unusual formats.
+Relevant commits (branch: `text-phi-redaction`):
 
-### Constraints locked with the user
+- `764cf1c` `feat(text_phi): LLM redaction pathway — local-first, model-agnostic` (LLM subpackage, prompts, benchmark, README)
+- `a45f7c5` `feat(text_phi): wire LLM path into records, CLI, and schema generation` (Records / CLI flags / --enable-llm)
+- `ba9fc90` `docs: text-PHI and LLM redaction design plans`
+- `32a85bc` `feat(text_phi): REDCap CSV inspection + schema derivation tools`
+- `fd048cf` `feat(text_phi): schema-driven PHI redaction pipeline for .txt and CSV`
 
-- **Deployment must fit a laptop first.** The REDCap CSV work happens on the user's local machine (a MacBook, based on the file paths in this repo). We can't assume 4× L40S here — that's for other datasets. Framework must scale up to the cluster later without code changes.
-- **Model-agnostic framework.** No model is committed. The framework must let the user swap models in and out easily.
-- **The LLM server should be a general-purpose local resource** the user can also use for other tasks in the lab, not a PHI-specific silo.
-- **Reproducibility**: seed control + `temperature=0` on every call.
-- **Human-reviewable output by default** — LLM operations produce a report of `{original value, recommended redaction, spans, reasons}`; the field is not modified unless the user opts into auto-apply.
-- **Accuracy benchmark suite required** — synthetic test set of 25 name-containing + 25 date-containing free-text passages (10 overlap), plus typo/variant perturbations. We measure precision/recall/F1/latency before trusting the LLM in production.
+**Runtime**: not yet stood up. Ollama isn't installed on the laptop, no `temp/llm_config.json`, no cache DB. Before the benchmark can execute, the setup section below has to run.
 
-## Serving strategy — OpenAI-compatible everywhere
+**What's left**: (1) local Ollama install + first model pull, (2) benchmark protocol executed with high-level user guidance, (3) decision on whether the initial model is trustworthy enough for `--auto-apply-llm` or should stay report-only.
 
-Every open-source LLM server we'd consider exposes an **OpenAI-compatible chat-completions API**. We write one client against that API and swap the underlying server via config:
+## What's built
 
-| Server | Where | Structured output | Notes |
-|---|---|---|---|
-| **Ollama** | **local (laptop) — default** | `format: <json_schema>` | Best-in-class UX. `ollama pull qwen2.5:7b`; `ollama serve` on `localhost:11434`. Handles Metal on Apple Silicon, CUDA on Linux. Model swap = one command. |
-| **vLLM** | cluster | `extra_body: {guided_json: schema}` | Tensor-parallel across GPUs, continuous batching. For the L40S cluster when we get there. |
-| **llama.cpp / LM Studio** | local | JSON via grammar file | Fallback / advanced users. |
-| **OpenAI-compatible generally** | any | varies | The client detects `server_type` from config and formats the structured-output body accordingly. |
+Source under `scripts/text_phi/llm/`:
 
-**Client stays server-agnostic.** Users switch environments by editing `llm_config.json`:
+| File | Purpose |
+|---|---|
+| `config.py` | `LLMConfig` + `ServerType` enum + model registry |
+| `client.py` | Sync httpx OpenAI-compatible client; per-server-type structured output |
+| `cache.py` | SQLite content-hash cache keyed on `(server, model, prompt_hash, input_hash, context_hash, seed, temp)` |
+| `template.py` | Jinja rendering + `PromptRegistry` |
+| `response.py` | PHI span JSON schema + `matched_text`→offset resolution |
+| `review_report.py` | Human-reviewable JSON writer (findings + record-flags buckets) |
+| `record_reviewer.py` | Post-scan per-record LLM audit pass |
+| `benchmark.py` | Accuracy + latency benchmark; Presidio baseline; F1 recommendation |
+| `prompts/{generic_phi,date_scan,name_scan,record_review}.jinja` | Editable prompt templates |
+| `test_data/names_and_dates.json` | 141-passage synthetic benchmark fixture (checked in) |
+| `README.md` | Deployment + config + model docs |
+
+Operations at `scripts/text_phi/operations/llm.py`: `llm_scan`, `llm_date_scan`, `llm_name_scan` (all registered in the operations registry, all `string` dtype only, all default `report_only: true`).
+
+Wired in:
+
+- `records.py` — `OperationContext` + `RecordRedactor` carry optional `llm_client` / `llm_cache` / `prompt_registry` / `review_report` / `record_location`.
+- `cli.py` `redact` subcommand — new flags:
+  - `--llm-config PATH` (required if schema has any `llm_*` op)
+  - `--llm-server-url URL`, `--llm-model NAME` (overrides)
+  - `--review-out PATH` (default `<output>.llm_review.json`)
+  - `--auto-apply-llm` (off by default — LLM findings report-only)
+  - `--enable-record-review` (post-scan LLM audit)
+  - `--llm-cache-clear`
+- `inspect/generate_schema.py` — `--enable-llm` appends `llm_scan` with `report_only: true` to every field currently getting `[subject_name_scan, generic_phi_scan]`.
+
+Tests: 118 new mocked LLM tests, all using `httpx.MockTransport`. No live model required for CI.
+
+## LLM setup steps (do these before the benchmark)
+
+### 1. Install Ollama
+
+```bash
+brew install ollama
+```
+
+### 2. Start the server
+
+Leave this running in a background terminal (or use `brew services start ollama`):
+
+```bash
+ollama serve
+```
+
+Confirm it responded on port 11434:
+
+```bash
+curl -s http://localhost:11434/api/version
+```
+
+### 3. Pull a model
+
+Default recommendation for a MacBook with ≥16 GB unified memory:
+
+```bash
+ollama pull qwen2.5:7b-instruct
+```
+
+Alternatives to consider (in order of speed → accuracy):
+
+| Tag | Size | RAM | Use case |
+|---|---|---:|---|
+| `llama3.2:3b` | 3B | ~2.5 GB | Fastest, iteration |
+| `qwen2.5:7b-instruct` | 7B | ~5 GB | Recommended default |
+| `gemma3:4b` | 4B | ~3 GB | Alternative small |
+| `qwen2.5:14b` | 14B | ~10 GB | Higher accuracy (if 32 GB) |
+| `phi4:14b` | 14B | ~9 GB | Alternative mid-size |
+
+### 4. Write the config file
+
+Save as `temp/llm_config.json` (the redact CLI + benchmark both read this):
 
 ```json
 {
@@ -39,301 +102,139 @@ Every open-source LLM server we'd consider exposes an **OpenAI-compatible chat-c
     "phi_detector":    "qwen2.5:7b-instruct",
     "record_reviewer": "qwen2.5:7b-instruct"
   },
-  "cache_path": "temp/llm_cache.sqlite",
-  "seed": 42,
-  "temperature": 0.0,
+  "cache_path":      "temp/llm_cache.sqlite",
+  "seed":            42,
+  "temperature":     0.0,
   "timeout_seconds": 60,
-  "max_retries": 3
+  "max_retries":     3
 }
 ```
 
-For the cluster: change `server_type: "vllm"`, `server_url: "http://cluster:8000/v1"`, models to `"meta-llama/Llama-3.3-70B-Instruct"`. No code changes.
+### 5. Sanity check
 
-## Model recommendations for laptop (default)
+Confirm the client can round-trip a request:
 
-For a MacBook with ≥16 GB unified memory. All accessed via Ollama tags:
-
-| Model | Size | RAM (~q4) | Notes |
-|---|---:|---:|---|
-| **Qwen 2.5 7B Instruct** (**recommended default**) | 7B | ~5 GB | Strongest JSON reliability in class; solid at NER-style tasks; runs fine on Metal. |
-| **Llama 3.2 3B Instruct** | 3B | ~2.5 GB | Fastest local; good for iteration; may miss subtle PHI. |
-| **Qwen 2.5 14B Instruct** | 14B | ~10 GB | Higher accuracy if the laptop has 32+ GB unified. |
-| **Phi-4 14B** | 14B | ~9 GB | Competitive alternative to Qwen 14B. |
-| **Gemma 3 4B** | 4B | ~3 GB | Fast, capable middle ground. |
-
-Cluster models (same client, just config swap):
-
-| Model | vLLM ID |
-|---|---|
-| **Llama 3.3 70B Instruct** | `meta-llama/Llama-3.3-70B-Instruct` |
-| **Qwen 2.5 72B Instruct** | `Qwen/Qwen2.5-72B-Instruct` |
-| **Qwen 3 32B** | `Qwen/Qwen3-32B` |
-
-The redaction operations never reference model names — they only use `model_hint: "phi_detector"` and the config resolves that to a concrete model.
-
-## Reusability — general-purpose LLM client
-
-The client library lives at `scripts/text_phi/llm/client.py` but is written so any lab script can `from scripts.text_phi.llm.client import LLMClient` and get a plain "call a local LLM" helper. No PHI logic in `client.py`, `config.py`, `cache.py`, or `template.py` — they're the general-purpose layer.
-
-PHI-specific code (operations, prompts, review report) lives in sibling modules that build on top.
-
-## Architecture
-
-```
-scripts/text_phi/llm/
-  __init__.py
-  config.py              # LLMConfig + ServerType enum + model registry
-  client.py              # Sync httpx OpenAI-compatible client; server-type-aware structured-output body
-  cache.py               # SQLite content-hash cache; keyed by (server, model, prompt_hash, input_hash, context_hash, seed)
-  template.py            # Jinja rendering: prompt + per-key context templates
-  response.py            # Guided JSON schema for spans; matched_text → offset resolution
-  review_report.py       # Human-reviewable JSON report writer (per-field + record-level entries)
-  record_reviewer.py     # Post-hoc per-record review pass
-  benchmark.py           # Accuracy + latency benchmark (synthetic PHI test set)
-  test_data/             # Cached synthetic test fixtures (checked in)
-    names_and_dates.json
-  prompts/
-    generic_phi.jinja
-    date_scan.jinja
-    name_scan.jinja
-    record_review.jinja
-
-scripts/text_phi/operations/
-  llm.py                 # LlmScanOperation, LlmDateScanOperation, LlmNameScanOperation
-
-scripts/text_phi/cli.py  # + --llm-config, --llm-server-url, --llm-model, --review-out,
-                         #   --auto-apply-llm, --enable-record-review, --llm-cache-clear
+```bash
+python -c "
+from scripts.text_phi.llm.config import LLMConfig
+from scripts.text_phi.llm.client import LLMClient
+cfg = LLMConfig.load('temp/llm_config.json')
+with LLMClient(cfg) as c:
+    r = c.chat([{'role':'user','content':'Reply with the JSON: {\"ok\": true}'}],
+               response_schema={'type':'object','properties':{'ok':{'type':'boolean'}},
+                                'required':['ok']})
+    print(r['choices'][0]['message']['content'])
+"
 ```
 
-## Schema shape
+Expect `{"ok": true}` (or a valid JSON with an `ok` field).
 
-```json
-{
-  "name": "llm_scan",
-  "params": {
-    "prompt": "generic_phi",
-    "context": {
-      "patient_name":    "{{ record.subject_name }}",
-      "admission_date":  "{{ record.implant_date }}",
-      "field_purpose":   "Freeform clinical note from a testing-day report"
-    },
-    "model_hint": "phi_detector",
-    "report_only": true
-  }
-}
-```
+## Performance-testing protocol
 
-Convenience wrappers (`llm_date_scan`, `llm_name_scan`) hard-wire their own prompt name but accept the same `context`, `model_hint`, `report_only` params.
+The plan is: I run the benchmark autonomously against a small set of candidate models, report the numbers, and surface the go/no-go decision to the user. The user's inputs are limited to (a) which model(s) to try beyond the default and (b) whether to accept the winning model for `--auto-apply-llm`.
 
-**Context resolution:** each `context.<key>` value is a Jinja template rendered against the current record + record_context. Static strings pass through unchanged.
+### What I'll do without asking
 
-## Guided response schema (all servers)
+1. **Confirm setup** — `curl http://localhost:11434/api/version` succeeds and the sanity-check snippet returns valid JSON.
 
-```json
-{
-  "type": "object",
-  "properties": {
-    "spans": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "type":         {"type": "string", "enum": ["DATE","PERSON","PHONE","EMAIL","ADDRESS","MRN","LOCATION","AGE","OTHER_PHI"]},
-          "matched_text": {"type": "string"},
-          "reason":       {"type": "string"}
-        },
-        "required": ["type","matched_text","reason"]
-      }
-    }
-  },
-  "required": ["spans"]
-}
-```
+2. **Baseline benchmark** — Qwen 2.5 7B Instruct:
 
-Character offsets are NOT requested — LLMs are unreliable at offsets. We ask for `matched_text` + `reason` and resolve offsets client-side by searching for `matched_text` in the value. Ambiguous matches: take first occurrence; flag ambiguity in the report.
+   ```bash
+   python -m scripts.text_phi.llm.benchmark \
+       --llm-config temp/llm_config.json \
+       --output temp/bench_qwen25_7b.json
+   ```
 
-Client translates the schema into the right server-specific body:
-- **Ollama**: `{"format": <schema>}` in the request body.
-- **vLLM**: `{"extra_body": {"guided_json": <schema>}}`.
-- Others: fall back to prompt-injected JSON instructions.
+   The synthetic set is 141 passages. Expect ~10–30 min on a MacBook depending on model speed.
 
-## Reproducibility
+3. **Comparison models** — repeat with two other models the user picks below, editing `models.phi_detector` in the config between runs (and pointing `--output` at a distinct file per model):
 
-- `seed` from config (default 42) sent on every request.
-- `temperature: 0.0` (also from config).
-- Cache key includes `seed` — changing seed re-runs; same seed re-uses cache.
-- Ollama and vLLM both honor `seed` in the OpenAI-compatible payload. LM Studio partially.
-- Prompts are versioned by filename + content-hash included in the cache key so prompt edits invalidate cache.
+   ```bash
+   ollama pull <model>
+   # edit temp/llm_config.json → models.phi_detector: <model>
+   python -m scripts.text_phi.llm.benchmark --llm-config temp/llm_config.json --output temp/bench_<model>.json
+   ```
 
-## Human-reviewable report
+4. **Summary report** — I'll pull the numbers from each JSON into a short table with:
+   - PERSON precision / recall / F1
+   - DATE precision / recall / F1
+   - Latency p50 / p95
+   - Cache hit rate
+   - Presidio-baseline delta (LLM F1 minus Presidio F1 per type)
+   - Recommendation string from each report
 
-Every LLM finding produces a report entry:
+5. **Cost audit** — I'll `du -h temp/llm_cache.sqlite` after the runs to confirm cache size is reasonable and report the disk footprint.
 
-```json
-{
-  "record_location": {"row": 3},
-  "field": "note_text",
-  "operation": "llm_scan",
-  "value_seen": "The patient's daughter Ann helped translate on 3/15...",
-  "recommended_redacted": "The patient's daughter [PERSON] helped translate on [DATE]...",
-  "spans": [
-    {"start": 22, "end": 25, "type": "PERSON", "matched_text": "Ann",
-     "reason": "First name of patient's daughter — indirect identifier"},
-    {"start": 38, "end": 42, "type": "DATE",   "matched_text": "3/15",
-     "reason": "Specific date not shifted; leaks admission timing"}
-  ]
-}
-```
+### What I need from the user (before I start)
 
-Two modes per operation (set via `params.report_only`):
+1. Which 1–2 alternative models to benchmark alongside Qwen 2.5 7B (from the table above, or user-supplied).
+2. F1 acceptance threshold for `--auto-apply-llm` — plan default is 0.80 per entity type, ask if the user wants to raise it (e.g. 0.90) for a clinical dataset.
+3. Confirmation that the initial-load Ollama model download (~5 GB per model) is fine to run over their network.
 
-- **`report_only: true` (default)** — value passes through unchanged; report captures the recommendation.
-- **`report_only: false`** — value is redacted per LLM spans AND the report is written for after-the-fact spot-checking.
+### What I will NOT do without asking
 
-Global override via CLI `--auto-apply-llm` (off by default).
+- Enable `--auto-apply-llm` on real data. Even after benchmarking, the CSV pipeline stays in report-only mode until the user explicitly opts in.
+- Run the benchmark against the real REDCap CSV. The 141-passage synthetic set is the acceptance test.
+- Modify the prompts. If benchmark numbers are low, I'll propose prompt edits and ask before applying.
+- Push the branch to any remote or open a PR.
+- Delete the cache DB. Every rerun is cheap because of the SHA-256 keyed cache.
 
-## Softer per-record review pass
+### Go / no-go decision matrix
 
-`RecordReviewer` runs *after* `RecordRedactor.process_records()`. For each record:
+After the benchmark, per model tested:
 
-1. Concatenate all redacted string fields with delimiters (`---BEGIN <field>---\n<value>\n---END <field>---`).
-2. Send to the LLM with `record_review.jinja`.
-3. Parse spans → map back to field by delimiter position.
-4. Append to `llm_review.json` under `record_review_flags`.
+| PERSON F1 | DATE F1 | My recommendation |
+|---|---|---|
+| ≥ 0.90 | ≥ 0.90 | Safe for `--auto-apply-llm` on this dataset. |
+| ≥ 0.80 | ≥ 0.80 | OK for `--auto-apply-llm` **if** paired with human spot-check of the review report. |
+| Either < 0.80 | Either < 0.80 | Stay report-only. Try a larger model, then decide. |
 
-Never auto-modifies — 100% audit.
+The `benchmark.py` output already contains a `"recommendation"` string encoding this — I'll surface it verbatim in my summary.
 
-## Caching
+## Runbook after benchmarks pass
 
-SQLite table:
+Once we've picked a model:
 
-```
-CREATE TABLE llm_cache(
-  cache_key   TEXT PRIMARY KEY,
-  response    TEXT NOT NULL,
-  created_at  INTEGER NOT NULL
-)
-```
+1. Update `temp/llm_config.json` to lock the winner in `models.phi_detector` and `models.record_reviewer`.
 
-Key = `sha256(f"{server_type}|{model}|{prompt_hash}|{input_hash}|{context_hash}|{seed}|{temperature}")`. Survives across runs. `--llm-cache-clear` purges.
+2. Regenerate the schema with LLM ops appended:
 
-## Benchmark suite (`benchmark.py`)
+   ```bash
+   python -m scripts.text_phi.inspect.generate_schema \
+       --inspection temp/inspection.json \
+       --output temp/redcap.schema.json \
+       --enable-llm
+   ```
 
-Synthetic test set generated deterministically (seed-controlled) and cached under `llm/test_data/names_and_dates.json`. Composition:
+3. Redact:
 
-- **25 name-containing passages** (2–4 sentences each). Names drawn from a diverse pool; embedded in realistic clinical prose.
-- **25 date-containing passages** (2–4 sentences each). Dates in mixed formats: `"3/15/2019"`, `"March 15"`, `"three weeks after implant"`, `"the following Tuesday"`, `"early spring 2019"`.
-- **10 of these overlap** (contain both a name and a freeform date).
+   ```bash
+   python -m scripts.text_phi.cli redact \
+       --input YOUR_DATA.csv \
+       --output temp/data_redacted.csv \
+       --schema temp/redcap.schema.json \
+       --llm-config temp/llm_config.json \
+       --audit-out temp/audit.json
+   ```
 
-Then perturbation set:
-- **Typo variants** of each name (Damerau–Levenshtein 1–2): `"Ann"` → `"Ana"`, `"An"`, `"Anne"`.
-- **Case variants**: `"john smith"`, `"JOHN SMITH"`.
-- **Nickname variants**: `"John"` → `"Johnny"`, `"Jack"`.
-- **Date phrasing variants**: `"March"` → `"Mar"`, `"3"`, `"the third month"`.
+   `temp/data_redacted.csv.llm_review.json` collects the LLM's proposed spans. The redacted CSV is hard-check-only until the user adds `--auto-apply-llm`.
 
-Each passage is labeled with ground-truth spans (start, end, type). Benchmark measures:
+4. Optional post-scan record-level audit (adds ~3975 more LLM calls, one per record):
 
-- **Precision / Recall / F1** per entity type (PERSON, DATE, OTHER_PHI).
-- **Latency** per call: p50, p95, p99.
-- **Cost** in cache hits vs misses.
-- **Comparison against Presidio + subject-name baseline** on the same set — quantifies what the LLM adds.
+   ```
+   ... redact command as above ... --enable-record-review
+   ```
 
-Command:
-```
-python -m scripts.text_phi.llm.benchmark \
-    --llm-config temp/llm_config.json \
-    --output temp/llm_benchmark.json \
-    [--regenerate-test-data]
-```
+## Deferred (Phase 2, not on this iteration)
 
-The report ends with a "recommendation" section: if F1 < 0.80 for either PERSON or DATE, warn that the model isn't reliable enough for auto-apply mode; recommend upping to a bigger model or disabling auto-apply.
+- `apply_review.py` — script that reads the `llm_review.json`, lets the user accept/reject findings, and applies the accepted subset to the CSV.
+- Async client + client-side batching if the sequential-per-field throughput becomes a bottleneck at REDCap scale.
+- Per-op model overrides at schema level (currently one model per `model_hint` in the config).
+- LLM ops on non-string dtypes.
+- Prompt A/B testing / versioning.
 
-## CLI additions
+## Out of scope for this plan
 
-New flags on `text_phi redact`:
-
-- `--llm-config PATH` — enables LLM ops. Required when the schema uses any `llm_*` operation.
-- `--llm-server-url URL` — override server URL from config.
-- `--llm-model NAME` — override the concrete model for `phi_detector` hint (convenience for testing).
-- `--review-out PATH` — where to write `llm_review.json` (default `<output>.llm_review.json`).
-- `--auto-apply-llm` — set `report_only=false` globally. Off by default.
-- `--enable-record-review` — run the post-scan `RecordReviewer` pass. Off by default.
-- `--llm-cache-clear` — wipe cache before running.
-
-Schema-load-time validation: if any field's operations include an `llm_*` op AND `--llm-config` isn't supplied, raise with a helpful error.
-
-## Schema generation integration
-
-`generate_schema.py` gains `--enable-llm`. When on: for each column currently getting `[subject_name_scan, generic_phi_scan]`, append `llm_scan` with `report_only: true`, `prompt: "generic_phi"`, and `context.patient_name` / `context.admission_date` inherited from `depends_on`. Identifier-flagged and file-type columns are unchanged.
-
-## Tests
-
-Coverage target ≥ 90% for the new `llm/` module. All LLM-dependent tests use a **mocked** HTTP client — no live model required for CI. The benchmark is a separate opt-in script that DOES require a live model.
-
-- `test_client.py` — payload format per server type (Ollama vs vLLM structured-output), retries, timeout, non-200.
-- `test_cache.py` — hit/miss, key stability across process restarts, `--llm-cache-clear`, seed propagation into key.
-- `test_template.py` — Jinja rendering; per-key context templates; missing-var behavior.
-- `test_response.py` — spans → RedactionSpan; matched_text lookup; ambiguity flagging; malformed JSON.
-- `test_review_report.py` — report file structure, append semantics.
-- `test_llm_operations.py` — `LlmScanOperation` with mock client covering report_only=true (value unchanged), report_only=false (value redacted), context template resolution, empty value passthrough, cache-hit path.
-- `test_record_reviewer.py` — concatenation format, per-field attribution from delimiter positions.
-- `test_benchmark.py` — synthetic test-set generation is deterministic under a seed; scoring functions produce expected metrics on hand-crafted mock LLM responses.
-
-Existing 89+ inspect tests, 449 pipeline tests still pass.
-
-## Deployment docs
-
-`scripts/text_phi/llm/README.md`:
-
-- **Laptop path (Ollama)**: `brew install ollama`; `ollama serve`; `ollama pull qwen2.5:7b-instruct`. That's it. Copy the sample `llm_config.json` and run.
-- **Cluster path (vLLM)**: `pip install vllm`; `vllm serve <model> --tensor-parallel-size 4 ...`; swap config `server_type` + `server_url`.
-- Config file field reference.
-- Cache management + expected sizes.
-- Model-swap workflow (`ollama pull <tag>`, edit config, re-run).
-- Benchmark workflow.
-
-## Dependencies
-
-`pyproject.toml` gets `httpx` and `jinja2` in optional-dependencies (`llm` extra). Ollama and vLLM are external installs — not project deps.
-
-## Migration path
-
-Each phase runs `pytest tests/text_phi/` before moving on.
-
-**Phase A — General-purpose LLM client (no PHI logic).** `config.py`, `client.py` (Ollama + vLLM structured-output support), `cache.py`, `template.py`, `response.py`. Tests fully mocked.
-
-**Phase B — PHI operations.** `operations/llm.py` (`LlmScanOperation` + wrappers). Register. Schema layer accepts them.
-
-**Phase C — Report writer.** `review_report.py`. Standalone.
-
-**Phase D — CLI integration.** `cli.py` new flags, schema-validate-time check, wire report writer into redact flow.
-
-**Phase E — Record reviewer.** `record_reviewer.py` + prompt. `--enable-record-review` flag.
-
-**Phase F — Schema generation.** `--enable-llm` in `generate_schema.py`.
-
-**Phase G — Prompts + README.**
-
-**Phase H — Benchmark suite.** Synthetic data generator + scoring + comparison-with-Presidio report.
-
-## End-to-end verification
-
-1. `pytest tests/text_phi/ --cov=scripts/text_phi` — coverage ≥ 90% for `llm/`, existing suite still green.
-2. User installs Ollama on their MacBook, pulls `qwen2.5:7b-instruct`, starts `ollama serve`.
-3. User runs `python -m scripts.text_phi.llm.benchmark --llm-config temp/llm_config.json --output temp/bench.json`. Reads the F1/latency numbers; decides whether to enable `--auto-apply-llm` or stay report-only.
-4. User regenerates schema with `--enable-llm`.
-5. User runs `text_phi redact` with `--llm-config`; observes:
-   - `temp/llm_cache.sqlite` growing across runs.
-   - `temp/data_redacted.csv` where LLM ops have `report_only: true` shows only hard-check redactions.
-   - `temp/llm_review.json` populated with per-field findings + record_review flags.
-6. User spot-checks the review report; approves/rejects findings. Application script (`apply_review.py`) deferred to Phase 2.
-7. Cluster path: user swaps config `server_type: "vllm"` + points at their vLLM endpoint. Zero code changes.
-
-## Out of scope
-
-- **Application script** for approved review findings — deferred.
-- **Async client + client-side batching** — add if throughput requires.
-- **Per-op model overrides** at schema level.
-- **LLM ops on non-string dtypes**.
-- **Fine-tuning**, prompt A/B testing.
-- **Field-level attribution refinement** for record review beyond delimiter parsing.
+- Fine-tuning any model.
+- vLLM cluster setup (documented in the module README; not on the critical path for the REDCap CSV).
+- Streaming responses (not needed given per-field small requests).
