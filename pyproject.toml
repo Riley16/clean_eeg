@@ -27,6 +27,7 @@ test = ["pytest"]
 
 [project.scripts]
 print-edf-header = "clean_eeg.print_edf_header:main"
+detect-edf-names = "clean_eeg.detect_name:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

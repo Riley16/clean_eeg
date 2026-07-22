@@ -10,6 +10,11 @@ from typing import Union
 from datetime import datetime, timedelta
 from tqdm import tqdm
 from clean_eeg.anonymize import redact_subject_name, PersonalName, SubjectNameRedactor
+from clean_eeg.detect_name import (
+    DEFAULT_NAME_CSV,
+    detect_subject_name,
+    write_name_csv_row,
+)
 from clean_eeg.load_eeg import load_edf, write_edf_pyedflib
 from clean_eeg.log import logged_input, setup_logger, get_logger, close_logger
 from clean_eeg.modify_edf_inplace import (
@@ -862,22 +867,97 @@ def get_clean_eeg_cli_arguments():
     import argparse
     import os
 
+    def detect_name_from_headers(args):
+        """Read the subject's name out of the EDF headers in input_path.
+
+        Returns the DetectionResult, or None if input_path isn't a readable
+        directory yet (validate_cli_arguments reports that later).
+
+        Any detected name text is registered as PHI with the logger BEFORE
+        it is printed — the detected name is echoed to the console during
+        arg parsing, long before the main PHI registration at the bottom of
+        this module, and log.out is shared with the data team.
+        """
+        if not args.input_path or not os.path.exists(args.input_path):
+            return None
+        detection = detect_subject_name(args.input_path)
+        logger = get_logger()
+        if logger is not None:
+            for token in detection.name_tokens():
+                logger.add_phi(token)
+            logger.rescrub()
+        if detection.ok:
+            middle = " ".join(detection.name.middle_names)
+            print(f"Detected subject name in EDF headers: "
+                  f"first={detection.name.first_name!r} middle={middle!r} "
+                  f"last={detection.name.last_name!r}")
+            print("Header name ordering is not standardized across recording "
+                  "systems — check the split above before accepting it.")
+        else:
+            print(f"Could not auto-detect the subject name from the EDF "
+                  f"headers: {detection.reason()}.")
+        return detection
+
     def prompt_if_missing(args):
         """Prompt the user interactively for any missing required arguments."""
 
-        # Required fields that must be non-empty
-        required_fields = {
-            "input_path":   "Enter path to all EDF files: ",
-            "subject_code": "Enter subject code (e.g., R1755A): ",
-            "first_name":   "Enter subject first name: ",
-            "last_name":    "Enter subject last name: ",
-        }
-
-        # Prompt for required arguments
-        for attr, prompt in required_fields.items():
+        # Path and subject code first — the name is read from the EDF
+        # headers under input_path, so it must be known before we can
+        # offer detected defaults for the name fields.
+        for attr, prompt in (("input_path", "Enter path to all EDF files: "),
+                             ("subject_code", "Enter subject code (e.g., R1755A): ")):
             if getattr(args, attr) in (None, ""):
                 value = logged_input(prompt).strip()
                 setattr(args, attr, value)
+
+        detection = detect_name_from_headers(args)
+        detected = detection.name if (detection is not None and detection.ok) else None
+
+        if args.name_csv:
+            if detection is None:
+                print("WARNING: skipping ID->name CSV — input path is not readable.")
+            else:
+                # Path only; the CSV's contents are PHI and never logged.
+                csv_path = write_name_csv_row(detection,
+                                              subject_code=args.subject_code,
+                                              csv_path=args.name_csv)
+                print(f"Recorded detected name in ID->name CSV (contains PHI): {csv_path}")
+
+        if args.auto_name:
+            # Batch mode: no prompts. Explicit --first_name/--last_name still
+            # win; anything missing must come from detection or we stop,
+            # rather than proceeding with an incomplete name (which would
+            # silently under-redact).
+            if detected is None:
+                reason = detection.reason() if detection is not None else \
+                    "input path is not readable"
+                raise ValueError(
+                    f"--auto_name was requested but the subject name could not "
+                    f"be detected from the EDF headers: {reason}. Re-run with "
+                    f"--first_name / --last_name (and --middle_name or "
+                    f"--no_middle_name) supplied explicitly.")
+            if not args.first_name:
+                args.first_name = detected.first_name
+            if not args.last_name:
+                args.last_name = detected.last_name
+            if getattr(args, "no_middle_name", False):
+                args.middle_name = ""
+            elif args.middle_name in (None, "", "NOT_SPECIFIED"):
+                args.middle_name = "_".join(detected.middle_names)
+            return args
+
+        # Interactive: detected values are offered as defaults, never
+        # applied silently — pressing Enter accepts, typing overrides.
+        for attr, prompt, default in (
+            ("first_name", "Enter subject first name",
+             detected.first_name if detected else ""),
+            ("last_name", "Enter subject last name",
+             detected.last_name if detected else ""),
+        ):
+            if getattr(args, attr) in (None, ""):
+                suffix = f" [{default}]" if default else ""
+                value = logged_input(f"{prompt}{suffix}: ").strip()
+                setattr(args, attr, value or default)
 
         # Middle name: optional, but still prompt if missing.
         # --no_middle_name short-circuits the prompt entirely (the flag
@@ -886,14 +966,20 @@ def get_clean_eeg_cli_arguments():
         if getattr(args, "no_middle_name", False):
             args.middle_name = ""
         elif args.middle_name in (None, "", "NOT_SPECIFIED"):
+            detected_middle = "_".join(detected.middle_names) if detected else ""
+            suffix = f" [{detected_middle}]" if detected_middle else ""
             mn = logged_input(
-                "Enter subject middle name(s) "
-                "(use underscores between multiple names; press Enter to skip; "
+                "Enter subject middle name(s)"
+                f"{suffix} "
+                "(use underscores between multiple names; press Enter to "
+                f"{'accept the detected value' if detected_middle else 'skip'}; "
                 "or pass --no_middle_name on the command line for a "
                 "non-interactive skip): "
             ).strip()
             if mn:  # Only override default if user typed something
                 args.middle_name = mn
+            elif detected_middle:
+                args.middle_name = detected_middle
 
         return args
 
@@ -926,6 +1012,21 @@ def get_clean_eeg_cli_arguments():
                              'Mutually exclusive with --middle_name.')
     parser.add_argument("--last_name", type=str, default='',
                         help="Subject last name (required)")
+    parser.add_argument("--auto_name", action="store_true",
+                        help="Take the subject name from the EDF headers "
+                             "without prompting (for batch runs). Aborts if "
+                             "the header name is missing, ambiguous, or only "
+                             "an initial. Explicit --first_name/--last_name "
+                             "still take precedence. Without this flag, the "
+                             "detected name is offered as the default in the "
+                             "interactive prompts.")
+    parser.add_argument("--name_csv", type=str, nargs='?', const=DEFAULT_NAME_CSV,
+                        default=None,
+                        help="Record the detected header name in an ID->name "
+                             "CSV for a manual review pass. Defaults to "
+                             f"{DEFAULT_NAME_CSV} when passed without a value. "
+                             "The CSV contains PHI in the clear and is never "
+                             "written to the output directory.")
     parser.add_argument("--raise_errors", action="store_true",
                         help="Raise errors instead of warnings for debugging")
     parser.add_argument("--verbosity", type=int, default=1,

@@ -11,6 +11,10 @@ from presidio_anonymizer.entities import OperatorConfig
 from rapidfuzz.distance import Levenshtein
 from nicknames import NickNamer
 
+# PersonalName lives in names.py (no presidio/spaCy imports) so lightweight
+# tools can use it; re-exported here since callers import it from anonymize.
+from clean_eeg.names import PersonalName, normalize_name_token  # noqa: F401
+
 REDACT_NAME_REPLACEMENT = "X"
 
 
@@ -25,11 +29,6 @@ def normalize_name_tokens(full_name: str, min_token_length=2) -> List[str]:
     if not tokens:
         raise ValueError(f"No valid name tokens found in: {full_name}")
     return tokens
-
-def normalize_name_token(name: str) -> str:
-    # passthrough
-    return name
-
 
 def strip_punct(s: str) -> str:
     """Remove apostrophes/hyphens for normalization."""
@@ -229,31 +228,6 @@ def build_title_name_pattern(first_name_token: str, last_name_token: str,
     branches.append(pat_lastonly)
 
     return "(?:" + "|".join(branches) + ")"
-
-
-class PersonalName():
-    def __init__(self,
-                 first_name: str,
-                 middle_names: List[str],
-                 last_name: str):
-        self.first_name = first_name
-        self.last_name = last_name
-        self.middle_names = middle_names
-
-    def get_full_name(self) -> str:
-        """
-        Get the full name as a string.
-        """
-        names = [self.first_name] + self.middle_names + [self.last_name]
-        return " ".join(names).strip()
-    
-    def get_normalized_tokens(self) -> List[str]:
-        """
-        Get the normalized tokens of the full name.
-        """
-        return [normalize_name_token(self.first_name),
-               *[normalize_name_token(m) for m in self.middle_names],
-               normalize_name_token(self.last_name)]
 
 
 class TitleAndInitialsRecognizer(PatternRecognizer):

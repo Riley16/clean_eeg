@@ -72,6 +72,51 @@ If the subject has multiple middle names, separate them with underscores:
 
 Any required arguments not provided on the command line will be prompted for interactively. The path to the de-identified files will be printed once the process finishes.
 
+## Automatic name detection
+
+The subject's name is usually already in the EDF header (bytes 8–87, the EDF+ `patient_id` field). The pipeline reads it from every EDF in `--input_path` before prompting and offers the parsed first/middle/last as the prompt defaults — press Enter to accept, or type a different value to override:
+
+```
+Detected subject name in EDF headers: first='John' middle='Paul' last='Smith'
+Header name ordering is not standardized across recording systems — check the split above before accepting it.
+Enter subject first name [John]:
+```
+
+For batch runs, `--auto_name` accepts the detected name without prompting:
+
+```
+python -m clean_eeg.clean_subject_eeg \
+  --input_path /path/to/subject/edf/files \
+  --subject_code SUBJECT_CODE \
+  --auto_name
+```
+
+Explicit `--first_name` / `--last_name` / `--middle_name` still take precedence over anything detected. `--auto_name` **aborts** rather than guessing when the header name is:
+
+- missing or already de-identified (`X`, a subject code)
+- a single token, so first and last name can't be separated
+- only an initial for the first or last name (e.g. `L. Smith`) — a lone initial gives the redactor nothing to match on
+
+Ordering is inferred from the delimiter: `SMITH^JOHN^P` and `Smith, John P` are read as *Last, First, Middle*; anything else (including the EDF+ underscore form `John_Paul_Smith`) is read as *First Middle Last*. Because that inference can be wrong, always eyeball the printed split.
+
+Note that a middle name absent from the header is treated as "no middle name" under `--auto_name`. If the subject has a middle name that the recording system omitted, pass `--middle_name` explicitly so it is also redacted from annotations.
+
+### Recording detected names for review (`detect-edf-names`)
+
+`detect-edf-names` reads the header names without modifying anything and records them in a CSV so subject-code↔name mappings can be checked in one pass:
+
+```
+detect-edf-names /path/to/subject/edfs --subject_code R1755A
+detect-edf-names /path/to/parent_dir --recursive     # one row per subject directory
+detect-edf-names /path/to/subject/edfs --no_csv      # print only
+```
+
+The CSV defaults to `~/sens_data/detected_names.csv` (directory created `0700`, file `0600`) and holds `subject_code`, `patient_code` (hospital MRN from the header), the raw `patient_id`, the parsed first/middle/last, and a `parse_status` explaining any declines. Re-scanning the same directory updates its row rather than appending a duplicate.
+
+The main pipeline can record the same row with `--name_csv` (optionally with a path).
+
+**This CSV contains PHI in the clear.** It is deliberately written outside the repository and outside the de-identified output directory, is never copied alongside the output EDFs, and its contents are never written to `log.out`. Keep it off shared or backed-up locations and delete it once the review is done.
+
 ## Inspecting EDF headers (debugging)
 
 The package ships a `print-edf-header` command for dumping the raw bytes and parsed values of every EDF header field. It works even when `pyedflib` refuses to open the file (which is typically when you'd reach for it — e.g. a Nihon Kohden export with empty/blank numeric fields). Operates on a single `.edf` file or every `.edf` in a directory.
