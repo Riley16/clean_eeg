@@ -192,12 +192,27 @@ def extract_patient_code(patient_id: str) -> str:
     return fields[0] if fields else ""
 
 
-def list_edf_files(input_path: str) -> List[str]:
+def list_edf_files(input_path: str, recursive: bool = True) -> List[str]:
     """Full paths of the subject's EDF files, excluding annotation stubs
-    written by a previous in-place de-identification run."""
+    written by a previous in-place de-identification run.
+
+    Recurses into subdirectories by default, so a subject folder is found
+    regardless of how the export nested the files (e.g.
+    ``R1001P/R1001P/day1/*.edf``). Pass ``recursive=False`` to read only
+    the files directly in ``input_path``.
+    """
     if not os.path.isdir(input_path):
         return [input_path] if input_path.lower().endswith(".edf") else []
     out = []
+    if recursive:
+        for dirpath, _dirnames, filenames in os.walk(input_path):
+            for fname in filenames:
+                if not fname.lower().endswith(".edf"):
+                    continue
+                if _is_annotation_stub(fname):
+                    continue
+                out.append(os.path.join(dirpath, fname))
+        return sorted(out)
     for fname in sorted(os.listdir(input_path)):
         if not fname.lower().endswith(".edf"):
             continue
@@ -272,16 +287,19 @@ class DetectionResult:
         return [t for t in tokens if t]
 
 
-def detect_subject_name(input_path: str) -> DetectionResult:
+def detect_subject_name(input_path: str,
+                        recursive: bool = True) -> DetectionResult:
     """Read the patient name from every EDF in ``input_path`` and parse it.
 
-    All non-placeholder files must agree on the name; a disagreement means
-    the directory may hold more than one subject, so nothing is detected
-    (the pipeline's own ``_check_subject_name_consistency`` reports the
-    details later).
+    By default recurses into subdirectories, treating every EDF found
+    beneath ``input_path`` as belonging to the same subject. All
+    non-placeholder files must agree on the name; a disagreement means the
+    tree may hold more than one subject, so nothing is detected (the
+    pipeline's own ``_check_subject_name_consistency`` reports the details
+    later).
     """
     per_file = {}
-    for path in list_edf_files(input_path):
+    for path in list_edf_files(input_path, recursive=recursive):
         header = read_main_header(path)
         patient_id = header.get("patient_id", "")
         if not isinstance(patient_id, str):
@@ -380,17 +398,25 @@ def write_name_csv_row(result: DetectionResult,
 # CLI:  detect-edf-names
 # ---------------------------------------------------------------------------
 
-def _subject_dirs(path: str, recursive: bool) -> List[str]:
-    """Directories to scan. Without --recursive, just ``path`` itself.
-    With it, every subdirectory containing at least one EDF file."""
-    if not recursive:
+def _subject_dirs(path: str, per_subject_dir: bool) -> List[str]:
+    """Subject directories to scan.
+
+    Default: ``[path]`` — every EDF found anywhere beneath ``path`` is
+    treated as one subject (``detect_subject_name`` recurses).
+
+    ``per_subject_dir``: batch mode for a parent folder — each immediate
+    subdirectory that has any EDF beneath it is scanned as its own
+    subject. Use this when ``path`` holds many subjects side by side."""
+    if not per_subject_dir:
         return [path]
-    found = []
-    for dirpath, _dirnames, filenames in os.walk(path):
-        if any(f.lower().endswith(".edf") and not _is_annotation_stub(f)
-               for f in filenames):
-            found.append(dirpath)
-    return sorted(found)
+    if not os.path.isdir(path):
+        return [path]
+    subs = []
+    for entry in sorted(os.listdir(path)):
+        full = os.path.join(path, entry)
+        if os.path.isdir(full) and list_edf_files(full, recursive=True):
+            subs.append(full)
+    return subs
 
 
 def main():
@@ -401,10 +427,16 @@ def main():
                     "modify any EDF file. The CSV contains PHI in the clear — "
                     "keep it out of shared/backed-up locations.")
     parser.add_argument("paths", nargs="+",
-                        help="Subject EDF directory (or a single .edf file)")
-    parser.add_argument("--recursive", action="store_true",
-                        help="Scan each subdirectory containing EDF files as "
-                             "its own subject")
+                        help="Subject EDF directory (or a single .edf file). "
+                             "EDF files are found recursively beneath it and "
+                             "treated as one subject.")
+    parser.add_argument("--per_subject_dir", "--recursive", action="store_true",
+                        dest="per_subject_dir",
+                        help="Batch mode: treat each immediate subdirectory "
+                             "of the given path as a separate subject (each "
+                             "still searched recursively for its EDFs). Use "
+                             "when the path holds many subjects side by side. "
+                             "(--recursive is a deprecated alias.)")
     parser.add_argument("--subject_code", type=str, default="",
                         help="Subject code to record alongside the detected "
                              "name (only meaningful for a single directory)")
@@ -419,7 +451,7 @@ def main():
         if not os.path.exists(path):
             print(f"ERROR: path does not exist: {path}", file=sys.stderr)
             return 1
-        targets.extend(_subject_dirs(path, args.recursive))
+        targets.extend(_subject_dirs(path, args.per_subject_dir))
 
     if args.subject_code and len(targets) > 1:
         print("ERROR: --subject_code is only valid when scanning a single "

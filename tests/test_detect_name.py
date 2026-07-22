@@ -166,6 +166,27 @@ def test_detect_subject_name_single_file_path(tmp_path):
     assert result.ok
 
 
+def test_detect_subject_name_finds_nested_edfs(tmp_path):
+    """EDFs buried in subdirectories are found and aggregated as one subject."""
+    (tmp_path / "day1").mkdir()
+    (tmp_path / "day2" / "session_a").mkdir(parents=True)
+    write_fake_edf(tmp_path / "day1" / "a.edf", "1234567 M 09-APR-1955 John_Smith")
+    write_fake_edf(tmp_path / "day2" / "session_a" / "b.edf",
+                   "1234567 M 09-APR-1955 John_Smith")
+    result = detect_subject_name(str(tmp_path))
+    assert result.ok
+    assert result.n_files == 2
+    assert result.name.last_name == "Smith"
+
+
+def test_list_edf_files_non_recursive(tmp_path):
+    (tmp_path / "nested").mkdir()
+    write_fake_edf(tmp_path / "top.edf", "1 M 09-APR-1955 John_Smith")
+    write_fake_edf(tmp_path / "nested" / "deep.edf", "1 M 09-APR-1955 John_Smith")
+    assert len(list_edf_files(str(tmp_path), recursive=False)) == 1
+    assert len(list_edf_files(str(tmp_path), recursive=True)) == 2
+
+
 def test_name_tokens_include_raw_header_text(tmp_path):
     """The tokens registered as PHI must cover the raw header form too, so
     the un-parsed string never survives in log.out."""
@@ -303,6 +324,37 @@ def test_interactive_typed_name_overrides_detected(tmp_path, monkeypatch):
     args = _run_cli(monkeypatch, ["--input_path", str(tmp_path),
                                   "--subject_code", "R1755A"])
     assert (args.first_name, args.last_name) == ("Jonathan", "Smythe")
+
+
+def test_detect_edf_names_cli_recursive_single_subject(tmp_path, capsys):
+    from clean_eeg.detect_name import main
+    import sys
+    (tmp_path / "day1").mkdir()
+    write_fake_edf(tmp_path / "day1" / "a.edf", "1234567 M 09-APR-1955 John_Smith")
+    csv_path = str(tmp_path / "sens" / "names.csv")
+    sys.argv = ["detect-edf-names", str(tmp_path), "--subject_code", "R1001P",
+                "--csv", csv_path]
+    assert main() == 0
+    with open(csv_path) as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    assert rows[0]["detected_last"] == "Smith"
+
+
+def test_detect_edf_names_cli_per_subject_dir(tmp_path, capsys):
+    from clean_eeg.detect_name import main
+    import sys
+    for subj, name in (("R1001P", "John_Smith"), ("R1002P", "Jane_Doe")):
+        d = tmp_path / subj / "day1"
+        d.mkdir(parents=True)
+        write_fake_edf(d / "a.edf", f"1 M 09-APR-1955 {name}")
+    csv_path = str(tmp_path / "names.csv")
+    sys.argv = ["detect-edf-names", str(tmp_path), "--per_subject_dir",
+                "--csv", csv_path]
+    assert main() == 0
+    with open(csv_path) as f:
+        rows = list(csv.DictReader(f))
+    assert sorted(r["detected_last"] for r in rows) == ["Doe", "Smith"]
 
 
 def test_name_csv_flag_writes_row(tmp_path, monkeypatch):

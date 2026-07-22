@@ -107,9 +107,11 @@ Note that a middle name absent from the header is treated as "no middle name" un
 
 ```
 detect-edf-names /path/to/subject/edfs --subject_code R1755A
-detect-edf-names /path/to/parent_dir --recursive     # one row per subject directory
-detect-edf-names /path/to/subject/edfs --no_csv      # print only
+detect-edf-names /path/to/parent_dir --per_subject_dir   # one row per subject subdirectory
+detect-edf-names /path/to/subject/edfs --no_csv          # print only
 ```
+
+EDF files are found **recursively** beneath the given path and treated as one subject, so it works regardless of how the export nested them (e.g. `R1001P/R1001P/day1/*.edf`). To batch-scan a folder that holds many subjects side by side, add `--per_subject_dir`: each immediate subdirectory becomes its own subject (its EDFs are still gathered recursively). Annotation stubs from a previous in-place run are skipped.
 
 The CSV defaults to `~/sens_data/detected_names.csv` (directory created `0700`, file `0600`) and holds `subject_code`, `patient_code` (hospital MRN from the header), the raw `patient_id`, the parsed first/middle/last, and a `parse_status` explaining any declines. Re-scanning the same directory updates its row rather than appending a duplicate.
 

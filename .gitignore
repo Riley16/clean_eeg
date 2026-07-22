@@ -100,6 +100,22 @@ Thumbs.db
 logs/
 *.log
 
+# --- PHI / sensitive outputs (NEVER commit) ---
+# Detected-name review CSVs (subject_code <-> real patient name, in the clear).
+sens_data/
+**/sens_data/
+detected_names.csv
+**/detected_names.csv
+# Raw and de-identified EEG recordings.
+*.edf
+# Pipeline log (name parts are scrubbed, but keep it out of the repo anyway).
+log.out
+**/log.out
+# De-identification output dirs (copy mode default + quarantined partials).
+deidentified_eeg_files/
+**/deidentified_eeg_files/
+**/quarantine/
+
 # Local-only exploration / reference material (Claude scratch space, not part of the package)
 context/
 misc_scripts/
