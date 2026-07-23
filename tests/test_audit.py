@@ -957,6 +957,27 @@ def test_e2e_output_dir_skip_reads_prior_manifest_from_output_dir(tmp_path):
     assert second["checks"]["transfer_integrity"]["status"] == "pass"
 
 
+def test_render_audit_notebook_html_excludes_code_cells(tmp_path):
+    # End-to-end: run the audit, render the notebook + HTML, and
+    # verify the HTML has NO code-cell content (only outputs).
+    # Requires jupyter kernel; skip if the socket bind is sandbox-blocked.
+    import socket
+    try:
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); s.close()
+    except PermissionError:
+        import pytest
+        pytest.skip("socket bind blocked by sandbox")
+
+    from clean_eeg.audit.notebook import render_audit_notebook
+    subject_dir = _build_clean_subject(tmp_path)
+    audit_subject(subject_dir, name_dictionary={"nonexistent"})
+    ipynb_path, html_path = render_audit_notebook(subject_dir)
+    html = html_path.read_text()
+    # Uniquely identifying strings from generated code cells:
+    for marker in ("AUDIT_JSON_PATH", "import matplotlib", "read_signal_window"):
+        assert marker not in html, f"code content leaked into HTML: {marker!r}"
+
+
 def test_build_audit_notebook_bakes_plot_params(tmp_path):
     nb = build_audit_notebook(tmp_path, tmp_path / "edf_audit.json",
                               n_channel_plot=7, n_files_plot=2,

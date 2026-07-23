@@ -189,6 +189,11 @@ def render_audit_notebook(subject_dir: str | Path,
     html_path: Path | None = None
     if emit_html:
         html_path = output_dir / HTML_FILENAME
-        body, _ = HTMLExporter().from_notebook_node(nb)
+        # Hide the code cells (input) in the HTML — the report is a
+        # results view, not a script listing. The full .ipynb is
+        # still on disk for anyone who wants to see the source.
+        exporter = HTMLExporter()
+        exporter.exclude_input = True
+        body, _ = exporter.from_notebook_node(nb)
         html_path.write_text(body)
     return ipynb_path, html_path
