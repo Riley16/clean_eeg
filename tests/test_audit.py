@@ -931,8 +931,59 @@ def test_e2e_audit_skip_hashes_omits_transfer_integrity(tmp_path):
     assert "transfer_integrity" not in audit["checks"]
 
 
-def test_build_audit_notebook_has_expected_cells():
-    nb = build_audit_notebook()
+def test_e2e_output_dir_isolates_audit_outputs(tmp_path):
+    subject_dir = _build_clean_subject(tmp_path)
+    out_dir = tmp_path / "elsewhere"
+    audit = audit_subject(subject_dir, output_dir=out_dir,
+                          name_dictionary={"nonexistent"})
+    # JSON lands in output_dir, NOT in subject_dir — avoids polluting fixtures.
+    assert (out_dir / AUDIT_JSON_FILENAME).exists()
+    assert not (subject_dir / AUDIT_JSON_FILENAME).exists()
+    assert audit["output_dir"] == str(out_dir)
+    assert audit["subject_dir"] == str(subject_dir)
+
+
+def test_e2e_output_dir_skip_reads_prior_manifest_from_output_dir(tmp_path):
+    subject_dir = _build_clean_subject(tmp_path)
+    out_dir = tmp_path / "elsewhere"
+    audit_subject(subject_dir, output_dir=out_dir,
+                  name_dictionary={"nonexistent"})
+
+    # Second run should skip based on the prior JSON in the ISOLATED output_dir,
+    # not look for one in subject_dir.
+    second = audit_subject(subject_dir, output_dir=out_dir,
+                           name_dictionary={"nonexistent"})
+    assert second.get("skipped") is True
+    assert second["checks"]["transfer_integrity"]["status"] == "pass"
+
+
+def test_build_audit_notebook_bakes_plot_params(tmp_path):
+    nb = build_audit_notebook(tmp_path, tmp_path / "edf_audit.json",
+                              n_channel_plot=7, n_files_plot=2,
+                              plot_seconds=3.5)
+    joined = "\n".join(c["source"] for c in nb["cells"])
+    assert "N_CHANNEL_PLOT = 7" in joined
+    assert "N_FILES_PLOT = 2" in joined
+    assert "PLOT_SECONDS = 3.5" in joined
+
+
+def test_cli_looks_like_boilerplate():
+    from clean_eeg.audit.cli import _looks_like_boilerplate
+    # Positive: real annotation content is kept.
+    assert not _looks_like_boilerplate("seizure onset")
+    assert not _looks_like_boilerplate("SEGMENT 1")
+    assert not _looks_like_boilerplate("XY")
+    # Negative: timekeeping-shaped / trivial strings are filtered.
+    assert _looks_like_boilerplate("")
+    assert _looks_like_boilerplate("   ")
+    assert _looks_like_boilerplate("+1.5")
+    assert _looks_like_boilerplate("-12.5")
+    assert _looks_like_boilerplate("1234")
+    assert _looks_like_boilerplate("X")  # single char
+
+
+def test_build_audit_notebook_has_expected_cells(tmp_path):
+    nb = build_audit_notebook(tmp_path, tmp_path / "edf_audit.json")
     cell_sources = [c["source"] for c in nb["cells"]]
     kinds = [c["cell_type"] for c in nb["cells"]]
     # Alternating markdown headers + code cells; check structure.

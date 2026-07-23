@@ -40,8 +40,8 @@ def _discover_edf_files(subject_dir: Path) -> list[Path]:
                   if p.is_file() and p.suffix.lower() == ".edf")
 
 
-def _load_previous_audit(subject_dir: Path) -> dict | None:
-    p = subject_dir / AUDIT_JSON_FILENAME
+def _load_previous_audit(output_dir: Path) -> dict | None:
+    p = output_dir / AUDIT_JSON_FILENAME
     if not p.exists():
         return None
     try:
@@ -52,6 +52,7 @@ def _load_previous_audit(subject_dir: Path) -> dict | None:
 
 def audit_subject(subject_dir: str | Path,
                   *,
+                  output_dir: str | Path | None = None,
                   force: bool = False,
                   annotation_only: bool = False,
                   skip_hashes: bool = False,
@@ -61,17 +62,23 @@ def audit_subject(subject_dir: str | Path,
     """Run the full audit on a single subject directory.
 
     Returns the audit-results dict (also written to
-    ``edf_audit.json``). Under ``force=False``, if an audit already
-    exists the transfer-integrity hash check still runs against the
-    prior manifest and the result is returned without redoing the rest
-    of the checks — this catches on-disk changes cheaply.
+    ``<output_dir>/edf_audit.json``). ``output_dir`` defaults to
+    ``subject_dir`` — override to avoid writing into read-only fixture
+    dirs or shared archive locations.
+
+    Under ``force=False``, if a prior audit exists in ``output_dir``
+    the transfer-integrity hash check still runs against the prior
+    manifest and the result is returned without redoing the rest of
+    the checks — this catches on-disk changes cheaply.
     """
     subject_dir = Path(subject_dir)
     if not subject_dir.is_dir():
         raise NotADirectoryError(f"{subject_dir} is not a directory")
+    output_dir = Path(output_dir) if output_dir is not None else subject_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     edf_files = _discover_edf_files(subject_dir)
-    previous = _load_previous_audit(subject_dir)
+    previous = _load_previous_audit(output_dir)
     previous_hashes = None
     if previous is not None:
         prev_hash_check = previous.get("checks", {}).get("transfer_integrity", {})
@@ -92,7 +99,7 @@ def audit_subject(subject_dir: str | Path,
         merged["skipped"] = True
         merged["generated_at"] = previous.get("generated_at")
         merged["rechecked_at"] = datetime.now(timezone.utc).isoformat()
-        _write_audit_json(subject_dir, merged)
+        _write_audit_json(output_dir, merged)
         return merged
 
     stubs = [p for p in edf_files if p.name.endswith(ANNOTATION_STUB_SUFFIX)]
@@ -123,13 +130,14 @@ def audit_subject(subject_dir: str | Path,
     audit = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "subject_dir": str(subject_dir),
+        "output_dir": str(output_dir),
         "subject_code": subject_code,
         "n_files": len(edf_files),
         "mode": "annotation_only" if annotation_only else "full",
         "checks": checks,
         "overall_status": _overall_status(checks),
     }
-    _write_audit_json(subject_dir, audit)
+    _write_audit_json(output_dir, audit)
     return audit
 
 
@@ -142,7 +150,7 @@ def _overall_status(checks: dict[str, dict]) -> str:
     return "pass"
 
 
-def _write_audit_json(subject_dir: Path, audit: dict) -> None:
-    (subject_dir / AUDIT_JSON_FILENAME).write_text(
+def _write_audit_json(output_dir: Path, audit: dict) -> None:
+    (output_dir / AUDIT_JSON_FILENAME).write_text(
         json.dumps(audit, indent=2, ensure_ascii=False, default=str)
     )

@@ -26,12 +26,13 @@ NOTEBOOK_FILENAME = "edf_audit.ipynb"
 HTML_FILENAME = "edf_audit.html"
 
 
-def _cell_load_audit() -> str:
+def _cell_load_audit(subject_dir: Path, audit_json_path: Path) -> str:
     return (
         "import json\n"
         "from pathlib import Path\n"
-        "SUBJECT_DIR = Path.cwd()\n"
-        "audit = json.loads((SUBJECT_DIR / 'edf_audit.json').read_text())\n"
+        f"SUBJECT_DIR = Path(r'''{subject_dir}''')\n"
+        f"AUDIT_JSON_PATH = Path(r'''{audit_json_path}''')\n"
+        "audit = json.loads(AUDIT_JSON_PATH.read_text())\n"
         "print(f\"Subject: {audit.get('subject_code', '?')}\")\n"
         "print(f\"Audit run at: {audit.get('generated_at', '?')}\")\n"
         "print(f\"Subject dir: {SUBJECT_DIR}\")"
@@ -82,16 +83,17 @@ def _cell_annotation_matches() -> str:
     )
 
 
-def _cell_eeg_snippets() -> str:
+def _cell_eeg_snippets(n_channel_plot: int, n_files_plot: int,
+                       plot_seconds: float) -> str:
     return (
         "import numpy as np\n"
         "import matplotlib.pyplot as plt\n"
         "from clean_eeg.audit.signals import read_signal_window\n"
         "from clean_eeg.audit.select import select_files\n"
         "\n"
-        "N_CHANNEL_PLOT = 5\n"
-        "PLOT_SECONDS = 5.0\n"
-        "N_FILES_PLOT = 4\n"
+        f"N_CHANNEL_PLOT = {n_channel_plot}\n"
+        f"PLOT_SECONDS = {plot_seconds}\n"
+        f"N_FILES_PLOT = {n_files_plot}\n"
         "\n"
         "recordings = sorted(SUBJECT_DIR.glob('*.edf'))\n"
         "recordings = [p for p in recordings if not p.name.endswith('_annotations.edf')]\n"
@@ -118,13 +120,22 @@ def _cell_eeg_snippets() -> str:
     )
 
 
-def build_audit_notebook() -> nbf.NotebookNode:
-    """Return the audit report notebook (unexecuted)."""
+def build_audit_notebook(subject_dir: Path, audit_json_path: Path,
+                         *,
+                         n_channel_plot: int = 5,
+                         n_files_plot: int = 4,
+                         plot_seconds: float = 5.0,
+                         ) -> nbf.NotebookNode:
+    """Return the audit report notebook (unexecuted). Paths are baked
+    into the first cell so the notebook can execute from any cwd.
+    Plot params are also baked so the CLI's ``--n-channel-plot`` /
+    ``--n-files-plot`` propagate all the way to the rendered figure.
+    """
     nb = nbf.v4.new_notebook()
     nb.metadata["kernelspec"] = {"name": "python3", "display_name": "Python 3"}
     nb.cells = [
         nbf.v4.new_markdown_cell("# EDF audit report"),
-        nbf.v4.new_code_cell(_cell_load_audit()),
+        nbf.v4.new_code_cell(_cell_load_audit(subject_dir, audit_json_path)),
         nbf.v4.new_markdown_cell("## Summary"),
         nbf.v4.new_code_cell(_cell_summary_table()),
         nbf.v4.new_markdown_cell("## Per-check issues"),
@@ -132,35 +143,52 @@ def build_audit_notebook() -> nbf.NotebookNode:
         nbf.v4.new_markdown_cell("## Annotation PHI scan — dictionary hits"),
         nbf.v4.new_code_cell(_cell_annotation_matches()),
         nbf.v4.new_markdown_cell("## EEG snippet plots"),
-        nbf.v4.new_code_cell(_cell_eeg_snippets()),
+        nbf.v4.new_code_cell(_cell_eeg_snippets(
+            n_channel_plot=n_channel_plot,
+            n_files_plot=n_files_plot,
+            plot_seconds=plot_seconds,
+        )),
     ]
     return nb
 
 
 def render_audit_notebook(subject_dir: str | Path,
                           *,
+                          output_dir: str | Path | None = None,
                           emit_html: bool = True,
-                          timeout: int = 120
+                          timeout: int = 120,
+                          n_channel_plot: int = 5,
+                          n_files_plot: int = 4,
+                          plot_seconds: float = 5.0,
                           ) -> tuple[Path, Path | None]:
-    """Write ``edf_audit.ipynb`` into ``subject_dir``, execute it in
-    place, and optionally emit ``edf_audit.html`` alongside.
-
-    Requires ``jupyter nbconvert`` + a Python 3 ipykernel (declared in
-    pyproject dependencies). Executes with cwd set to the subject
-    directory so the notebook can load ``edf_audit.json`` directly.
+    """Write ``edf_audit.ipynb`` + ``edf_audit.html`` into
+    ``output_dir`` (defaults to ``subject_dir``). Executes the notebook
+    in-process via ``nbconvert.ExecutePreprocessor``; requires
+    ``ipykernel`` (declared in pyproject dependencies).
     """
-    subject_dir = Path(subject_dir)
-    ipynb_path = subject_dir / NOTEBOOK_FILENAME
+    # Resolve to absolute paths — the executed notebook uses
+    # ``output_dir`` as cwd (via ExecutePreprocessor's metadata.path),
+    # so any relative path baked into a cell would resolve against
+    # the wrong root at execution time.
+    subject_dir = Path(subject_dir).resolve()
+    output_dir = (Path(output_dir).resolve()
+                  if output_dir is not None else subject_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    audit_json_path = output_dir / "edf_audit.json"
+    ipynb_path = output_dir / NOTEBOOK_FILENAME
 
-    nb = build_audit_notebook()
+    nb = build_audit_notebook(subject_dir, audit_json_path,
+                              n_channel_plot=n_channel_plot,
+                              n_files_plot=n_files_plot,
+                              plot_seconds=plot_seconds)
     ExecutePreprocessor(timeout=timeout, kernel_name="python3").preprocess(
-        nb, {"metadata": {"path": str(subject_dir)}}
+        nb, {"metadata": {"path": str(output_dir)}}
     )
     nbf.write(nb, str(ipynb_path))
 
     html_path: Path | None = None
     if emit_html:
-        html_path = subject_dir / HTML_FILENAME
+        html_path = output_dir / HTML_FILENAME
         body, _ = HTMLExporter().from_notebook_node(nb)
         html_path.write_text(body)
     return ipynb_path, html_path

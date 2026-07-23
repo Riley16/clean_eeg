@@ -4,6 +4,11 @@
   audit-subject-eeg --parent PARENT_DIR [OPTIONS]
 
 Options:
+  --output-dir PATH        Write edf_audit.{json,ipynb,html} here instead
+                           of the subject dir (avoids polluting fixtures
+                           or read-only archives). In --parent mode,
+                           each subject's outputs land in
+                           OUTPUT_DIR/<subject_name>/.
   --force                  Re-run all checks (else: skip if audit exists;
                            hash-consistency step always runs)
   --annotation-only        Only run the annotation-dictionary scan
@@ -26,12 +31,25 @@ import json
 import sys
 from pathlib import Path
 
+import re
+
 from clean_eeg.audit.annotations import extract_annotations
+from clean_eeg.audit.select import select_files
 from clean_eeg.audit.subject import (
     AUDIT_JSON_FILENAME,
     _discover_edf_files,
     audit_subject,
 )
+
+
+# Matches EDF+ timekeeping-shaped strings the pipeline treats as
+# non-PHI ([clean_subject_eeg.py:167]): empty, all-whitespace, pure
+# numeric (with optional sign / decimal), or single-char lines.
+_BOILERPLATE_RE = re.compile(r"^\s*[+-]?\d*\.?\d*\s*$")
+
+
+def _looks_like_boilerplate(text: str) -> bool:
+    return not text or len(text.strip()) < 2 or bool(_BOILERPLATE_RE.match(text))
 
 
 DEFAULT_VOCAB_WHITELIST = Path("data/annotation_vocab_whitelist.json")
@@ -55,10 +73,30 @@ def _print_summary(audit: dict, out=sys.stdout) -> None:
             print(f"          - {issue}", file=out)
 
 
-def _print_annotations(subject_dir: Path, out=sys.stdout) -> None:
-    print(f"\n--- All annotations in {subject_dir.name} ---", file=out)
-    for p in _discover_edf_files(subject_dir):
+def _print_annotations(subject_dir: Path,
+                       *,
+                       sample_n: int | None = None,
+                       verbosity: int = 0,
+                       out=sys.stdout) -> None:
+    """Print annotations across the subject's EDFs.
+
+    - ``sample_n=None`` prints from every file; otherwise picks that
+      many via ``select_files`` (always includes first + last).
+    - ``verbosity < 3``: skip timekeeping-shaped boilerplate.
+    - ``verbosity >= 3``: full verbatim, no filter.
+    """
+    files = _discover_edf_files(subject_dir)
+    picks = files if sample_n is None else select_files(files, n_files=sample_n)
+    filter_boilerplate = verbosity < 3
+
+    hdr = ("all annotations" if sample_n is None
+           else f"{len(picks)}-file random sample of annotations")
+    filt = "" if not filter_boilerplate else "  (boilerplate filtered; -vvv for full)"
+    print(f"\n--- {hdr} in {subject_dir.name}{filt} ---", file=out)
+    for p in picks:
         anns = extract_annotations(p)
+        if filter_boilerplate:
+            anns = [a for a in anns if not _looks_like_boilerplate(a["text"])]
         if not anns:
             continue
         print(f"  {p.name}:", file=out)
@@ -106,14 +144,23 @@ def _always_print_warnings(audit: dict, out=sys.stdout) -> None:
 
 
 def _run_one_subject(subject_dir: Path, args) -> dict:
-    audit_exists = (subject_dir / AUDIT_JSON_FILENAME).exists()
+    # Per-subject output dir: if --output-dir was given, nest under it
+    # by subject-folder name (so --parent mode doesn't collide multiple
+    # subjects into a single dir). Otherwise write alongside the EDFs.
+    if args.output_dir is not None:
+        out_dir = args.output_dir / subject_dir.name
+    else:
+        out_dir = subject_dir
+
+    audit_exists = (out_dir / AUDIT_JSON_FILENAME).exists()
     if audit_exists and not args.force:
-        print(f"[skip] {subject_dir.name}: {AUDIT_JSON_FILENAME} exists "
+        print(f"[skip] {subject_dir.name}: {out_dir / AUDIT_JSON_FILENAME} exists "
               f"(pass --force to re-run all checks; hash-consistency check still runs)")
 
     vocab = _load_vocab_whitelist(args.vocab_whitelist)
     audit = audit_subject(
         subject_dir,
+        output_dir=out_dir,
         force=args.force,
         annotation_only=args.annotation_only,
         skip_hashes=args.skip_hashes,
@@ -124,7 +171,9 @@ def _run_one_subject(subject_dir: Path, args) -> dict:
         _print_summary(audit)
     _always_print_warnings(audit)  # never suppressed
     if args.print_annot:
-        _print_annotations(subject_dir)
+        _print_annotations(subject_dir,
+                           sample_n=args.print_annot_sample_n,
+                           verbosity=args.verbose)
     if args.print_edf_header:
         _print_unique_header_values(audit)
     if args.print_edf_signal_header:
@@ -133,7 +182,9 @@ def _run_one_subject(subject_dir: Path, args) -> dict:
     if not args.no_notebook:
         from clean_eeg.audit.notebook import render_audit_notebook
         try:
-            render_audit_notebook(subject_dir)
+            render_audit_notebook(subject_dir, output_dir=out_dir,
+                                  n_channel_plot=args.n_channel_plot,
+                                  n_files_plot=args.n_files_plot)
         except Exception as e:
             print(f"[!] Notebook rendering failed for {subject_dir.name}: {e}",
                   file=sys.stderr)
@@ -151,14 +202,30 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Single subject directory to audit.")
     g.add_argument("--parent", type=Path,
                    help="Parent directory — audit every subject subfolder.")
+    p.add_argument("--output-dir", type=Path, default=None,
+                   help="Write edf_audit.{json,ipynb,html} here instead "
+                        "of alongside the EDFs. In --parent mode, per-subject "
+                        "outputs land in OUTPUT_DIR/<subject_name>/.")
     p.add_argument("--force", action="store_true")
     p.add_argument("--annotation-only", action="store_true")
     p.add_argument("--skip-hashes", action="store_true")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--no-notebook", action="store_true")
     p.add_argument("--print-annot", action="store_true")
+    p.add_argument("--print-annot-sample-n", type=int, default=None,
+                   help="Print annotations from a randomized N-file sample "
+                        "(always includes the first and last files). "
+                        "Default: all files.")
+    p.add_argument("-v", "--verbose", action="count", default=0,
+                   help="Increase --print-annot detail. Default filters "
+                        "timekeeping-shaped boilerplate; -vvv prints "
+                        "every annotation verbatim.")
     p.add_argument("--print-edf-header", action="store_true")
     p.add_argument("--print-edf-signal-header", action="store_true")
+    p.add_argument("--n-channel-plot", type=int, default=5,
+                   help="Channels per EEG snippet plot in the notebook.")
+    p.add_argument("--n-files-plot", type=int, default=4,
+                   help="Files to plot in the notebook EEG snippet section.")
     p.add_argument("--vocab-whitelist", type=Path,
                    default=DEFAULT_VOCAB_WHITELIST,
                    help="JSON list of tokens to exempt from the name scan.")
