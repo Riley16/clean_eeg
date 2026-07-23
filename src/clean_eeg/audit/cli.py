@@ -40,6 +40,7 @@ from clean_eeg.audit.subject import (
     _discover_edf_files,
     audit_subject,
 )
+from clean_eeg.paths import DATA_DIR
 
 
 # Matches EDF+ timekeeping-shaped strings the pipeline treats as
@@ -52,16 +53,27 @@ def _looks_like_boilerplate(text: str) -> bool:
     return not text or len(text.strip()) < 2 or bool(_BOILERPLATE_RE.match(text))
 
 
-DEFAULT_VOCAB_WHITELIST = Path("data/annotation_vocab_whitelist.json")
+# Absolute path (via clean_eeg.paths.DATA_DIR) so the default whitelist
+# is found regardless of the user's cwd. The file is shipped in-repo
+# and grows over time as operators run more audits.
+DEFAULT_VOCAB_WHITELIST = DATA_DIR / "annotation_vocab_whitelist.json"
 
 
-def _load_vocab_whitelist(path: Path | None) -> set[str]:
-    if path is None or not path.exists():
-        return set()
-    return set(json.loads(path.read_text()))
+def _load_vocab_whitelist(path: Path | None) -> tuple[set[str], str]:
+    """Return ``(tokens, status_message)``. The status message tells
+    the operator which whitelist was used and how many tokens loaded —
+    surfaces silent whiffs (e.g., wrong path, malformed JSON).
+    """
+    if path is None:
+        return set(), "vocab whitelist: none provided"
+    if not path.exists():
+        return set(), f"vocab whitelist: {path} does not exist (using empty set)"
+    tokens = set(json.loads(path.read_text()))
+    return tokens, f"vocab whitelist: {len(tokens)} token(s) from {path}"
 
 
-def _print_summary(audit: dict, out=sys.stdout) -> None:
+def _print_summary(audit: dict, out=None) -> None:
+    out = out or sys.stdout
     print(f"\n=== Audit: {audit['subject_dir']} ===", file=out)
     print(f"Subject code: {audit.get('subject_code')}", file=out)
     print(f"Files: {audit['n_files']}   Mode: {audit['mode']}   "
@@ -77,7 +89,7 @@ def _print_annotations(subject_dir: Path,
                        *,
                        sample_n: int | None = None,
                        verbosity: int = 0,
-                       out=sys.stdout) -> None:
+                       out=None) -> None:
     """Print annotations across the subject's EDFs.
 
     - ``sample_n=None`` prints from every file; otherwise picks that
@@ -85,6 +97,7 @@ def _print_annotations(subject_dir: Path,
     - ``verbosity < 3``: skip timekeeping-shaped boilerplate.
     - ``verbosity >= 3``: full verbatim, no filter.
     """
+    out = out or sys.stdout
     files = _discover_edf_files(subject_dir)
     picks = files if sample_n is None else select_files(files, n_files=sample_n)
     filter_boilerplate = verbosity < 3
@@ -105,7 +118,8 @@ def _print_annotations(subject_dir: Path,
                   f"(dur={a['duration']!r})  {a['text']!r}", file=out)
 
 
-def _print_unique_header_values(audit: dict, out=sys.stdout) -> None:
+def _print_unique_header_values(audit: dict, out=None) -> None:
+    out = out or sys.stdout
     residue = audit["checks"].get("header_phi_residue", {})
     pids = set(residue.get("patient_ids_by_file", {}).values())
     startdates = set(residue.get("startdates_by_file", {}).values())
@@ -118,7 +132,8 @@ def _print_unique_header_values(audit: dict, out=sys.stdout) -> None:
         print(f"    {v!r}", file=out)
 
 
-def _print_unique_signal_headers(audit: dict, out=sys.stdout) -> None:
+def _print_unique_signal_headers(audit: dict, out=None) -> None:
+    out = out or sys.stdout
     uni = audit["checks"].get("signal_header_uniformity", {})
     sigs = uni.get("signatures", {})
     print(f"\n--- Signal-header signatures ({len(sigs)} unique) ---", file=out)
@@ -129,9 +144,11 @@ def _print_unique_signal_headers(audit: dict, out=sys.stdout) -> None:
             print(f"      {ch}", file=out)
 
 
-def _always_print_warnings(audit: dict, out=sys.stdout) -> None:
-    """Always echo name-dictionary matches and any fail-status checks
-    even under --quiet — these are the load-bearing PHI signals."""
+def _always_print_warnings(audit: dict, out=None) -> None:
+    """Always echo name-dictionary matches and any pipeline redactions
+    into annotations, even under --quiet — these are the load-bearing
+    PHI signals the auditor cares about most."""
+    out = out or sys.stdout
     scan = audit["checks"].get("annotation_phi_scan", {})
     matches = scan.get("matched_tokens", {})
     if matches:
@@ -141,6 +158,16 @@ def _always_print_warnings(audit: dict, out=sys.stdout) -> None:
             print(f"    '{token}' × {len(hits)}", file=out)
             for h in hits[:3]:
                 print(f"        {h['file']} @ {h['onset']}s: {h['text']!r}", file=out)
+
+    log = audit["checks"].get("log_file", {})
+    ann_redactions = [r for r in log.get("redactions", [])
+                      if r.get("field") == "annotation"]
+    if ann_redactions:
+        print(f"\n[!] Pipeline redacted {len(ann_redactions)} annotation(s) during "
+              "de-identification — human should verify each redacted_value:",
+              file=out)
+        for r in ann_redactions:
+            print(f"    log line {r['line_number']}: {r['redacted_value']!r}", file=out)
 
 
 def _run_one_subject(subject_dir: Path, args) -> dict:
@@ -157,7 +184,8 @@ def _run_one_subject(subject_dir: Path, args) -> dict:
         print(f"[skip] {subject_dir.name}: {out_dir / AUDIT_JSON_FILENAME} exists "
               f"(pass --force to re-run all checks; hash-consistency check still runs)")
 
-    vocab = _load_vocab_whitelist(args.vocab_whitelist)
+    vocab, vocab_status = _load_vocab_whitelist(args.vocab_whitelist)
+    print(f"[audit] {vocab_status}")
     audit = audit_subject(
         subject_dir,
         output_dir=out_dir,

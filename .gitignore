@@ -94,9 +94,14 @@ cython_debug/
 Thumbs.db
 
 # --- Project-specific ignores ---
-# Add here if you generate data, figures, logs, or large artifacts
-**/data/
+# Add here if you generate data, figures, logs, or large artifacts.
+# Use `**/data/*` (not `**/data/`) so specific files inside data/ can
+# be re-included below via `!` exception patterns.
+**/data/*
 **/test_data/
+# Exception: the audit's annotation-vocab whitelist is operator-curated
+# but should grow across audits and be shared across contributors.
+!data/annotation_vocab_whitelist.json
 logs/
 *.log
 

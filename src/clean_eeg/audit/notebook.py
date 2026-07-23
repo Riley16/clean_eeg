@@ -83,6 +83,24 @@ def _cell_annotation_matches() -> str:
     )
 
 
+def _cell_pipeline_annotation_redactions() -> str:
+    return (
+        "log = audit['checks'].get('log_file', {})\n"
+        "ann_redactions = [r for r in log.get('redactions', [])\n"
+        "                  if r.get('field') == 'annotation']\n"
+        "if not ann_redactions:\n"
+        "    print('Pipeline did not redact any annotations during '\n"
+        "          'de-identification (or log.out is missing).')\n"
+        "else:\n"
+        "    print(f'Pipeline redacted {len(ann_redactions)} annotation(s). '\n"
+        "          'The pipeline log is PHI-scrubbed, so redacted_value below '\n"
+        "          'is safe to eyeball — verify each redaction is correct.')\n"
+        "    print()\n"
+        "    for r in ann_redactions:\n"
+        "        print(f\"  log line {r['line_number']}: {r['redacted_value']!r}\")"
+    )
+
+
 def _cell_eeg_snippets(n_channel_plot: int, n_files_plot: int,
                        plot_seconds: float) -> str:
     return (
@@ -142,6 +160,14 @@ def build_audit_notebook(subject_dir: Path, audit_json_path: Path,
         nbf.v4.new_code_cell(_cell_per_check_issues()),
         nbf.v4.new_markdown_cell("## Annotation PHI scan — dictionary hits"),
         nbf.v4.new_code_cell(_cell_annotation_matches()),
+        nbf.v4.new_markdown_cell(
+            "## Pipeline annotation redactions\n\n"
+            "Every annotation the de-identification pipeline flagged and "
+            "redacted (recovered from `log.out`). The log is PHI-scrubbed, "
+            "so the `redacted_value` shown is safe to review — a human "
+            "should verify each redaction was correct."
+        ),
+        nbf.v4.new_code_cell(_cell_pipeline_annotation_redactions()),
         nbf.v4.new_markdown_cell("## EEG snippet plots"),
         nbf.v4.new_code_cell(_cell_eeg_snippets(
             n_channel_plot=n_channel_plot,

@@ -1012,15 +1012,56 @@ def test_build_audit_notebook_has_expected_cells(tmp_path):
         "markdown", "code",  # title + load_audit
         "markdown", "code",  # summary heading + counts
         "markdown", "code",  # per-check issues heading + code
-        "markdown", "code",  # annotation matches
+        "markdown", "code",  # name-dictionary matches
+        "markdown", "code",  # pipeline annotation redactions
         "markdown", "code",  # eeg snippets
     ]
     joined = "\n".join(cell_sources)
     assert "SUBJECT_DIR" in joined
     assert "annotation_phi_scan" in joined
+    assert "log_file" in joined and "redactions" in joined  # ann-redaction cell
     assert "read_signal_window" in joined
     assert "matplotlib" in joined
     assert nb["metadata"]["kernelspec"]["name"] == "python3"
+
+
+def test_cli_always_prints_annotation_redactions(capsys):
+    from clean_eeg.audit.cli import _always_print_warnings
+    audit = {"checks": {
+        "annotation_phi_scan": {"matched_tokens": {}},
+        "log_file": {"redactions": [
+            {"line_number": 42, "field": "annotation",
+             "redacted_value": "seen by <REDACTED>"},
+            {"line_number": 43, "field": "patientname",  # NOT annotation
+             "redacted_value": "X X X"},
+            {"line_number": 44, "field": "annotation",
+             "redacted_value": "noted by <REDACTED>"},
+        ]},
+    }}
+    _always_print_warnings(audit)
+    out = capsys.readouterr().out
+    # Positive: both annotation redactions flagged.
+    assert "Pipeline redacted 2 annotation" in out
+    assert "'seen by <REDACTED>'" in out
+    assert "'noted by <REDACTED>'" in out
+    assert "log line 42" in out and "log line 44" in out
+    # Negative: the patientname redaction (field != 'annotation') is NOT
+    # in the annotation-redactions block (patientname is a header field,
+    # not annotation content — different auditor concern).
+    assert "log line 43" not in out
+    assert "'X X X'" not in out
+
+
+def test_cli_annotation_redaction_block_absent_when_none(capsys):
+    from clean_eeg.audit.cli import _always_print_warnings
+    audit = {"checks": {
+        "annotation_phi_scan": {"matched_tokens": {}},
+        "log_file": {"redactions": []},
+    }}
+    _always_print_warnings(audit)
+    out = capsys.readouterr().out
+    # No annotation redactions → no block at all (keeps output tight).
+    assert "Pipeline redacted" not in out
 
 
 # --- annotation stub pairing -----------------------------------------------

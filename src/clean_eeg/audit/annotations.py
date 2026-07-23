@@ -71,7 +71,7 @@ def extract_annotations(edf_path: str | Path) -> list[dict]:
 
 
 def scan_annotation_texts(annotations: Iterable[dict],
-                          name_set: set[str],
+                          name_set,  # set[str] | frozenset[str]
                           vocab_whitelist: set[str] | None = None
                           ) -> tuple[list[dict], dict[str, list[dict]]]:
     """Hard-match every token in each annotation text against
@@ -119,9 +119,12 @@ def check_annotation_phi_scan(edf_paths: Iterable[str | Path],
     paths = [Path(p) for p in edf_paths]
 
     if name_dictionary is None:
-        from scripts.build_whitelist import load_names_dataset_names
-        name_dictionary = load_names_dataset_names(countries=('US',))
-    name_set = {str(n).lower() for n in name_dictionary if isinstance(n, str)}
+        # Disk-cached loader: cold ~23s (full CSV rebuild), warm <1s.
+        from clean_eeg.audit.name_dictionary import load_us_name_dictionary
+        name_set: frozenset[str] | set[str] = load_us_name_dictionary(
+            countries=('US',))
+    else:
+        name_set = {str(n).lower() for n in name_dictionary if isinstance(n, str)}
     vocab = {v.lower() for v in (vocab_whitelist or set())}
 
     matches_by_file: dict[str, list[dict]] = {}
