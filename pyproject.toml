@@ -20,6 +20,10 @@ dependencies = [
     "nicknames",
     "regex",
     "tqdm",
+    "matplotlib",
+    "nbformat",
+    "nbconvert",
+    "ipykernel",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +31,7 @@ test = ["pytest"]
 
 [project.scripts]
 print-edf-header = "clean_eeg.print_edf_header:main"
+audit-subject-eeg = "clean_eeg.audit.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

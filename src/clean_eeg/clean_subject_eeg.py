@@ -136,8 +136,11 @@ def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: Per
     return clean_annotations
 
 
+SUBJECT_CODE_PATTERN = r'^R1\d{3}[ACDEFHJMNPST]$'
+
+
 def is_valid_subject_code(subject_code,
-                          pattern=r'^R1\d{3}[ACDEFHJMNPST]$',
+                          pattern=SUBJECT_CODE_PATTERN,
                           raise_error=True):
     """
     Validate the format of <subject_code> matches regex <pattern>.
