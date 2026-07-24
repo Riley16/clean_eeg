@@ -72,6 +72,35 @@ If the subject has multiple middle names, separate them with underscores:
 
 Any required arguments not provided on the command line will be prompted for interactively. The path to the de-identified files will be printed once the process finishes.
 
+At the end of a successful run the pipeline writes a `deidentify.json` sidecar into the output directory (recording the manifest of de-identified files with fast-hash checksums), prints a "Human review needed" block for any annotations that contained PHI-adjacent text or header fields that were truncated on write, and asks whether to transfer the files to the CML rhino server. Answering `y` invokes the transfer step described below; answering `n` (or pressing Enter) exits, and you can run `transfer-subject-eeg <output_dir>` at any time to upload.
+
+Re-invoking `clean_subject_eeg` on a directory that already has a `deidentify.json` short-circuits straight to the "already done, skip to transfer?" prompt. Pass `--force` to re-run de-identification from scratch instead. If 5 EDF files in a row fail to load, the pipeline aborts with a message pointing at the `--force_load_all` escape hatch — usually a systematic input-directory issue (wrong export format, permissions, truncated USB dump) rather than genuine per-file corruption.
+
+## Transferring de-identified files to the CML server
+
+```
+transfer-subject-eeg /path/to/deidentified/output/dir
+```
+
+Runs a preflight that refuses to upload unless the directory looks fully de-identified: `deidentify.json` present, no non-empty `quarantine/` subdir, every EDF matches the de-identified filename pattern, every header shows the redacted patient fields, the site letter is known, and a spot-check hash matches what was recorded at de-id time. If any check fails, the tool prints the reasons and exits without touching the network.
+
+On pass, prints the composed `rsync` (or `scp` fallback) command and asks for confirmation. Uses `rsync --partial` so an interrupted upload can be safely resumed by simply re-running the command (rsync's delta algorithm block-checksums the shared prefix on resume).
+
+Options:
+- `--dry-run` — preflight and print the composed commands without invoking anything
+- `--user USER` — SSH username (defaults to `$USER`)
+- `--yes`/`-y` — skip the interactive confirmation prompt
+
+## Post-upload audit
+
+```
+audit-subject-eeg /data10/RAM/incoming/{SITE}/{SUBJECT}/all_clinical_eeg
+```
+
+Runs an independent per-subject PHI audit against the uploaded directory: header-residue scan, annotation-dictionary scan, byte-geometry checks, hash comparison against the pipeline's `deidentify.json` manifest, log-file scan, and more. Produces `edf_audit.json` plus a rendered notebook + HTML report in the subject dir. Data analysts run this on the cluster after upload; it is not intended for hospital-site operators (the name-dictionary scan is deliberately noisy for review purposes).
+
+Pass `--parent /data10/RAM/incoming/{SITE}` to audit every subject subfolder in one pass. See `audit-subject-eeg --help` for the full check inventory and options.
+
 ## Inspecting EDF headers (debugging)
 
 The package ships a `print-edf-header` command for dumping the raw bytes and parsed values of every EDF header field. It works even when `pyedflib` refuses to open the file (which is typically when you'd reach for it — e.g. a Nihon Kohden export with empty/blank numeric fields). Operates on a single `.edf` file or every `.edf` in a directory.

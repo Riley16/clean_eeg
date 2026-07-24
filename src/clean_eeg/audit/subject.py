@@ -131,6 +131,38 @@ def _load_previous_audit(output_dir: Path) -> dict | None:
         return None
 
 
+def _seed_hashes_from_deidentify_manifest(subject_dir: Path
+                                           ) -> tuple[dict | None, str | None]:
+    """Return ``(file_hashes, hash_mode)`` from ``deidentify.json`` in
+    ``subject_dir`` if present, else ``(None, None)``.
+
+    The pipeline writes this sidecar on successful completion, so if
+    it's there we can compare the audit's fresh hashes against the
+    de-identification-time hashes. Any drift indicates on-disk change
+    between de-id and the first audit — usually transfer damage, less
+    often disk-level corruption. Lazy-imported to avoid a hard
+    dependency on the top-level ``deidentify_manifest`` module (which
+    itself imports from ``audit.hashes`` — deferring here keeps the
+    audit importable in environments that haven't installed the whole
+    pipeline)."""
+    try:
+        from clean_eeg.deidentify_manifest import (
+            ManifestSchemaError,
+            read_manifest,
+        )
+    except ImportError:
+        return None, None
+    try:
+        manifest = read_manifest(subject_dir)
+    except (ManifestSchemaError, OSError, json.JSONDecodeError):
+        # Malformed manifest — better to skip the comparison than
+        # crash the audit. The audit still records fresh hashes.
+        return None, None
+    if manifest is None:
+        return None, None
+    return manifest.get("file_hashes"), manifest.get("hash_mode")
+
+
 def audit_subject(subject_dir: str | Path,
                   *,
                   output_dir: str | Path | None = None,
@@ -185,6 +217,17 @@ def audit_subject(subject_dir: str | Path,
         prev_hash_check = previous.get("checks", {}).get("transfer_integrity", {})
         previous_hashes = prev_hash_check.get("file_hashes")
         previous_hash_mode = prev_hash_check.get("hash_mode")
+    else:
+        # First audit run on this subject — seed previous_hashes from
+        # the de-identification manifest (deidentify.json) if the
+        # pipeline wrote one. This catches bit-rot between de-id and
+        # the first audit (transfer over slow/unreliable link, disk
+        # corruption on the ingest server, etc.). Absent manifest is
+        # fine — the check reverts to "first run, record only".
+        seed_hashes, seed_mode = _seed_hashes_from_deidentify_manifest(subject_dir)
+        if seed_hashes is not None:
+            previous_hashes = seed_hashes
+            previous_hash_mode = seed_mode
 
     checks: dict[str, dict] = {}
     timings: dict[str, float] = {}

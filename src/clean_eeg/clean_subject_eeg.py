@@ -10,6 +10,15 @@ from typing import Union
 from datetime import datetime, timedelta
 from tqdm import tqdm
 from clean_eeg.anonymize import redact_subject_name, PersonalName, SubjectNameRedactor
+from clean_eeg.annotation_boilerplate import load_whitelist
+from clean_eeg.deidentify_manifest import (
+    MANIFEST_FILENAME,
+    ReviewEvent,
+    build_manifest,
+    manifest_exists,
+    read_manifest,
+    write_manifest,
+)
 from clean_eeg.load_eeg import load_edf, write_edf_pyedflib
 from clean_eeg.log import logged_input, setup_logger, get_logger, close_logger
 from clean_eeg.modify_edf_inplace import (
@@ -18,6 +27,7 @@ from clean_eeg.modify_edf_inplace import (
     create_annotations_only_edf,
     validate_header_roundtrip,
 )
+from clean_eeg.paths import ANNOTATION_BOILERPLATE_WHITELIST_PATH
 
 BASE_START_DATE = datetime(1985, 1, 1)
 DEFAULT_REDACT_HEADER_KEYS = ['patientname', 'sex', 'gender', 'patient_additional']
@@ -30,9 +40,27 @@ SITE_CODE_TO_INCOMING_FOLDER = {'S': 'UTHSCSA',
                                 'H': 'harvard',
                                 'J': 'TJ'}
 
+# Consecutive load failures after which _load_edf_metadata aborts the
+# subject rather than dutifully churning through more files. When N
+# neighboring files in a row fail to load, the input directory is
+# almost certainly broken in some systematic way (wrong export format,
+# permissions issue, truncated USB dump) and continuing wastes time
+# and floods stdout with per-file header dumps. Override with
+# --force_load_all on the CLI.
+MAX_CONSECUTIVE_LOAD_FAILURES = 5
+
+
+class ConsecutiveLoadFailureLimit(RuntimeError):
+    """Raised by _load_edf_metadata when the consecutive-failure cap
+    fires. Caught in clean_subject_edf_files to skip the de-id loop
+    AND skip the transfer prompt — an operator whose files won't load
+    should never be shown a transfer command."""
+
 
 def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_start_time,
-                   redactor: Union[SubjectNameRedactor, None] = None):
+                   redactor: Union[SubjectNameRedactor, None] = None,
+                   review_events: Union[list, None] = None,
+                   source_file: Union[str, None] = None):
     # remove protected health information (PHI) from EEG
     # accepts EDF data in 'pyedflib' format
 
@@ -68,7 +96,9 @@ def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_star
         'signal_headers': clean_signal_headers,
         'annotations': deidentify_edf_annotations(edf_data['annotations'],
                                                   subject_name=subject_name,
-                                                  redactor=redactor),
+                                                  redactor=redactor,
+                                                  review_events=review_events,
+                                                  source_file=source_file),
         'signals': edf_data['signals'],
     }
 
@@ -115,7 +145,9 @@ def deidentify_edf_header(header: dict,
 
 
 def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: PersonalName,
-                                redactor: Union[SubjectNameRedactor, None] = None):
+                                redactor: Union[SubjectNameRedactor, None] = None,
+                                review_events: Union[list, None] = None,
+                                source_file: Union[str, None] = None):
     clean_start_times = list()
     clean_durations = list()
     clean_descriptions = list()
@@ -125,7 +157,9 @@ def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: Per
                                       field_name='annotation',
                                       subject_name=subject_name,
                                       alert=True,
-                                      redactor=redactor)
+                                      redactor=redactor,
+                                      review_events=review_events,
+                                      source_file=source_file)
         clean_start_times.append(start_time)
         clean_durations.append(duration)
         clean_descriptions.append(redacted_text)
@@ -169,18 +203,29 @@ _NON_PHI_TEXT_RE = re.compile(r"^\s*[+-]?\d*\.?\d*\s*$")
 
 def redact_string(text: str, field_name: str, subject_name: PersonalName,
                   alert: bool = False,
-                  redactor: Union[SubjectNameRedactor, None] = None) -> str:
+                  redactor: Union[SubjectNameRedactor, None] = None,
+                  review_events: Union[list, None] = None,
+                  source_file: Union[str, None] = None) -> str:
     if _NON_PHI_TEXT_RE.match(text):
         # Empty, numeric, or timekeeping-shaped — cannot hold PHI; skip Presidio.
         return text
     redacted = redact_subject_name(text, subject_full_name=subject_name, redactor=redactor)
     redacted = remove_gendered_pronouns(redacted)
     if alert and text != redacted:
-        # Print the *redacted* value (not the raw one) so the log stays
-        # PHI-free while still showing what was flagged and what survived.
-        print('Subject protected health information detected in EDF '
-              f'{field_name}; redacted value: "{redacted}". '
-              'Alert the data analysis team.')
+        # Collect the *redacted* value (not the raw one) so it stays
+        # PHI-free while still showing what was flagged and what
+        # survived. Appended to review_events for the end-of-run
+        # 'Human review needed' block; boilerplate suppression happens
+        # at print time (all events are recorded in the manifest).
+        if review_events is not None:
+            review_events.append(ReviewEvent(
+                kind="annotation_redaction",
+                file=source_file or "",
+                details={
+                    "field": field_name,
+                    "redacted_value": redacted,
+                },
+            ))
     return redacted
 
 
@@ -218,17 +263,37 @@ def clean_subject_edf_files(
     benchmark: bool = False,
     read_digital: bool = True,
     skip_audit: bool = False,
+    force: bool = False,
+    force_load_all: bool = False,
+    auto_transfer_response: Union[str, None] = None,
 ):
     from clean_eeg.benchmark import BenchmarkCollector
     bench = BenchmarkCollector(enabled=benchmark)
 
     if inplace:
         assert input_path == output_path, "For inplace cleaning, input_path must equal output_path."
-    EDF_meta_data = _load_edf_metadata(input_path=input_path,
-                                       verbosity=verbosity,
-                                       load_method=load_method,
-                                       raise_errors=raise_errors,
-                                       bench=bench)
+
+    # Completion-marker fast path: a prior successful run wrote
+    # deidentify.json to output_path. Presence == de-id done. Offer to
+    # skip straight to transfer unless --force says re-run from scratch.
+    if not force and manifest_exists(output_path):
+        _maybe_skip_to_transfer(output_path,
+                                auto_response=auto_transfer_response)
+        return
+
+    try:
+        EDF_meta_data = _load_edf_metadata(input_path=input_path,
+                                           verbosity=verbosity,
+                                           load_method=load_method,
+                                           raise_errors=raise_errors,
+                                           force_load_all=force_load_all,
+                                           bench=bench)
+    except ConsecutiveLoadFailureLimit as e:
+        # Do NOT write a manifest and do NOT offer transfer — an
+        # operator whose files won't load must not be handed an upload
+        # command. Print the message so the tee captures it in log.out.
+        print(f"\n{e}\n")
+        return
 
     if not EDF_meta_data:
         raise RuntimeError(
@@ -261,6 +326,12 @@ def clean_subject_edf_files(
     with bench.step("build_presidio_redactor"):
         redactor = SubjectNameRedactor(subject_name) if subject_name is not None else None
 
+    # Review events accumulated across the whole subject — printed once
+    # in the end-of-run 'Human review needed' block and persisted in
+    # deidentify.json for post-hoc audit.
+    review_events: list[ReviewEvent] = []
+    output_edf_paths: list = []  # accumulated for the manifest's hash step
+
     # de-identify EDF files and save out
     print("Cleaning EDF files... Saving to output path:", output_path)
     # Quarantine subdir for partial outputs from any file that fails
@@ -269,7 +340,12 @@ def clean_subject_edf_files(
     # tells operators NOT to send anything in this subdir.
     quarantine_dir = os.path.join(output_path, "quarantine")
     failed_files: list[tuple[str, str, list]] = []  # (filename, error, moved_paths)
-    for filename, _ in tqdm(EDF_meta_data.items()):
+    progress = tqdm(EDF_meta_data.items())
+    n_audited = 0
+    for filename, _ in progress:
+        progress.set_postfix(current=filename[:24],
+                             redactions=len(review_events),
+                             quarantined=len(failed_files))
         # Track output artifacts created for this file so we can move
         # them to quarantine if anything fails mid-pipeline.
         output_artifacts: list = []
@@ -307,12 +383,24 @@ def clean_subject_edf_files(
                     subject_code=subject_code,
                     earliest_recording_start_time=min_start_time,
                     redactor=redactor,
+                    review_events=review_events,
+                    source_file=filename,
                 )
             with bench.step("validate_header_roundtrip", file=filename):
                 truncation_warnings = validate_header_roundtrip(
                     edf['header'], edf['signal_headers'])
             for warning in truncation_warnings:
+                # Header-field truncation is PHI-adjacent: patient_id
+                # packs patientname + patientcode + birthdate; a
+                # truncation there could leave partial name bytes in
+                # the file. Surface in the review block AND log
+                # immediately for visibility.
                 print(f"WARNING: {warning}")
+                review_events.append(ReviewEvent(
+                    kind="header_truncation",
+                    file=filename,
+                    details={"message": str(warning)},
+                ))
 
             clean_start_time = edf['header']['startdate']
             filename_no_ext = os.path.splitext(filename)[0]
@@ -341,13 +429,24 @@ def clean_subject_edf_files(
                 with bench.step("write_edf_pyedflib", file=filename):
                     write_edf_pyedflib(edf, clean_full_path, digital=read_digital)
                     output_artifacts.append(clean_full_path)
-            print(f"Cleaned EDF file at: {clean_filename}")
+            # Per-file success is reflected in the tqdm postfix
+            # (redactions/quarantined counters) — dropping the old
+            # scrolling 'Cleaned EDF file at:' line keeps the terminal
+            # legible on multi-file subjects.
 
             # Audit signal integrity immediately after write
             if filename in audit_filenames:
                 with bench.step("audit_signal_integrity", file=filename):
                     _audit_signal_integrity(orig_signals, clean_full_path, filename,
                                             inplace=inplace, digital=read_digital)
+                n_audited += 1
+
+            # Track output artifacts for the manifest's hash step —
+            # AFTER the audit so a failed audit's quarantined artifacts
+            # never end up in the hash manifest (would crash on
+            # FileNotFoundError at hash time).
+            for artifact in output_artifacts:
+                output_edf_paths.append(artifact)
         except Exception as e:
             if raise_errors:
                 raise e
@@ -386,6 +485,11 @@ def clean_subject_edf_files(
     print("Done cleaning EDF files. Saved to output path:", output_path)
     if benchmark:
         print(bench.report())
+
+    site_code = subject_code[-1]
+    site_incoming_folder = SITE_CODE_TO_INCOMING_FOLDER.get(site_code, 'UNKNOWN_SITE')
+
+    n_quarantined_files = sum(len(moved) for _, _, moved in failed_files)
     if failed_files:
         any_quarantined = any(moved for _, _, moved in failed_files)
         print(
@@ -399,51 +503,152 @@ def clean_subject_edf_files(
         print()
         if any_quarantined:
             print(
-                "Files in the 'quarantine/' subdirectory have NOT been fully "
-                "de-identified and MUST NOT be sent to the data management "
-                "team. The standard `scp <output>/*.edf` command (printed "
-                "below) is non-recursive and will skip quarantine/ "
-                "automatically — but if you copy files manually, do NOT "
-                "include the quarantine/ subdirectory."
+                "Files in the 'quarantine/' subdirectory have NOT been "
+                "fully de-identified and MUST NOT be sent to the data "
+                "management team. The transfer step will refuse to run "
+                "until quarantine/ is empty — investigate the failures "
+                "above, DO NOT include the quarantine/ subdirectory in "
+                "any manual copy, and re-run transfer-subject-eeg after "
+                "resolving the issues."
             )
             print()
         print(
             "Please send log.out (in the EDF directory) to the data "
             "management team so the failures above can be investigated.\n"
         )
-    site_code = subject_code[-1]  # last character of subject code is site code
-    site_code_incoming_folder = SITE_CODE_TO_INCOMING_FOLDER.get(site_code, 'UNKNOWN_SITE')
-    site_parent_dir = f"/data10/RAM/incoming/{site_code_incoming_folder}"
-    subject_remote_dir = f"{site_parent_dir}/{subject_code}"
-    remote_dir = f"{subject_remote_dir}/all_clinical_eeg"
-    print("\nExample commands to transfer cleaned EDF files to the CML "
-          "rhino server (replace USER with your username):")
-    print()
-    # umask 007 → newly-created intermediate dirs are 770. Pre-existing
-    # dirs are untouched.
-    print(f'  ssh USER@rhino2.psych.upenn.edu "umask 007 && mkdir -p {remote_dir}"')
-    print()
-    # Prefer rsync (resumable, --exclude). scp fallback for systems
-    # without rsync (typically Windows without WSL); log.out must be
-    # listed explicitly since *.edf misses it.
-    if shutil.which("rsync"):
-        print(f"  rsync -avzh --partial --progress --exclude='quarantine/' \\")
-        print(f"    {output_path}/ \\")
-        print(f"    USER@rhino2.psych.upenn.edu:{remote_dir}/")
+
+    _print_review_block(review_events)
+
+    manifest = build_manifest(
+        subject_code=subject_code,
+        site_code=site_code,
+        site_incoming_folder=site_incoming_folder,
+        input_path=input_path,
+        output_path=output_path,
+        inplace=inplace,
+        output_edf_paths=output_edf_paths,
+        n_files_deidentified=len(output_edf_paths),
+        n_files_failed=len(failed_files),
+        n_files_quarantined=n_quarantined_files,
+        review_events=review_events,
+    )
+    write_manifest(output_path, manifest)
+
+    # Refuse to prompt for transfer if any file failed or was
+    # quarantined — the operator needs to resolve those first.
+    if failed_files:
+        print(
+            "Refusing to offer transfer while failures/quarantine remain. "
+            "Investigate, then re-run `transfer-subject-eeg <output_dir>` "
+            "once resolved.\n"
+        )
+        return
+
+    _prompt_ready_to_transfer(output_path, auto_response=auto_transfer_response)
+
+
+def _maybe_skip_to_transfer(output_path: str,
+                            auto_response: Union[str, None] = None) -> None:
+    """Called when re-invoking the pipeline on an already-completed
+    output directory. Confirms with the operator, then hands off to
+    the transfer tool. Called with a fresh (non-force) invocation
+    only — --force short-circuits this path in ``clean_subject_edf_files``.
+    """
+    try:
+        manifest = read_manifest(output_path)
+    except Exception as e:
+        print(f"WARNING: could not read existing deidentify.json: {e}")
+        print("Falling back to a fresh de-identification run. Pass "
+              "--force to skip this check next time.")
+        return
+    assert manifest is not None
+    print(
+        f"\nDe-identification manifest already present in {output_path}\n"
+        f"  generated_at: {manifest.get('generated_at')}\n"
+        f"  clean_eeg version: {manifest.get('clean_eeg_version')}\n"
+        f"  n_files: {manifest.get('n_files_deidentified')}\n"
+    )
+    resp = (auto_response
+            if auto_response is not None
+            else logged_input(
+                "De-identification already completed for this directory. "
+                "Skip to transfer? [Y/n]: ")).strip().lower()
+    if resp in ("", "y", "yes"):
+        _invoke_transfer(output_path)
     else:
-        print(f"  scp {os.path.join(output_path, '*.edf')} \\")
-        print(f"    {os.path.join(output_path, LOG_FILENAME)} \\")
-        print(f"    USER@rhino2.psych.upenn.edu:{remote_dir}")
-    print()
-    # Recursive chgrp+chmod on the subject folder so the data team's
-    # group (taken from the site's incoming dir) owns everything and
-    # has rwx. Bounded to {subject_remote_dir} so ancestors aren't
-    # touched. `;` (not `&&`) so chmod still runs if chgrp can't touch
-    # a few entries the operator doesn't own — those failures are
-    # printed but non-fatal.
-    print(f'  ssh USER@rhino2.psych.upenn.edu "'
-          f'chgrp -R --reference={site_parent_dir} {subject_remote_dir}; '
-          f'chmod -R g+rwX,o-rwx {subject_remote_dir}"')
+        print(
+            "Aborting. To re-run de-identification from scratch, pass "
+            "--force (this will overwrite deidentify.json). To transfer "
+            "without re-running de-id, run `transfer-subject-eeg "
+            f"{output_path}` directly.")
+
+
+def _print_review_block(events: list) -> None:
+    """Emit the end-of-run 'Human review needed' block. Boilerplate-matched
+    annotations are suppressed here (they still live in the manifest)
+    to avoid drowning the review in site-specific noise."""
+    whitelist = load_whitelist(ANNOTATION_BOILERPLATE_WHITELIST_PATH)
+    # Filter annotation redactions through the boilerplate whitelist so
+    # recurring site-specific patterns don't flood the block. Header
+    # truncations are always surfaced — they're rare and always relevant.
+    to_show: list = []
+    for e in events:
+        if e.kind == "annotation_redaction":
+            text = e.details.get("redacted_value", "")
+            site_code = None  # boilerplate is applied broadly for now
+            if not whitelist.matches(text, site_code=site_code):
+                to_show.append(e)
+        else:
+            to_show.append(e)
+
+    if not to_show:
+        return
+    print("\n=== Human review needed ===")
+    ann = [e for e in to_show if e.kind == "annotation_redaction"]
+    trunc = [e for e in to_show if e.kind == "header_truncation"]
+    if ann:
+        print(f"  {len(ann)} annotation(s) contained PHI-adjacent text "
+              f"(redacted values shown; boilerplate suppressed):")
+        for e in ann:
+            print(f"    {e.file}: {e.details.get('redacted_value')!r}")
+    if trunc:
+        print(f"  {len(trunc)} header field(s) were truncated on write "
+              f"— verify the affected fields did not contain PHI:")
+        for e in trunc:
+            print(f"    {e.file}: {e.details.get('message')}")
+    print("===========================\n")
+
+
+def _prompt_ready_to_transfer(output_path: str,
+                              auto_response: Union[str, None] = None) -> None:
+    """End-of-run prompt for the transfer step. Non-interactive via
+    ``auto_response``; empty response defaults to 'no' so a truncated
+    stdin never accidentally triggers an upload."""
+    resp = (auto_response
+            if auto_response is not None
+            else logged_input(
+                "Ready to transfer de-identified files to the CML server? "
+                "[y/N]: ")).strip().lower()
+    if resp in ("y", "yes"):
+        _invoke_transfer(output_path)
+    else:
+        print(
+            f"Transfer skipped. Run `transfer-subject-eeg {output_path}` "
+            "at any time to upload."
+        )
+
+
+def _invoke_transfer(output_path: str) -> None:
+    """Thin wrapper so tests can monkeypatch a single seam. Errors are
+    caught here so a transfer failure does not tear down the log file
+    close-out in ``__main__``."""
+    from clean_eeg.transfer import transfer_subject
+    try:
+        transfer_subject(output_path)
+    except RuntimeError as e:
+        print(f"\nTransfer failed: {e}")
+        print(f"Re-run `transfer-subject-eeg {output_path}` after "
+              "resolving the issue above.")
 
 
 QUARANTINE_SUFFIX = ".QUARANTINED-DO-NOT-USE"
@@ -654,8 +859,13 @@ def _audit_signal_integrity(orig_signals: list, clean_file_path: str, filename: 
                 "investigation."
             )
 
-    print(f"Audit passed for {filename}: all {n_data_signals} signals "
-          f"unchanged (pyedflib cross-check on signal {spot_idx if n_data_signals > 0 else 'n/a'}).")
+    # Success is intentionally silent — per-file confirmations used to
+    # scroll for hundreds of lines on multi-file subjects, drowning
+    # out the actually-important redaction warnings. The tqdm postfix
+    # in clean_subject_edf_files carries running counts, and the
+    # manifest records n_files_deidentified for post-hoc verification.
+    # Failures still raise loudly (see the RuntimeErrors above).
+    _ = (n_data_signals, spot_idx)
 
 
 def convert_edfC_to_edfD(input_file: str):
@@ -673,6 +883,7 @@ def _load_edf_metadata(input_path: str,
                        repair_truncated: bool = True,
                        repair_phys_ranges: bool = True,
                        raise_errors: bool = False,
+                       force_load_all: bool = False,
                        bench=None):
     from clean_eeg.repair_edf import (
         validate_edf_minimum_size,
@@ -684,7 +895,12 @@ def _load_edf_metadata(input_path: str,
         bench = BenchmarkCollector(enabled=False)
     EDF_meta_data = dict()
     failed_files: list[tuple[str, str]] = []  # (filename, error_message)
-    for filename in tqdm(os.listdir(input_path), desc="Loading EDF meta-data..."):
+    consecutive_failures = 0
+    # sorted() so the consecutive-failure counter and the tqdm progress
+    # bar are deterministic — os.listdir order is filesystem-dependent
+    # and makes load-cap behavior unpredictable across platforms.
+    for filename in tqdm(sorted(os.listdir(input_path)),
+                          desc="Loading EDF meta-data..."):
         if not filename.lower().endswith('.edf'):
             continue
         full_path = os.path.join(input_path, filename)
@@ -706,6 +922,7 @@ def _load_edf_metadata(input_path: str,
             with bench.step("load_edf_metadata_only", file=filename):
                 data = load_edf(full_path, load_method=load_method, preload=False)
             EDF_meta_data[filename] = {'data': data}
+            consecutive_failures = 0  # a success resets the streak
         except Exception as e:
             if raise_errors:
                 raise e
@@ -718,6 +935,18 @@ def _load_edf_metadata(input_path: str,
                 f"Check if the file is corrupted. Skipping this file...\n"
             )
             _dump_edf_header_for_diagnosis(full_path)
+            consecutive_failures += 1
+            if (consecutive_failures >= MAX_CONSECUTIVE_LOAD_FAILURES
+                    and not force_load_all):
+                raise ConsecutiveLoadFailureLimit(
+                    f"Aborting: {MAX_CONSECUTIVE_LOAD_FAILURES} EDF files "
+                    f"in a row failed to load. This usually indicates a "
+                    f"systematic issue with the input directory (wrong "
+                    f"format, permissions, truncated export) rather than "
+                    f"per-file corruption. Investigate the files above, "
+                    f"then re-run with --force_load_all to attempt every "
+                    f"remaining file regardless of failure streak."
+                )
     if failed_files:
         print(
             f"\nWARNING: {len(failed_files)} EDF file(s) were skipped during "
@@ -850,12 +1079,24 @@ def _check_signal_header_consistency(EDF_meta_data: dict, verbosity: int = 0):
                                             for signal_header in signal_headers)
     unique_label_sets = {*list(signal_label_sets.values())}
     if len(unique_label_sets) > 1:
-        print("WARNING: Multiple unique sets of signal header labels found across EDF files:")
-        for labels in unique_label_sets:
-            files_with_header = [fname for fname, label_keys in signal_label_sets.items() if label_keys == labels]
-            print(f'Signal header labels\n\n{labels}\n\nfound in files:\n{files_with_header}')
-        print("\nThis may indicate inconsistent EDF signal labels across recordings or multiple subjects across files in the EDF data folder.")
-        print('Alternatively, this may be due to multiple recording montages during e.g., the same stay in the epilepsy monitoring unit.')
+        # Compact form: one line per unique signature with a channel
+        # count and file count. Full per-signature label tuples used
+        # to scroll for hundreds of lines on multi-montage NK subjects
+        # — the audit tool has the detailed view via edf_audit.json.
+        print(f"WARNING: {len(unique_label_sets)} unique signal-header "
+              f"signatures across {len(signal_label_sets)} files.")
+        for i, labels in enumerate(unique_label_sets):
+            files_with_header = [fname for fname, label_keys in signal_label_sets.items()
+                                 if label_keys == labels]
+            preview = list(files_with_header[:3])
+            more = f" (+{len(files_with_header)-3} more)" if len(files_with_header) > 3 else ""
+            print(f"  signature {i+1}: {len(labels)} channels, "
+                  f"{len(files_with_header)} file(s), e.g. {preview}{more}")
+        print("This may indicate inconsistent EDF signal labels across recordings "
+              "or multiple subjects across files in the EDF data folder.")
+        print("Alternatively, this may be due to multiple recording montages during "
+              "e.g., the same stay in the epilepsy monitoring unit.")
+        print("Full labels are available via `audit-subject-eeg --print-edf-signal-header`.")
         continue_input = logged_input("Continue? (only continue if recordings have been confirmed as coming from the same subject and EMU stay for data integrity) yes/no: ")
         if continue_input.lower() not in ['yes', 'y']:
             raise RuntimeError("Aborting EDF de-identification conversion due to inconsistent signal headers.")
@@ -949,6 +1190,14 @@ def get_clean_eeg_cli_arguments():
                              "which can take minutes on multi-GB Nihon Kohden files. Headers "
                              "and annotations are still de-identified; only the cross-check "
                              "that signals survived byte-identical is skipped.")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-run de-identification even if deidentify.json already exists "
+                             "in the output directory. Without --force, a pre-existing manifest "
+                             "short-circuits straight to the transfer prompt.")
+    parser.add_argument("--force_load_all", action="store_true",
+                        help=f"Bypass the {MAX_CONSECUTIVE_LOAD_FAILURES}-consecutive-load-failure "
+                             "abort. Use only after inspecting the failed files' errors and "
+                             "confirming the remaining files are worth attempting.")
 
     args = parser.parse_args()
 
@@ -1080,6 +1329,8 @@ if __name__ == "__main__":
             skip_header_name_check=args.skip_header_name_check,
             benchmark=args.benchmark,
             skip_audit=args.skip_audit,
+            force=args.force,
+            force_load_all=args.force_load_all,
         )
 
     except Exception:

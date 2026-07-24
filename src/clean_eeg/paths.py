@@ -5,6 +5,11 @@ DATA_DIR = PACKAGE_DIR / 'data'
 AUTO_WORD_WHITELIST_PATH = DATA_DIR /'auto_word_whitelist.json'
 # words added manually
 MANUAL_WORD_WHITELIST_PATH = DATA_DIR / 'manual_word_whitelist.json'
+# per-site regex whitelist for standard/boilerplate annotations that
+# should NOT be surfaced in the end-of-run 'Human review needed' block
+# even when the redactor flagged them. Grown over time as operators
+# identify recurring patterns per hospital site.
+ANNOTATION_BOILERPLATE_WHITELIST_PATH = DATA_DIR / 'annotation_boilerplate_whitelist.json'
 
 TEST_DIR = PACKAGE_DIR / 'tests'
 TEST_DATA_DIR = TEST_DIR / "test_data"

@@ -106,29 +106,33 @@ def test_deidentify_edf():
 
 @pytest.mark.parametrize("inplace", [False, True])
 def test_clean_subject_edf_files(monkeypatch, inplace):
-    responses = iter(["y"])  # answers in sequence
+    # One "y" for the recording-gap prompt (the test subject data has
+    # a ~59-minute gap between the two files, above the 60 s threshold).
+    # The transfer prompt is short-circuited via auto_transfer_response.
+    responses = iter(["y"])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
 
     from clean_eeg.clean_subject_eeg import clean_subject_edf_files
     from pathlib import Path
 
     output_path = TEST_SUBJECT_DATA_DIR / 'temp_clean_output'
-    if not output_path.exists():
-        os.makedirs(output_path)
-    elif inplace:
-        # for inplace, clear out existing files in output_path
-        for f in os.listdir(output_path):
-            os.remove(os.path.join(output_path, f))
+    # Wipe any leftover state (including a prior run's deidentify.json,
+    # which would trigger the 'already done' fast path) — the test
+    # must always exercise a fresh de-id run.
+    if output_path.exists():
+        shutil.rmtree(output_path)
+    os.makedirs(output_path)
 
     if inplace:
         shutil.copyfile(SUBJECT_EDF_PATH1, os.path.join(output_path, os.path.basename(SUBJECT_EDF_PATH1)))
         shutil.copyfile(SUBJECT_EDF_PATH2, os.path.join(output_path, os.path.basename(SUBJECT_EDF_PATH2)))
-    
+
     clean_subject_edf_files(subject_name=PATIENT_NAME,
                             subject_code=SUBJECT_CODE,
                             input_path=str(TEST_SUBJECT_DATA_DIR) if not inplace else str(output_path),
                             output_path=str(output_path),
-                            inplace=inplace)
+                            inplace=inplace,
+                            auto_transfer_response="n")
     
     # check that file was created
     filename_no_ext1 = Path(SUBJECT_EDF_PATH1).stem
@@ -149,8 +153,12 @@ def test_clean_subject_edf_files_w_large_gap(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
 
     output_path = TEST_SUBJECT_DATA_DIR / 'temp_clean_output'
-    if not output_path.exists():
-        os.makedirs(output_path)
+    # Prior tests may have left a deidentify.json here — clear so the
+    # gap check actually runs (otherwise the completion fast-path
+    # returns before we get anywhere near _check_recording_gaps).
+    if output_path.exists():
+        shutil.rmtree(output_path)
+    os.makedirs(output_path)
     
     # assert RunTimeError is raised with pytest due to large time gap between recordings
     try:
@@ -385,6 +393,7 @@ def test_clean_subject_edf_files_repairs_degenerate_phys_range(monkeypatch, tmp_
         subject_name=PATIENT_NAME,
         inplace=inplace,
         raise_errors=True,
+        auto_transfer_response="n",
     )
 
     # Locate the cleaned output file (named with timestamp suffix), skipping
@@ -458,6 +467,7 @@ def test_pipeline_skips_file_with_non_ascii_label_gracefully(tmp_path,
             subject_name=PATIENT_NAME,
             inplace=True,
             raise_errors=False,
+            auto_transfer_response="n",
         )
     except RuntimeError:
         # It's OK if the run raises (e.g. "No EDF files loaded" when
@@ -480,9 +490,10 @@ def test_audit_runs_on_every_file_with_pyedflib_cross_check(monkeypatch,
     """Default behaviour: every file gets the streamed mmap audit AND a
     single-channel pyedflib cross-check. Verifies (1) more than 2 files
     in a subject don't fall out of the audit set (we used to cap at 2)
-    and (2) the pyedflib cross-check message appears in the audit
-    output for every audited file."""
-    responses = iter(["y"] * 10)
+    and (2) the audit actually ran on every file (would raise if a
+    signal disagreed) — evidence is the manifest's file_hashes, which
+    covers every file that made it through the audit successfully."""
+    responses = iter([])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
 
     input_dir = tmp_path / "in"
@@ -495,6 +506,19 @@ def test_audit_runs_on_every_file_with_pyedflib_cross_check(monkeypatch,
                                                  sample_rate=100,
                                                  duration_s=2)
 
+    # Wrap the audit to count invocations — a stronger guarantee than
+    # the old "check the stdout for N audit lines" pattern (which broke
+    # when we moved per-file confirmations out of stdout).
+    import clean_eeg.clean_subject_eeg as _csm
+    audit_call_count = {"n": 0}
+    real_audit = _csm._audit_signal_integrity
+
+    def counting_audit(*args, **kwargs):
+        audit_call_count["n"] += 1
+        return real_audit(*args, **kwargs)
+
+    monkeypatch.setattr(_csm, "_audit_signal_integrity", counting_audit)
+
     clean_subject_edf_files(
         input_path=str(input_dir),
         output_path=str(input_dir),
@@ -502,18 +526,25 @@ def test_audit_runs_on_every_file_with_pyedflib_cross_check(monkeypatch,
         subject_name=PATIENT_NAME,
         inplace=True,
         raise_errors=True,
+        auto_transfer_response="n",
     )
 
-    out = capsys.readouterr().out
-    audit_lines = [l for l in out.splitlines() if "Audit passed" in l]
-    assert len(audit_lines) == n_files, (
-        f"expected {n_files} audit confirmations (one per file), "
-        f"got {len(audit_lines)}: {audit_lines}"
+    assert audit_call_count["n"] == n_files, (
+        f"expected {n_files} audit invocations (one per file), "
+        f"got {audit_call_count['n']}"
     )
-    # Every audit message must mention the pyedflib cross-check signal.
-    for line in audit_lines:
-        assert "pyedflib cross-check" in line, \
-            f"audit line missing pyedflib cross-check note: {line!r}"
+    # Manifest records a hash for every audited file — cross-checks that
+    # the pipeline both ran the audit AND wrote the output.
+    from clean_eeg.deidentify_manifest import read_manifest
+    manifest = read_manifest(input_dir)
+    assert manifest is not None
+    # inplace mode writes both the main EDF and its _annotations stub;
+    # both survive the audit and land in file_hashes.
+    hashed = list(manifest["file_hashes"].keys())
+    non_stub = [h for h in hashed if "_annotations" not in h]
+    assert len(non_stub) == n_files, (
+        f"manifest should hash one main EDF per file: {hashed}"
+    )
 
 
 def test_audit_raises_runtime_error_on_signal_corruption(tmp_path):
@@ -752,6 +783,7 @@ def test_empty_edf_file_produces_user_readable_error(monkeypatch, tmp_path, caps
         subject_name=PATIENT_NAME,
         inplace=True,
         raise_errors=False,
+        auto_transfer_response="n",
     )
 
     out = capsys.readouterr().out
@@ -801,6 +833,7 @@ def test_load_failure_dumps_header_for_empty_n_signals(monkeypatch, tmp_path, ca
         subject_name=PATIENT_NAME,
         inplace=True,
         raise_errors=False,
+        auto_transfer_response="n",
     )
 
     out = capsys.readouterr().out
@@ -812,144 +845,22 @@ def test_load_failure_dumps_header_for_empty_n_signals(monkeypatch, tmp_path, ca
     assert "n_signals" in out
 
 
-def _run_pipeline_for_transfer_command(tmp_path):
-    """Helper: run a minimal pipeline and return the captured stdout.
-    Used by the rsync/scp transfer-command tests."""
-    input_dir = tmp_path / "in"
-    input_dir.mkdir()
-    edf_path = input_dir / "ok.edf"
-    _write_minimal_edfplus_with_annotations(str(edf_path),
-                                              n_channels=3,
-                                              sample_rate=100,
-                                              duration_s=2)
-    clean_subject_edf_files(
-        input_path=str(input_dir),
-        output_path=str(input_dir),
-        subject_code=SUBJECT_CODE,
-        subject_name=PATIENT_NAME,
-        inplace=True,
-        raise_errors=True,
-    )
-
-
-def test_transfer_command_uses_rsync_when_available(monkeypatch,
-                                                     tmp_path,
-                                                     capsys):
-    """When rsync is available on the system, the printed transfer
-    recommendation must be rsync only:
-    - --exclude='quarantine/' so partially-processed files are skipped
-    - --partial so long uploads resume cleanly on connection failure
-    - source path with trailing slash so log.out is picked up
-    No scp command should be printed in this branch."""
-    responses = iter(["y"] * 5)
-    monkeypatch.setattr("builtins.input", lambda _: next(responses))
-    # Force rsync-available branch regardless of the test host.
-    import shutil as _sh
-    monkeypatch.setattr(
-        "clean_eeg.clean_subject_eeg.shutil.which",
-        lambda cmd: "/usr/bin/rsync" if cmd == "rsync" else _sh.which(cmd),
-    )
-
-    _run_pipeline_for_transfer_command(tmp_path)
-
-    out = capsys.readouterr().out
-    assert "rsync" in out, "transfer recommendation must include rsync"
-    assert "--exclude='quarantine/'" in out or '--exclude="quarantine/"' in out, \
-        "rsync command must --exclude='quarantine/'"
-    assert "--partial" in out, \
-        "rsync command must use --partial for resume-on-failure"
-
-    transfer_block_start = out.find("Example commands to transfer")
-    assert transfer_block_start != -1
-    transfer_block = out[transfer_block_start:]
-    for line in transfer_block.splitlines():
-        stripped = line.lstrip()
-        assert not stripped.startswith("scp "), \
-            f"no scp command should be printed when rsync is available: {line!r}"
-    # The rsync command's source path must end with a trailing slash —
-    # that's what makes rsync copy directory *contents* (including
-    # log.out which lives in output_path) rather than the directory
-    # itself.
-    rsync_lines = [l for l in transfer_block.splitlines()
-                   if l.lstrip().startswith("rsync ") or "/ \\" in l]
-    assert any(line.rstrip().rstrip("\\").rstrip().endswith("/")
-               for line in rsync_lines), \
-        "rsync source path must have trailing slash to copy contents (incl log.out)"
-
-    # Permissions: umask 007 on mkdir (so new intermediate dirs are
-    # group-rwx) plus a follow-up recursive chgrp + chmod on the
-    # subject folder so the data team's group (taken via --reference
-    # from the site's incoming dir) owns and can rwx everything.
-    assert "umask 007" in transfer_block, \
-        "mkdir step must use 'umask 007' so new intermediate dirs are group-rwx"
-    chgrp_lines = [l for l in transfer_block.splitlines()
-                   if "chgrp -R" in l and "--reference=" in l]
-    assert chgrp_lines, \
-        "transfer block must include a recursive chgrp with --reference=<site dir>"
-    chmod_lines = [l for l in transfer_block.splitlines()
-                   if "chmod -R g+rwX,o-rwx" in l]
-    assert chmod_lines, \
-        "transfer block must include a recursive chmod -R g+rwX,o-rwx"
-
-
-def test_transfer_command_falls_back_to_scp_when_rsync_unavailable(monkeypatch,
-                                                                     tmp_path,
-                                                                     capsys):
-    """When rsync is NOT available (e.g. Windows without WSL), the
-    transfer recommendation must fall back to scp — and that scp
-    command must explicitly include log.out (the *.edf glob misses
-    it)."""
-    responses = iter(["y"] * 5)
-    monkeypatch.setattr("builtins.input", lambda _: next(responses))
-    # Simulate a system without rsync.
-    import shutil as _sh
-    monkeypatch.setattr(
-        "clean_eeg.clean_subject_eeg.shutil.which",
-        lambda cmd: None if cmd == "rsync" else _sh.which(cmd),
-    )
-
-    _run_pipeline_for_transfer_command(tmp_path)
-
-    out = capsys.readouterr().out
-    transfer_block_start = out.find("Example commands to transfer")
-    assert transfer_block_start != -1
-    transfer_block = out[transfer_block_start:]
-
-    # rsync command line must NOT appear in the transfer block.
-    for line in transfer_block.splitlines():
-        stripped = line.lstrip()
-        assert not stripped.startswith("rsync "), \
-            f"rsync should not be printed when unavailable: {line!r}"
-
-    # scp command line must appear, with both *.edf and log.out.
-    scp_lines = [l for l in transfer_block.splitlines()
-                 if l.lstrip().startswith("scp ")]
-    assert scp_lines, "scp fallback command must be printed"
-    # log.out can be on the same scp line OR continued on the next line
-    # via a trailing backslash. Search the whole transfer block.
-    assert "log.out" in transfer_block, \
-        "scp fallback must explicitly include log.out (the *.edf glob misses it)"
-    assert "*.edf" in transfer_block
-
-    # Permissions: umask 007 on mkdir + follow-up recursive chgrp +
-    # chmod on the subject folder. chgrp uses --reference so the group
-    # matches the site's incoming dir.
-    assert "umask 007" in transfer_block, \
-        "mkdir step must use 'umask 007' so new intermediate dirs are group-rwx"
-    chgrp_lines = [l for l in transfer_block.splitlines()
-                   if "chgrp -R" in l and "--reference=" in l]
-    assert chgrp_lines, \
-        "scp fallback must include a recursive chgrp with --reference=<site dir>"
-    chmod_lines = [l for l in transfer_block.splitlines()
-                   if "chmod -R g+rwX,o-rwx" in l]
-    assert chmod_lines, \
-        "scp fallback must include a recursive chmod -R g+rwX,o-rwx"
+# Transfer-command tests were moved to tests/test_transfer.py — the
+# rsync/scp branching now lives in clean_eeg.transfer, not inside the
+# pipeline. `test_transfer_command_uses_rsync_when_available` and
+# `test_transfer_command_falls_back_to_scp_when_rsync_unavailable`
+# were replaced by `test_transfer_plan_uses_rsync_when_available` /
+# `test_transfer_plan_falls_back_to_scp` (which test the command
+# strings) and `test_transfer_subject_dry_run_returns_plan_without_executing`
+# (which tests orchestration without touching the network).
 
 
 def test_audit_skipped_when_skip_audit_true(monkeypatch, tmp_path, capsys):
-    """skip_audit=True must suppress both the streamed mmap audit AND the
-    pyedflib cross-check — no 'Audit passed' lines should be emitted."""
-    responses = iter(["y"] * 5)
+    """skip_audit=True must not invoke the audit function at all — the
+    prior 'Audit passed' stdout assertion was replaced by a direct
+    call-count check because per-file confirmations no longer scroll
+    to stdout."""
+    responses = iter([])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
 
     input_dir = tmp_path / "in"
@@ -961,6 +872,16 @@ def test_audit_skipped_when_skip_audit_true(monkeypatch, tmp_path, capsys):
                                                  sample_rate=100,
                                                  duration_s=2)
 
+    import clean_eeg.clean_subject_eeg as _csm
+    audit_calls = {"n": 0}
+    real_audit = _csm._audit_signal_integrity
+
+    def counting_audit(*args, **kwargs):
+        audit_calls["n"] += 1
+        return real_audit(*args, **kwargs)
+
+    monkeypatch.setattr(_csm, "_audit_signal_integrity", counting_audit)
+
     clean_subject_edf_files(
         input_path=str(input_dir),
         output_path=str(input_dir),
@@ -969,8 +890,13 @@ def test_audit_skipped_when_skip_audit_true(monkeypatch, tmp_path, capsys):
         inplace=True,
         raise_errors=True,
         skip_audit=True,
+        auto_transfer_response="n",
     )
 
+    assert audit_calls["n"] == 0, (
+        f"skip_audit=True must skip _audit_signal_integrity entirely, "
+        f"got {audit_calls['n']} call(s)"
+    )
     out = capsys.readouterr().out
     assert "Audit passed" not in out
     assert "pyedflib cross-check" not in out
@@ -1115,3 +1041,322 @@ def test_valid_names_pass_validate(tmp_path, capsys):
     # validate_cli_arguments prints a "Loading EDF files" line as a
     # side effect — drain it so test isolation isn't surprising.
     capsys.readouterr()
+
+
+# ---------------------------------------------------------------------
+# Consecutive load-failure cap: 5 consecutive load failures abort the
+# subject rather than churning through more files. `--force_load_all`
+# bypasses. A success in the middle resets the streak.
+# ---------------------------------------------------------------------
+
+def _make_bad_edf(path):
+    """0-byte file — reliably fails validate_edf_minimum_size."""
+    path.write_bytes(b"")
+
+
+def test_load_failure_cap_aborts_after_5_consecutive(tmp_path, monkeypatch, capsys):
+    responses = iter([])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    for i in range(5):
+        _make_bad_edf(input_dir / f"bad{i}.edf")
+
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=False,
+    )
+
+    out = capsys.readouterr().out
+    assert "--force_load_all" in out, (
+        "abort message must mention the --force_load_all escape hatch"
+    )
+    # Manifest MUST NOT be written on an abort — the transfer tool
+    # relies on absence to refuse.
+    from clean_eeg.deidentify_manifest import manifest_exists
+    assert not manifest_exists(input_dir), (
+        "no deidentify.json should be written when the load cap fires"
+    )
+
+
+def test_load_failure_cap_bypassed_by_force_load_all(tmp_path, monkeypatch, capsys):
+    """With --force_load_all, 5 consecutive bad files should NOT abort;
+    the pipeline continues past them and processes whatever remains."""
+    responses = iter([])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    for i in range(5):
+        _make_bad_edf(input_dir / f"bad{i}.edf")
+    # One good file after the bad streak.
+    _write_minimal_edfplus_with_annotations(str(input_dir / "good.edf"),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=False,
+        force_load_all=True,
+        auto_transfer_response="n",
+    )
+
+    out = capsys.readouterr().out
+    assert "--force_load_all" not in out or "Aborting" not in out, (
+        "run should not have aborted with --force_load_all"
+    )
+    # Good file made it through → manifest present.
+    from clean_eeg.deidentify_manifest import read_manifest
+    manifest = read_manifest(input_dir)
+    assert manifest is not None
+    assert manifest["n_files_deidentified"] >= 1
+
+
+def test_load_failure_cap_reset_by_intervening_success(tmp_path, monkeypatch,
+                                                        capsys):
+    """A success in the middle of a bad streak resets the consecutive
+    counter — 4 bad, 1 good, 4 bad = 8 total failures but streak never
+    hit 5, so the pipeline should complete."""
+    responses = iter([])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    # Interleave: 4 bad, 1 good, 4 bad. os.listdir order is not
+    # guaranteed to match creation order, so use alphabetical prefixes
+    # to force the sequence.
+    for i in range(4):
+        _make_bad_edf(input_dir / f"a{i}_bad.edf")
+    _write_minimal_edfplus_with_annotations(str(input_dir / "b_good.edf"),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+    for i in range(4):
+        _make_bad_edf(input_dir / f"c{i}_bad.edf")
+
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=False,
+        auto_transfer_response="n",
+    )
+
+    from clean_eeg.deidentify_manifest import read_manifest
+    manifest = read_manifest(input_dir)
+    assert manifest is not None, "pipeline must have completed"
+
+
+# ---------------------------------------------------------------------
+# Completion marker: deidentify.json's presence is what makes the
+# pipeline offer to skip straight to transfer on re-invocation.
+# --force bypasses. An interrupted run leaves no marker.
+# ---------------------------------------------------------------------
+
+def test_completion_marker_prompts_skip_to_transfer(tmp_path, monkeypatch, capsys):
+    """When a valid manifest already exists in output_path and --force
+    was not passed, re-invoking the pipeline must offer to skip straight
+    to transfer rather than silently redoing de-id."""
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    _write_minimal_edfplus_with_annotations(str(input_dir / "f.edf"),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+
+    # Prime with one clean run.
+    responses = iter([])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=True,
+        auto_transfer_response="n",
+    )
+
+    # Second invocation on the same directory — must hit the
+    # completion fast-path. Assert the transfer tool is called.
+    import clean_eeg.clean_subject_eeg as _csm
+    transfer_calls = []
+    monkeypatch.setattr(_csm, "_invoke_transfer",
+                        lambda path: transfer_calls.append(path))
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=True,
+        # Say yes to the "already done, skip to transfer?" prompt.
+        auto_transfer_response="y",
+    )
+    assert transfer_calls, (
+        "the completion fast-path must invoke transfer when the "
+        "operator confirms"
+    )
+    out = capsys.readouterr().out
+    assert "already present" in out.lower() or "already completed" in out.lower(), (
+        "the fast-path must announce the pre-existing manifest so the "
+        "operator understands why de-id is being skipped"
+    )
+
+
+def test_force_flag_bypasses_completion_marker(tmp_path, monkeypatch, capsys):
+    """--force must skip the completion fast-path. We assert this
+    directly rather than triggering a full second de-id run, since a
+    re-run against an inplace-mode output dir would try to re-de-id
+    the previous run's ``_annotations`` stub (a real limitation of
+    inplace mode, out of scope for this test)."""
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    _write_minimal_edfplus_with_annotations(str(input_dir / "f.edf"),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+
+    responses = iter([])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=True,
+        auto_transfer_response="n",
+    )
+    from clean_eeg.deidentify_manifest import read_manifest
+    first = read_manifest(input_dir)
+    assert first is not None
+
+    # Assert the fast-path fires WITHOUT --force (positive control).
+    import clean_eeg.clean_subject_eeg as _csm
+    fast_path_calls = []
+    monkeypatch.setattr(_csm, "_maybe_skip_to_transfer",
+                        lambda path, auto_response=None: fast_path_calls.append(path))
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=True,
+        # no force
+    )
+    assert fast_path_calls, (
+        "without --force, an existing manifest must trigger the fast-path"
+    )
+
+    # Assert --force bypasses it (the point of this test).
+    fast_path_calls.clear()
+
+    # Stub out downstream so we don't have to worry about the second-run
+    # signal-header divergence caused by annotation stubs in inplace mode.
+    def stub_load(*_args, **_kwargs):
+        return {}  # empty EDF_meta_data → pipeline raises before de-id loop
+    monkeypatch.setattr(_csm, "_load_edf_metadata", stub_load)
+    try:
+        clean_subject_edf_files(
+            input_path=str(input_dir),
+            output_path=str(input_dir),
+            subject_code=SUBJECT_CODE,
+            subject_name=PATIENT_NAME,
+            inplace=True,
+            raise_errors=True,
+            force=True,
+        )
+    except RuntimeError:
+        pass  # expected: stubbed load returns empty
+    assert fast_path_calls == [], (
+        "--force must skip _maybe_skip_to_transfer even when the "
+        "manifest exists"
+    )
+
+
+def test_interrupted_run_leaves_no_manifest(tmp_path, monkeypatch, capsys):
+    """If the pipeline raises mid-loop, no deidentify.json is written —
+    so a subsequent re-invocation starts fresh rather than false-positive
+    triggering the fast-path."""
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    _write_minimal_edfplus_with_annotations(str(input_dir / "f.edf"),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+
+    responses = iter([])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+
+    # Blow up mid-loop.
+    import clean_eeg.clean_subject_eeg as _csm
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash mid de-id")
+    monkeypatch.setattr(_csm, "deidentify_edf", boom)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        clean_subject_edf_files(
+            input_path=str(input_dir),
+            output_path=str(input_dir),
+            subject_code=SUBJECT_CODE,
+            subject_name=PATIENT_NAME,
+            inplace=True,
+            raise_errors=True,
+        )
+
+    from clean_eeg.deidentify_manifest import manifest_exists
+    assert not manifest_exists(input_dir), (
+        "an interrupted run must not leave a completion marker — "
+        "re-invocation must start fresh"
+    )
+
+
+def test_manifest_records_fast_hash_for_every_output(tmp_path, monkeypatch):
+    """Every EDF the pipeline writes must appear in the manifest's
+    file_hashes so the audit can verify byte-identity post-transfer."""
+    responses = iter([])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    n_files = 3
+    for i in range(n_files):
+        _write_minimal_edfplus_with_annotations(
+            str(input_dir / f"f{i}.edf"),
+            n_channels=3, sample_rate=100, duration_s=2,
+        )
+
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=True,
+        auto_transfer_response="n",
+    )
+
+    from clean_eeg.deidentify_manifest import read_manifest
+    manifest = read_manifest(input_dir)
+    assert manifest is not None
+    # inplace writes both the main file and an _annotations stub per input.
+    hashed = list(manifest["file_hashes"].keys())
+    main_files = [h for h in hashed if "_annotations" not in h]
+    assert len(main_files) == n_files
+    # All hashes are 64-char SHA-256 hex.
+    for name, digest in manifest["file_hashes"].items():
+        assert len(digest) == 64, f"{name}: {digest!r}"
+    assert manifest["hash_mode"] == "fast"
+    assert manifest["subject_code"] == SUBJECT_CODE
+    assert manifest["site_code"] == SUBJECT_CODE[-1]

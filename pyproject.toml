@@ -32,6 +32,7 @@ test = ["pytest"]
 [project.scripts]
 print-edf-header = "clean_eeg.print_edf_header:main"
 audit-subject-eeg = "clean_eeg.audit.cli:main"
+transfer-subject-eeg = "clean_eeg.transfer_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -54,5 +55,6 @@ markers = [
     "benchmark: small (~30 MB) pipeline benchmark (not run by default)",
     "benchmark_heavy: large (~150 MB, many annotations) benchmark; minutes + GB of RAM",
     "audit_benchmark: ~1.8 GB audit-performance dataset; ~1 min to generate on first run",
+    "integration: end-to-end tests that hit the network (rhino2 SSH); require credentials, opt-in only",
 ]
-addopts = "-m 'not benchmark and not benchmark_heavy and not audit_benchmark'"
+addopts = "-m 'not benchmark and not benchmark_heavy and not audit_benchmark and not integration'"
