@@ -14,6 +14,8 @@ subsequent audits catch bit rot on disk — see
 from __future__ import annotations
 
 import json
+import os
+import platform
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +36,57 @@ from clean_eeg.print_edf_header import ANNOTATION_STUB_SUFFIX
 
 
 AUDIT_JSON_FILENAME = "edf_audit.json"
+IN_PROGRESS_FILENAME = "edf_audit.in_progress"
+
+
+class AuditInterruptedError(RuntimeError):
+    """Raised when ``audit_subject`` finds an in-progress sentinel from a
+    prior run that didn't complete (Ctrl-C, crash, SIGKILL, cluster
+    preemption). The prior run left no ``edf_audit.json`` — silently
+    starting over would hide from the operator that anything went
+    wrong. Requires an explicit ``force=True`` to clear the sentinel
+    and re-run.
+
+    ``sentinel_path`` is the file to inspect (or delete manually); the
+    remaining attributes come from the sentinel content and describe
+    when/where the prior run started so operators can correlate with
+    cluster logs.
+    """
+
+    def __init__(self, sentinel_path: Path, *, started_at: str | None,
+                 hostname: str | None, pid: int | None):
+        self.sentinel_path = sentinel_path
+        self.started_at = started_at
+        self.hostname = hostname
+        self.pid = pid
+        detail = f"started {started_at or '?'} on {hostname or '?'} (pid={pid or '?'})"
+        super().__init__(
+            f"Previous audit was interrupted ({detail}); left "
+            f"{sentinel_path}. Re-run with force=True to wipe the "
+            f"sentinel and audit from scratch, or delete the sentinel "
+            f"file manually."
+        )
+
+
+def _read_sentinel(sentinel_path: Path) -> dict:
+    """Return the sentinel's recorded metadata, or an empty dict if the
+    file is missing or unreadable. Never raises — a corrupted sentinel
+    still signals interruption; we just can't tell the operator when."""
+    try:
+        return json.loads(sentinel_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_sentinel(sentinel_path: Path) -> None:
+    """Record the start of an audit run to disk. Content is a small
+    self-describing JSON so a stale sentinel from days-ago is still
+    diagnostic (timestamp + host + pid)."""
+    sentinel_path.write_text(json.dumps({
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "hostname": platform.node(),
+        "pid": os.getpid(),
+    }))
 
 
 # ``phase`` is 'start' when a check begins and 'end' when it finishes.
@@ -107,6 +160,23 @@ def audit_subject(subject_dir: str | Path,
     output_dir = Path(output_dir) if output_dir is not None else subject_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Interruption sentinel: a prior run that didn't complete leaves
+    # this file behind (we only remove it on successful completion,
+    # below). Refusing to silently start over is the whole point — the
+    # operator must acknowledge via ``force=True``.
+    sentinel_path = output_dir / IN_PROGRESS_FILENAME
+    if sentinel_path.exists():
+        if not force:
+            meta = _read_sentinel(sentinel_path)
+            raise AuditInterruptedError(
+                sentinel_path,
+                started_at=meta.get("started_at"),
+                hostname=meta.get("hostname"),
+                pid=meta.get("pid"),
+            )
+        sentinel_path.unlink()
+    _write_sentinel(sentinel_path)
+
     edf_files = _discover_edf_files(subject_dir)
     previous = _load_previous_audit(output_dir)
     previous_hashes = None
@@ -141,6 +211,7 @@ def audit_subject(subject_dir: str | Path,
         merged["rechecked_at"] = datetime.now(timezone.utc).isoformat()
         merged["_timings_by_check_s"] = timings
         _write_audit_json(output_dir, merged)
+        sentinel_path.unlink(missing_ok=True)
         return merged
 
     stubs = [p for p in edf_files if p.name.endswith(ANNOTATION_STUB_SUFFIX)]
@@ -192,6 +263,7 @@ def audit_subject(subject_dir: str | Path,
         "_timings_by_check_s": timings,
     }
     _write_audit_json(output_dir, audit)
+    sentinel_path.unlink(missing_ok=True)
     return audit
 
 

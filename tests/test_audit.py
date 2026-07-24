@@ -26,7 +26,12 @@ from clean_eeg.audit.logs import check_log_file
 from clean_eeg.audit.select import select_files
 from clean_eeg.audit.signals import read_signal_window
 from clean_eeg.audit.notebook import build_audit_notebook
-from clean_eeg.audit.subject import AUDIT_JSON_FILENAME, audit_subject
+from clean_eeg.audit.subject import (
+    AUDIT_JSON_FILENAME,
+    IN_PROGRESS_FILENAME,
+    AuditInterruptedError,
+    audit_subject,
+)
 
 
 _SENTINEL_PID = "R1755J X 01-JAN-1900 unknown unknown"
@@ -986,6 +991,125 @@ def test_progress_callback_optional_when_omitted(tmp_path):
 
 
 # --- name-dictionary in-process memoization ------------------------------
+
+
+# --- interruption sentinel ------------------------------------------------
+
+
+def test_sentinel_removed_after_successful_audit(tmp_path):
+    subject_dir = _build_clean_subject(tmp_path)
+    audit_subject(subject_dir, name_dictionary={"nonexistent"})
+    assert not (subject_dir / IN_PROGRESS_FILENAME).exists()
+
+
+def test_sentinel_persists_when_a_check_raises(tmp_path, monkeypatch):
+    """Simulate a Ctrl-C mid-audit: the sentinel must remain so the
+    next invocation can detect the interruption."""
+    subject_dir = _build_clean_subject(tmp_path)
+
+    # Any check will do — patch one that runs late so the sentinel is
+    # definitely already written.
+    import clean_eeg.audit.subject as subject_mod
+
+    def _boom(*_args, **_kwargs):
+        raise KeyboardInterrupt("simulated Ctrl-C")
+
+    monkeypatch.setattr(subject_mod, "check_annotation_phi_scan", _boom)
+    import pytest as _pytest
+    with _pytest.raises(KeyboardInterrupt):
+        audit_subject(subject_dir, name_dictionary={"nonexistent"})
+
+    sentinel = subject_dir / IN_PROGRESS_FILENAME
+    assert sentinel.exists(), "sentinel must survive an interrupted run"
+    # And no completed audit JSON exists — the audit did not finish.
+    assert not (subject_dir / AUDIT_JSON_FILENAME).exists()
+
+
+def test_re_running_after_interruption_raises(tmp_path, monkeypatch):
+    subject_dir = _build_clean_subject(tmp_path)
+    import clean_eeg.audit.subject as subject_mod
+    monkeypatch.setattr(subject_mod, "check_annotation_phi_scan",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError):
+        audit_subject(subject_dir, name_dictionary={"nonexistent"})
+
+    # Second invocation must refuse loudly rather than silently restart.
+    with _pytest.raises(AuditInterruptedError) as exc_info:
+        audit_subject(subject_dir, name_dictionary={"nonexistent"})
+
+    assert exc_info.value.sentinel_path == subject_dir / IN_PROGRESS_FILENAME
+    # Sentinel content should give the operator timestamp + host + pid
+    # for cluster-log correlation.
+    assert exc_info.value.started_at is not None
+    assert exc_info.value.hostname is not None
+    assert exc_info.value.pid is not None
+
+
+def test_force_clears_sentinel_and_completes_audit(tmp_path, monkeypatch):
+    subject_dir = _build_clean_subject(tmp_path)
+    import clean_eeg.audit.subject as subject_mod
+
+    # First run: interrupted mid-audit
+    monkeypatch.setattr(subject_mod, "check_annotation_phi_scan",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError):
+        audit_subject(subject_dir, name_dictionary={"nonexistent"})
+    assert (subject_dir / IN_PROGRESS_FILENAME).exists()
+
+    # Unpatch: subsequent calls run normally
+    monkeypatch.undo()
+
+    # force=True clears the stale sentinel and completes the audit
+    audit = audit_subject(subject_dir, name_dictionary={"nonexistent"},
+                          force=True)
+    assert audit["overall_status"] in ("pass", "warn")
+    assert (subject_dir / AUDIT_JSON_FILENAME).exists()
+    assert not (subject_dir / IN_PROGRESS_FILENAME).exists()
+
+
+def test_sentinel_records_start_metadata(tmp_path):
+    subject_dir = _build_clean_subject(tmp_path)
+    import clean_eeg.audit.subject as subject_mod
+    import pytest as _pytest
+
+    # Interrupt before completion so we can read the sentinel
+    original = subject_mod.check_annotation_phi_scan
+    def _boom(*a, **kw):
+        raise RuntimeError("boom")
+    subject_mod.check_annotation_phi_scan = _boom
+    try:
+        with _pytest.raises(RuntimeError):
+            audit_subject(subject_dir, name_dictionary={"nonexistent"})
+    finally:
+        subject_mod.check_annotation_phi_scan = original
+
+    import json as _json
+    meta = _json.loads((subject_dir / IN_PROGRESS_FILENAME).read_text())
+    assert "started_at" in meta
+    assert "hostname" in meta
+    assert "pid" in meta
+    assert isinstance(meta["pid"], int)
+
+
+def test_corrupted_sentinel_still_signals_interruption(tmp_path):
+    """A malformed sentinel (e.g., disk corruption, partial write) must
+    still block silent restart. The error just carries less metadata."""
+    subject_dir = _build_clean_subject(tmp_path)
+    # Complete one successful audit so edf_audit.json exists (baseline)
+    audit_subject(subject_dir, name_dictionary={"nonexistent"})
+    # Now plant a garbage sentinel by hand — simulates a crashed run
+    # that couldn't finish writing.
+    (subject_dir / IN_PROGRESS_FILENAME).write_text("not json {")
+
+    import pytest as _pytest
+    with _pytest.raises(AuditInterruptedError) as exc_info:
+        audit_subject(subject_dir, name_dictionary={"nonexistent"})
+    # Metadata gracefully missing rather than crashing on parse
+    assert exc_info.value.started_at is None
+    assert exc_info.value.hostname is None
 
 
 def test_load_us_name_dictionary_is_memoized_in_process():

@@ -10,7 +10,9 @@ Options:
                            each subject's outputs land in
                            OUTPUT_DIR/<subject_name>/.
   --force                  Re-run all checks (else: skip if audit exists;
-                           hash-consistency step always runs)
+                           hash-consistency step always runs). Also
+                           clears a stale ``edf_audit.in_progress``
+                           sentinel left by a previous interrupted run.
   --annotation-only        Only run the annotation-dictionary scan
                            (for fast whitelist-seeding iteration)
   --hash-mode {fast,full,none}
@@ -44,6 +46,7 @@ from clean_eeg.audit.hashes import VALID_HASH_MODES
 from clean_eeg.audit.select import select_files
 from clean_eeg.audit.subject import (
     AUDIT_JSON_FILENAME,
+    AuditInterruptedError,
     _discover_edf_files,
     audit_subject,
 )
@@ -177,6 +180,43 @@ def _always_print_warnings(audit: dict, out=None) -> None:
             print(f"    log line {r['line_number']}: {r['redacted_value']!r}", file=out)
 
 
+def _resolve_interrupted_prior(err: AuditInterruptedError,
+                               subject_dir: Path) -> str:
+    """Decide how to handle a prior interrupted audit for ``subject_dir``.
+
+    Returns one of:
+      - ``'wipe'``  — clear the sentinel and re-run this subject.
+      - ``'skip'``  — leave the sentinel in place; skip this subject.
+      - ``'quit'``  — abort the whole batch (only meaningful under
+                      ``--parent``; single-subject mode treats it as
+                      the same exit as ``skip`` after printing).
+
+    Interactive (stdin is a TTY): prompt the operator once per subject.
+    Non-interactive (batch scheduler, redirect): refuse the subject
+    with instructions and continue — silently proceeding could destroy
+    provenance the operator wants to inspect.
+    """
+    print(f"\n[!] {subject_dir.name}: previous audit was interrupted "
+          f"(started {err.started_at or '?'}, host {err.hostname or '?'}, "
+          f"pid {err.pid or '?'})", file=sys.stderr, flush=True)
+    if not sys.stdin.isatty():
+        print(f"    non-interactive session — skipping {subject_dir.name}. "
+              f"Re-run with --force to wipe the sentinel and audit from "
+              f"scratch, or delete {err.sentinel_path} manually.",
+              file=sys.stderr, flush=True)
+        return "skip"
+
+    while True:
+        resp = input(f"    [w]ipe and re-run, [s]kip, [q]uit? ").strip().lower()
+        if resp in ("w", "wipe"):
+            return "wipe"
+        if resp in ("s", "skip", ""):
+            return "skip"
+        if resp in ("q", "quit"):
+            return "quit"
+        print("    please answer w, s, or q.", file=sys.stderr, flush=True)
+
+
 def _make_streaming_progress(quiet: bool):
     """Return a progress callback that prints one line per check as it
     starts and finishes. ``flush=True`` on every print so the operator
@@ -199,7 +239,11 @@ def _make_streaming_progress(quiet: bool):
     return _cb
 
 
-def _run_one_subject(subject_dir: Path, args) -> dict:
+def _run_one_subject(subject_dir: Path, args) -> dict | None:
+    """Audit one subject. Returns the audit dict, or ``None`` if the
+    operator (or batch mode) chose to skip this subject because a prior
+    run was interrupted.
+    """
     # Per-subject output dir: if --output-dir was given, nest under it
     # by subject-folder name (so --parent mode doesn't collide multiple
     # subjects into a single dir). Otherwise write alongside the EDFs.
@@ -217,16 +261,31 @@ def _run_one_subject(subject_dir: Path, args) -> dict:
     vocab, vocab_status = _load_vocab_whitelist(args.vocab_whitelist)
     print(f"[audit] {vocab_status}", flush=True)
     print(f"[audit] auditing {subject_dir}", flush=True)
-    audit = audit_subject(
-        subject_dir,
-        output_dir=out_dir,
-        force=args.force,
-        annotation_only=args.annotation_only,
-        skip_hashes=args.skip_hashes,
-        hash_mode=args.hash_mode,
-        vocab_whitelist=vocab,
-        progress=_make_streaming_progress(quiet=args.quiet),
-    )
+
+    def _do_audit(force: bool) -> dict:
+        return audit_subject(
+            subject_dir,
+            output_dir=out_dir,
+            force=force,
+            annotation_only=args.annotation_only,
+            skip_hashes=args.skip_hashes,
+            hash_mode=args.hash_mode,
+            vocab_whitelist=vocab,
+            progress=_make_streaming_progress(quiet=args.quiet),
+        )
+
+    try:
+        audit = _do_audit(args.force)
+    except AuditInterruptedError as e:
+        decision = _resolve_interrupted_prior(e, subject_dir)
+        if decision == "skip":
+            return None
+        if decision == "quit":
+            print("Operator quit at interrupted subject; aborting batch.",
+                  file=sys.stderr, flush=True)
+            raise SystemExit(1)
+        # 'wipe' — clear sentinel by re-running with force=True.
+        audit = _do_audit(True)
 
     if not args.quiet:
         _print_summary(audit)
@@ -267,7 +326,10 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Write edf_audit.{json,ipynb,html} here instead "
                         "of alongside the EDFs. In --parent mode, per-subject "
                         "outputs land in OUTPUT_DIR/<subject_name>/.")
-    p.add_argument("--force", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="Re-run all checks (overrides idempotent skip) "
+                        "and clear any stale 'edf_audit.in_progress' "
+                        "sentinel left by a previous interrupted run.")
     p.add_argument("--annotation-only", action="store_true")
     p.add_argument("--hash-mode", choices=VALID_HASH_MODES, default="fast",
                    help="fast (default): hash header + 2 s at start, middle, "
@@ -307,13 +369,25 @@ def main(argv: list[str] | None = None) -> int:
             print(f"No subdirectories found in {args.parent}", file=sys.stderr)
             return 1
         overall_fail = False
+        skipped: list[str] = []
         for s in subjects:
             audit = _run_one_subject(s, args)
+            if audit is None:
+                skipped.append(s.name)
+                continue
             if audit.get("overall_status") == "fail":
                 overall_fail = True
-        return 1 if overall_fail else 0
+        if skipped:
+            print(f"\n[!] Skipped {len(skipped)} subject(s) with interrupted "
+                  f"prior audits: {skipped}. Re-run with --force to wipe and "
+                  f"audit from scratch.", file=sys.stderr, flush=True)
+        # Any skip or fail is a non-zero exit — batch schedulers rely on
+        # this to notice partial completions.
+        return 1 if (overall_fail or skipped) else 0
 
     audit = _run_one_subject(args.subject_dir, args)
+    if audit is None:
+        return 1
     return 1 if audit.get("overall_status") == "fail" else 0
 
 
