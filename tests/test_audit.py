@@ -1435,15 +1435,20 @@ def test_uniformity_pass_single_file(tmp_path):
     assert result["n_unique_signatures"] == 1
 
 
-def test_uniformity_fail_different_sample_rates(tmp_path):
+def test_uniformity_ignores_samples_per_record_drift(tmp_path):
+    """samples_per_record depends on record_duration, which some
+    recorders vary across files even at a fixed physical sample rate.
+    It's still reported in per-field variability so operators see the
+    drift, but it must not fragment the montage signature."""
     _write_edf_with_signals(tmp_path / "fast.edf",
                             n_records=5, samples_per_record=500)
     _write_edf_with_signals(tmp_path / "slow.edf",
                             n_records=5, samples_per_record=100)
     result = check_signal_header_uniformity(sorted(tmp_path.glob("*.edf")))
-    assert result["status"] == "fail"
-    assert result["n_unique_signatures"] == 2
-    assert any("distinct signal-header signatures" in msg for msg in result["issues"])
+    assert result["status"] == "pass"
+    assert result["n_unique_signatures"] == 1
+    # Diagnostic still names the drift, even though it didn't fragment.
+    assert result["field_variability"]["samples_per_record"] == 2
 
 
 def test_uniformity_fail_different_labels(tmp_path):
@@ -1513,32 +1518,33 @@ def test_uniformity_reports_per_field_variability(tmp_path):
     """When signatures fragment, the check must name the specific
     montage fields with per-file variation so the operator can tell
     which axis of the montage changed."""
-    # Two files where sample rate differs — labels and units match.
-    # Signature fragments, and varying_fields should name only
-    # samples_per_record.
+    # Two files where channel labels differ — samples_per_record
+    # matches. Signature fragments (labels ARE part of the signature),
+    # and varying_fields names label. samples_per_record isn't listed
+    # because it doesn't vary between these two files.
     _write_edf_with_signals(tmp_path / "a.edf",
-                            n_records=5, samples_per_record=100)
+                            n_records=5, samples_per_record=100,
+                            label_prefix="EEG")
     _write_edf_with_signals(tmp_path / "b.edf",
-                            n_records=5, samples_per_record=250)
+                            n_records=5, samples_per_record=100,
+                            label_prefix="ECG")
 
     result = check_signal_header_uniformity(sorted(tmp_path.glob("*.edf")))
     assert result["status"] == "fail"
-    assert set(result["varying_fields"]) == {"samples_per_record"}, (
-        result["varying_fields"]
-    )
+    assert set(result["varying_fields"]) == {"label"}, result["varying_fields"]
     # And the human-readable issues list surfaces that field name.
-    assert any("samples_per_record" in m for m in result["issues"]), result["issues"]
+    assert any("label" in m for m in result["issues"]), result["issues"]
 
 
 def test_uniformity_caps_per_signature_enumeration(tmp_path):
     """When many signatures fragment, the summary must not enumerate
     every one — that's exactly the noise the compression is meant to
     avoid. Full mapping still lives in edf_audit.json."""
-    # 8 files with 8 distinct sample rates → 8 signatures.
+    # 8 files with 8 distinct label prefixes → 8 signatures.
     for i in range(8):
         _write_edf_with_signals(tmp_path / f"f{i}.edf",
-                                n_records=5,
-                                samples_per_record=100 + i * 10)
+                                n_records=5, samples_per_record=100,
+                                label_prefix=f"CH{i}")
 
     result = check_signal_header_uniformity(sorted(tmp_path.glob("*.edf")))
     assert result["n_unique_signatures"] == 8

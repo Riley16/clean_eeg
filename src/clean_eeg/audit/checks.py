@@ -372,15 +372,22 @@ def check_byte_geometry(edf_paths: Iterable[str | Path]) -> dict:
     }
 
 
-# Fields that define a subject's montage (should be identical across
-# every recording of the same subject). Deliberately EXCLUDES phys_min /
-# phys_max / dig_min / dig_max — those are calibration values derived
-# from the actual signal extremes within each recording, so they legit-
-# imately vary from file to file even when the montage is unchanged.
-# Including them fragmented signatures on every real subject.
+# Fields the audit reports per signal (recorded in edf_audit.json and
+# fed into the per-field variability diagnostic). Includes fields that
+# ARE informative but should not fragment the montage signature.
 _SIGNAL_UNIFORMITY_FIELDS = (
     "label", "samples_per_record", "phys_dim",
 )
+
+# Strict subset used in the montage signature. Deliberately excludes:
+#   - phys_min / phys_max / dig_min / dig_max — calibration values the
+#     recorder derives from actual signal extremes per recording; they
+#     vary from file to file even when the montage is unchanged.
+#   - samples_per_record — depends on record_duration, which some
+#     recorders vary across files even at a fixed sample rate.
+# What remains is what defines a montage in practice: which channels
+# were recorded, and what units they carry.
+_SIGNATURE_FIELDS = ("label", "phys_dim")
 
 
 def _canonical_field_value(field: str, value):
@@ -397,12 +404,14 @@ def _canonical_field_value(field: str, value):
 
 
 def _signal_header_signature(sigs: list, *, ignore_annotation_channel: bool) -> tuple:
-    """Deterministic hashable signature of a file's signal headers.
+    """Deterministic hashable signature of a file's montage.
 
-    Fields are canonicalized (stripped / rounded) so functionally
-    identical headers produce identical signatures — otherwise minor
-    representation drift across files (float precision, ASCII padding)
-    would make every file appear to have a unique montage.
+    Compares only :data:`_SIGNATURE_FIELDS` (label + phys_dim). Other
+    per-signal fields are recorded in the JSON report and surfaced by
+    the per-field variability diagnostic, but do not fragment the
+    signature — they legitimately vary from recording to recording
+    even when the montage is unchanged (see :data:`_SIGNATURE_FIELDS`
+    docstring).
     """
     channels = []
     for s in sigs:
@@ -411,7 +420,7 @@ def _signal_header_signature(sigs: list, *, ignore_annotation_channel: bool) -> 
             continue
         channels.append(tuple(
             _canonical_field_value(f, s.get(f))
-            for f in _SIGNAL_UNIFORMITY_FIELDS
+            for f in _SIGNATURE_FIELDS
         ))
     return tuple(channels)
 
