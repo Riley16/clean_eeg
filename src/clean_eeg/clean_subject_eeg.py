@@ -1043,22 +1043,23 @@ if __name__ == "__main__":
             log_path = logger.log_path
         validate_cli_arguments(args)
 
-        # Log the installed version up-front so shared log.out files always
-        # carry provenance for the code that produced them.
-        try:
-            from importlib.metadata import version as _pkg_version
-            _installed_version = _pkg_version("clean_eeg")
-        except Exception:
-            _installed_version = "unknown"
-        print(f"clean_eeg version: {_installed_version}")
-
-        # Register subject name parts as PHI for log scrubbing
+        # Register subject name parts as PHI first so the provenance
+        # block that follows (which includes sys.argv) gets scrubbed on
+        # write via the tee. rescrub() also cleans anything already
+        # written (e.g., interactive-prompt captures) with the new patterns.
         for name_part in [args.first_name, args.last_name]:
             logger.add_phi(name_part)
         if args.middle_name and args.middle_name != "NOT_SPECIFIED":
             for mn in args.middle_name.split('_'):
                 logger.add_phi(mn)
         logger.rescrub()
+
+        # Full environment provenance: clean_eeg version + git SHA + dirty
+        # flag + command line + python + OS + key-dep versions. Load-bearing
+        # for reproducing an issue reported months after a subject shipped.
+        from clean_eeg.provenance import log_environment_provenance
+        log_environment_provenance(logger)
+
         logger.log_args(args)
 
         middle_names = [mn for mn in args.middle_name.split('_') if mn] if args.middle_name else []
