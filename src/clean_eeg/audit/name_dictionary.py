@@ -1,42 +1,72 @@
-"""Disk-cached loader for the US name dictionary.
+"""US name dictionary loader for the audit's annotation PHI scan.
 
-The raw ``name_dataset`` build (see [scripts/build_whitelist.py]) reads
-a 32M-row CSV and produces a ~4M-name set — ~23s on cold start every
-audit run. Since the audit's name dictionary should be identical for
-every subject in a given deployment, we cache the derived set to
-``data/name_dictionary_cache/<countries>.pkl`` and rebuild only when
-the source CSVs are newer than the cache.
+Loads the derived set of unique casefolded first + last names from the
+gzipped text file shipped in ``data/name_dictionary/us_names.txt.gz``.
+That file is generated once from the raw ``name_dataset`` CSVs (see
+``scripts/build_us_name_dictionary.py``) and committed to the repo so
+the audit runs out-of-the-box on fresh installs — including cluster
+deployments that never provisioned the ~10 GB raw dataset.
 
-The cache is a plain pickle of a ``frozenset[str]``. It's kept under
-``data/`` (gitignored) because it's a derived artifact, one per machine.
+Format is deliberately simple: newline-delimited UTF-8 text, sorted,
+casefolded, gzipped. Human-inspectable when gunzipped, cross-language
+readable, no arbitrary-code-execution risk on load (unlike pickle).
+
+The loader still supports building from raw CSVs when the caller
+requests countries other than US or explicitly asks to regenerate;
+that path uses :func:`build_name_set_from_csvs`.
 """
 
 from __future__ import annotations
 
 import functools
-import pickle
+import gzip
 from pathlib import Path
-
-import pandas as pd
 
 from clean_eeg.paths import DATA_DIR
 
 
+# Shipped, ready-to-use derived artifact — the primary load path.
+US_NAMES_TXT_GZ = DATA_DIR / "name_dictionary" / "us_names.txt.gz"
+
+# Raw dataset location for the regeneration / other-country fallback
+# path. This directory is gitignored — it holds ~10 GB of source CSVs
+# that must be provisioned separately (see scripts/build_whitelist.py).
 NAME_DATA_PATH = DATA_DIR / "name_dataset" / "data"
-_CACHE_DIR = DATA_DIR / "name_dictionary_cache"
 
 
-def _build_name_set(countries: tuple[str, ...]) -> frozenset[str]:
-    """Load first + last name columns from the requested country CSVs
-    (columns: ``FirstName, LastName, Gender, Country``), union them,
-    and casefold. Same output as
-    ``scripts.build_whitelist.load_names_dataset_names`` but reachable
-    from an installed package (which cannot import top-level
-    ``scripts``).
+class NameDictionaryUnavailable(RuntimeError):
+    """Raised when neither the shipped gzipped names file nor the raw
+    CSV source is accessible for the requested countries. Distinct
+    exception type so callers can degrade gracefully (skip the
+    name-dictionary scan) rather than crashing the whole audit."""
+
+
+def _load_from_gzip_text(path: Path) -> frozenset[str]:
+    """Read the newline-delimited gzipped names file into a frozenset."""
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        return frozenset(line.rstrip("\n") for line in f if line.strip())
+
+
+def build_name_set_from_csvs(countries: tuple[str, ...]) -> frozenset[str]:
+    """Union first + last names from the raw per-country CSVs
+    (``FirstName, LastName, Gender, Country`` columns), casefolded.
+
+    Used when the caller asks for countries other than US (the shipped
+    gzip covers US only) or wants to regenerate the derived set.
+    Requires ``pandas`` and the raw dataset on disk; raises
+    :class:`NameDictionaryUnavailable` if the CSVs are missing.
     """
+    import pandas as pd  # lazy: pandas is heavy and only this path needs it
+
     frames = []
     for c in countries:
         path = NAME_DATA_PATH / f"{c.upper()}.csv"
+        if not path.exists():
+            raise NameDictionaryUnavailable(
+                f"Raw name-dataset CSV not found at {path}. The gzipped "
+                "shipped file covers US only; other countries require "
+                "the raw dataset. See scripts/build_whitelist.py."
+            )
         frames.append(pd.read_csv(
             path, names=["FirstName", "LastName", "Gender", "Country"]))
     df = pd.concat(frames, ignore_index=True)
@@ -46,48 +76,33 @@ def _build_name_set(countries: tuple[str, ...]) -> frozenset[str]:
                      if isinstance(n, str) and n)
 
 
-def _cache_path(countries: tuple[str, ...]) -> Path:
-    key = "_".join(sorted(c.upper() for c in countries))
-    return _CACHE_DIR / f"{key}.pkl"
-
-
-def _cache_is_fresh(cache_path: Path, countries: tuple[str, ...]) -> bool:
-    """True iff the cache exists and is newer than every source CSV for
-    the requested countries. Missing source files → cache is not fresh
-    (safest default: force rebuild)."""
-    if not cache_path.exists():
-        return False
-    cache_mtime = cache_path.stat().st_mtime
-    for c in countries:
-        csv_path = Path(NAME_DATA_PATH) / f"{c.upper()}.csv"
-        if not csv_path.exists():
-            return False
-        if csv_path.stat().st_mtime > cache_mtime:
-            return False
-    return True
-
-
 @functools.lru_cache(maxsize=4)
 def load_us_name_dictionary(countries: tuple[str, ...] = ("US",)) -> frozenset[str]:
     """Return the lowercased union of first + last names for ``countries``.
 
-    Two-level cache:
-      - **in-process** — this function is memoized, so repeated calls in
-        the same process (e.g., ``audit-subject-eeg --parent`` looping
-        across 20 subjects) pay the pickle-load cost only once.
-      - **on-disk** — the derived set is pickled to
-        ``data/name_dictionary_cache/<countries>.pkl`` and rebuilt only
-        when the source CSVs are newer. Delete that dir to force a rebuild.
-    """
-    cache_path = _cache_path(countries)
-    if _cache_is_fresh(cache_path, countries):
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
+    Fast path (default ``countries=("US",)``): decode the shipped gzip'd
+    text file. ~0.5 s cold, memoized in-process for zero-cost reuse
+    across subjects when auditing in ``--parent`` mode.
 
-    names = _build_name_set(countries)
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    with open(tmp, "wb") as f:
-        pickle.dump(names, f, protocol=pickle.HIGHEST_PROTOCOL)
-    tmp.replace(cache_path)  # atomic swap so a killed run can't corrupt
-    return names
+    Fallback path (other countries, or shipped file missing): rebuild
+    from the raw CSVs via :func:`build_name_set_from_csvs`. Raises
+    :class:`NameDictionaryUnavailable` if neither source is accessible.
+    """
+    if countries == ("US",) and US_NAMES_TXT_GZ.exists():
+        return _load_from_gzip_text(US_NAMES_TXT_GZ)
+
+    if countries == ("US",):
+        # US requested but shipped file missing — degrade to CSV rebuild
+        # so a repo cloned without the LFS/large-file blob still works
+        # if the operator has the raw CSVs.
+        try:
+            return build_name_set_from_csvs(countries)
+        except NameDictionaryUnavailable:
+            raise NameDictionaryUnavailable(
+                f"Neither {US_NAMES_TXT_GZ} nor the raw CSV at "
+                f"{NAME_DATA_PATH / 'US.csv'} is available. Check that "
+                "the shipped file made it through the git checkout "
+                "(should be ~15 MB in data/name_dictionary/)."
+            )
+
+    return build_name_set_from_csvs(countries)
