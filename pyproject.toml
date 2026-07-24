@@ -53,5 +53,6 @@ local_scheme = "no-local-version"
 markers = [
     "benchmark: small (~30 MB) pipeline benchmark (not run by default)",
     "benchmark_heavy: large (~150 MB, many annotations) benchmark; minutes + GB of RAM",
+    "audit_benchmark: ~1.8 GB audit-performance dataset; ~1 min to generate on first run",
 ]
-addopts = "-m 'not benchmark and not benchmark_heavy'"
+addopts = "-m 'not benchmark and not benchmark_heavy and not audit_benchmark'"
