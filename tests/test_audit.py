@@ -1456,7 +1456,13 @@ def test_uniformity_fail_different_labels(tmp_path):
     assert result["n_unique_signatures"] == 2
 
 
-def test_uniformity_fail_different_phys_range(tmp_path):
+def test_uniformity_ignores_phys_range_drift(tmp_path):
+    """phys_min / phys_max / dig_min / dig_max are calibration values
+    the recorder derives from the actual signal extremes within each
+    file, so they legitimately vary from recording to recording even
+    when the montage (labels, sample rate, units) is unchanged.
+    Including them in the signature spuriously fragmented every real
+    subject's summary; the montage is what should be compared."""
     _write_edf_with_signals(tmp_path / "a.edf",
                             n_records=5, samples_per_record=100,
                             phys_min=-3200.0, phys_max=3200.0)
@@ -1464,8 +1470,8 @@ def test_uniformity_fail_different_phys_range(tmp_path):
                             n_records=5, samples_per_record=100,
                             phys_min=-1600.0, phys_max=1600.0)
     result = check_signal_header_uniformity(sorted(tmp_path.glob("*.edf")))
-    assert result["status"] == "fail"
-    assert result["n_unique_signatures"] == 2
+    assert result["status"] == "pass"
+    assert result["n_unique_signatures"] == 1
 
 
 def test_uniformity_fail_different_channel_counts(tmp_path):
@@ -1483,21 +1489,17 @@ def test_uniformity_fail_empty_input():
     assert result["status"] == "fail"
 
 
-def test_uniformity_canonicalizes_float_precision_and_string_padding():
-    """Floating-point round-trip noise (phys_min = 0.9999999 vs
-    1.0000001) and trailing ASCII padding on labels/dims must not
-    fragment signatures — otherwise every file in a full admission
-    can end up with its own 'unique' signature purely from
-    representation drift."""
+def test_uniformity_canonicalizes_string_padding():
+    """Trailing ASCII padding on labels/dims (from fixed-width slots)
+    must not fragment signatures — otherwise files that are
+    functionally identical get counted as distinct montages."""
     from clean_eeg.audit.checks import _signal_header_signature
 
     file_a = [{"label": "EEG Fp1", "samples_per_record": 250,
-               "phys_min": 0.9999999, "phys_max": -0.9999999,
-               "dig_min": -32768, "dig_max": 32767, "phys_dim": "uV"}]
+               "phys_dim": "uV"}]
     file_b = [{"label": "EEG Fp1     ",  # trailing padding
                "samples_per_record": 250,
-               "phys_min": 1.0000001, "phys_max": -1.0000001,
-               "dig_min": -32768, "dig_max": 32767, "phys_dim": "uV  "}]
+               "phys_dim": "uV  "}]
 
     sig_a = _signal_header_signature(file_a, ignore_annotation_channel=True)
     sig_b = _signal_header_signature(file_b, ignore_annotation_channel=True)
@@ -1509,26 +1511,23 @@ def test_uniformity_canonicalizes_float_precision_and_string_padding():
 
 def test_uniformity_reports_per_field_variability(tmp_path):
     """When signatures fragment, the check must name the specific
-    fields with per-file variation so the operator can tell noise
-    (e.g. phys_min drift only) from real montage change (labels
-    differ)."""
-    # Two files where only phys_min varies — dig_min/dig_max/label all
-    # match. Should fail, and 'varying_fields' should name phys_min /
-    # phys_max only.
+    montage fields with per-file variation so the operator can tell
+    which axis of the montage changed."""
+    # Two files where sample rate differs — labels and units match.
+    # Signature fragments, and varying_fields should name only
+    # samples_per_record.
     _write_edf_with_signals(tmp_path / "a.edf",
-                            n_records=5, samples_per_record=100,
-                            phys_min=-3200.0, phys_max=3200.0)
+                            n_records=5, samples_per_record=100)
     _write_edf_with_signals(tmp_path / "b.edf",
-                            n_records=5, samples_per_record=100,
-                            phys_min=-1600.0, phys_max=1600.0)
+                            n_records=5, samples_per_record=250)
 
     result = check_signal_header_uniformity(sorted(tmp_path.glob("*.edf")))
     assert result["status"] == "fail"
-    assert set(result["varying_fields"]) == {"phys_min", "phys_max"}, (
+    assert set(result["varying_fields"]) == {"samples_per_record"}, (
         result["varying_fields"]
     )
-    # And the human-readable issues list surfaces those field names.
-    assert any("phys_min" in m for m in result["issues"]), result["issues"]
+    # And the human-readable issues list surfaces that field name.
+    assert any("samples_per_record" in m for m in result["issues"]), result["issues"]
 
 
 def test_uniformity_caps_per_signature_enumeration(tmp_path):

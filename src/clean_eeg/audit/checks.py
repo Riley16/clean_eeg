@@ -372,33 +372,25 @@ def check_byte_geometry(edf_paths: Iterable[str | Path]) -> dict:
     }
 
 
+# Fields that define a subject's montage (should be identical across
+# every recording of the same subject). Deliberately EXCLUDES phys_min /
+# phys_max / dig_min / dig_max — those are calibration values derived
+# from the actual signal extremes within each recording, so they legit-
+# imately vary from file to file even when the montage is unchanged.
+# Including them fragmented signatures on every real subject.
 _SIGNAL_UNIFORMITY_FIELDS = (
-    "label", "samples_per_record", "phys_min", "phys_max",
-    "dig_min", "dig_max", "phys_dim",
+    "label", "samples_per_record", "phys_dim",
 )
-
-# Float precision for canonicalizing phys_min / phys_max. The EDF ASCII
-# fields carry ~8 chars of precision; rounding to 6 decimals absorbs
-# any floating-point round-trip noise (e.g. 0.9999999 vs 1.0000001)
-# that would otherwise fragment signatures across files that are
-# functionally identical.
-_FLOAT_FIELDS = frozenset({"phys_min", "phys_max"})
-_FLOAT_ROUND_DECIMALS = 6
 
 
 def _canonical_field_value(field: str, value):
     """Normalize one signal-header field for signature comparison.
 
     Strings → stripped (guards against trailing padding from fixed-width
-    ASCII slots). Floats → rounded to a stable precision (guards against
-    parse round-trip noise). Everything else passes through."""
+    ASCII slots — e.g. ``'EEG Fp1     '`` vs ``'EEG Fp1'``). Everything
+    else passes through."""
     if value is None:
         return None
-    if field in _FLOAT_FIELDS:
-        try:
-            return round(float(value), _FLOAT_ROUND_DECIMALS)
-        except (TypeError, ValueError):
-            return value
     if isinstance(value, str):
         return value.strip()
     return value
