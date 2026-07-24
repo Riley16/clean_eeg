@@ -17,7 +17,11 @@ from clean_eeg.audit.annotations import (
     extract_annotations,
     scan_annotation_texts,
 )
-from clean_eeg.audit.hashes import check_transfer_integrity, sha256_of_file
+from clean_eeg.audit.hashes import (
+    check_transfer_integrity,
+    sha256_fast_of_file,
+    sha256_of_file,
+)
 from clean_eeg.audit.logs import check_log_file
 from clean_eeg.audit.select import select_files
 from clean_eeg.audit.signals import read_signal_window
@@ -931,6 +935,77 @@ def test_e2e_audit_skip_hashes_omits_transfer_integrity(tmp_path):
     assert "transfer_integrity" not in audit["checks"]
 
 
+# --- progress callback + per-check timings --------------------------------
+
+
+def test_progress_callback_fires_start_and_end_for_every_check(tmp_path):
+    """Every check that runs must emit exactly one 'start' event followed
+    by one 'end' event with a status + elapsed time. This is what
+    downstream CLIs (audit-subject-eeg's streaming printer) rely on."""
+    subject_dir = _build_clean_subject(tmp_path)
+    events: list[dict] = []
+
+    def _cb(*, name, phase, elapsed_s=None, status=None):
+        events.append({"name": name, "phase": phase,
+                       "elapsed_s": elapsed_s, "status": status})
+
+    audit = audit_subject(subject_dir, name_dictionary={"nonexistent"},
+                          progress=_cb)
+
+    import pytest as _pytest
+    starts = [e for e in events if e["phase"] == "start"]
+    ends = [e for e in events if e["phase"] == "end"]
+    ran_checks = list(audit["checks"].keys())
+
+    # Same set of checks, same order, one start per check followed by
+    # one end per check.
+    assert [e["name"] for e in starts] == ran_checks
+    assert [e["name"] for e in ends] == ran_checks
+
+    # Each end carries the check's own status + a non-negative elapsed.
+    for end in ends:
+        assert end["status"] in ("pass", "warn", "fail")
+        assert end["status"] == audit["checks"][end["name"]]["status"]
+        assert end["elapsed_s"] is not None and end["elapsed_s"] >= 0
+
+    # Timing map matches the checks + roughly aligns with the callback
+    # (allowing loose bounds for measurement jitter).
+    assert set(audit["_timings_by_check_s"]) == set(ran_checks)
+    for end in ends:
+        recorded = audit["_timings_by_check_s"][end["name"]]
+        assert recorded == _pytest.approx(end["elapsed_s"], abs=0.05)
+
+
+def test_progress_callback_optional_when_omitted(tmp_path):
+    """audit_subject must work when no progress callback is passed —
+    the callback is a pure UX addition and cannot be a required arg."""
+    subject_dir = _build_clean_subject(tmp_path)
+    # Should not raise
+    audit = audit_subject(subject_dir, name_dictionary={"nonexistent"})
+    assert "_timings_by_check_s" in audit
+
+
+# --- name-dictionary in-process memoization ------------------------------
+
+
+def test_load_us_name_dictionary_is_memoized_in_process():
+    """Repeated calls in the same process must return the identical
+    frozenset object, not a fresh copy loaded from disk each time.
+    This is what makes --parent mode fast across many subjects."""
+    import pytest as _pytest
+    from clean_eeg.audit.name_dictionary import load_us_name_dictionary
+    from clean_eeg.paths import DATA_DIR
+
+    cache_pkl = DATA_DIR / "name_dictionary_cache" / "US.pkl"
+    if not cache_pkl.exists():
+        _pytest.skip(f"US name-dictionary cache not present at {cache_pkl}")
+
+    a = load_us_name_dictionary(("US",))
+    b = load_us_name_dictionary(("US",))
+    # `is` — same object → memoization is in effect (not just same content).
+    assert a is b
+
+
 def test_e2e_output_dir_isolates_audit_outputs(tmp_path):
     subject_dir = _build_clean_subject(tmp_path)
     out_dir = tmp_path / "elsewhere"
@@ -1381,6 +1456,220 @@ def test_sha256_of_file_matches_known_digest(tmp_path):
     assert sha256_of_file(tmp_path / "hi.txt") == (
         "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
     )
+
+
+# --- fast-hash (head/middle/tail sampling) --------------------------------
+
+
+def _write_edf_for_fast_hash(path, *, n_records=10, samples_per_record=8,
+                             n_signals=1):
+    """Wrapper: a valid EDF with enough records that fast-hash's three
+    2 s windows (2 records each at 1 s/record) don't overlap.
+    """
+    _write_edf_with_signals(path, n_records=n_records,
+                            samples_per_record=samples_per_record,
+                            n_signals=n_signals)
+
+
+def test_fast_hash_returns_fast_mode_on_a_long_file(tmp_path):
+    _write_edf_for_fast_hash(tmp_path / "a.edf")
+
+    digest, mode, details = sha256_fast_of_file(tmp_path / "a.edf")
+
+    assert mode == "fast"
+    assert len(digest) == 64
+    assert details["records_per_window"] == 2  # 2 s @ 1 s/record
+    assert details["window_bytes"] > 0
+    # Windows must be in strict order and non-overlapping
+    offsets = details["window_offsets"]
+    assert offsets["start"] < offsets["middle"] < offsets["end"]
+
+
+def test_fast_hash_deterministic_on_identical_file(tmp_path):
+    _write_edf_for_fast_hash(tmp_path / "a.edf")
+    d1, _, _ = sha256_fast_of_file(tmp_path / "a.edf")
+    d2, _, _ = sha256_fast_of_file(tmp_path / "a.edf")
+    assert d1 == d2
+
+
+def test_fast_hash_falls_back_to_full_on_short_file(tmp_path):
+    # Only 4 records @ 1 s each — three 2 s windows would cover the whole
+    # data body, so the implementation should fall back to full hashing.
+    _write_edf_for_fast_hash(tmp_path / "a.edf", n_records=4)
+
+    digest, mode, details = sha256_fast_of_file(tmp_path / "a.edf")
+
+    assert mode == "full"
+    assert digest == sha256_of_file(tmp_path / "a.edf")
+    assert "too short" in details.get("reason", "")
+
+
+def test_fast_hash_falls_back_to_full_on_unparseable_header(tmp_path):
+    # A 256-byte main-header-only stub has no signal headers and no data —
+    # sha256_fast_of_file cannot compute record geometry and must fall back.
+    _write_edf_stub(tmp_path / "a.edf", n_records=0)
+
+    digest, mode, details = sha256_fast_of_file(tmp_path / "a.edf")
+
+    assert mode == "full"
+    assert digest == sha256_of_file(tmp_path / "a.edf")
+    assert "unparseable" in details.get("reason", "") or "no data" in details.get("reason", "")
+
+
+def test_fast_hash_detects_header_tampering(tmp_path):
+    _write_edf_for_fast_hash(tmp_path / "a.edf")
+    original, _, _ = sha256_fast_of_file(tmp_path / "a.edf")
+
+    with open(tmp_path / "a.edf", "r+b") as f:
+        f.seek(8)  # inside patient_id
+        f.write(b"X")
+
+    tampered, _, _ = sha256_fast_of_file(tmp_path / "a.edf")
+    assert original != tampered
+
+
+def test_fast_hash_detects_start_window_bit_rot(tmp_path):
+    _write_edf_for_fast_hash(tmp_path / "a.edf")
+    original, _, details = sha256_fast_of_file(tmp_path / "a.edf")
+
+    # Flip a byte inside the start window (immediately after the header)
+    with open(tmp_path / "a.edf", "r+b") as f:
+        f.seek(details["window_offsets"]["start"] + 4)
+        f.write(b"\xff")
+
+    corrupted, _, _ = sha256_fast_of_file(tmp_path / "a.edf")
+    assert original != corrupted
+
+
+def test_fast_hash_detects_middle_window_bit_rot(tmp_path):
+    _write_edf_for_fast_hash(tmp_path / "a.edf")
+    original, _, details = sha256_fast_of_file(tmp_path / "a.edf")
+
+    with open(tmp_path / "a.edf", "r+b") as f:
+        f.seek(details["window_offsets"]["middle"] + 4)
+        f.write(b"\xff")
+
+    corrupted, _, _ = sha256_fast_of_file(tmp_path / "a.edf")
+    assert original != corrupted
+
+
+def test_fast_hash_detects_end_window_bit_rot(tmp_path):
+    _write_edf_for_fast_hash(tmp_path / "a.edf")
+    original, _, details = sha256_fast_of_file(tmp_path / "a.edf")
+
+    # Last byte of the file — inside the end window's tail.
+    file_size = (tmp_path / "a.edf").stat().st_size
+    with open(tmp_path / "a.edf", "r+b") as f:
+        f.seek(file_size - 1)
+        f.write(b"\xff")
+
+    corrupted, _, _ = sha256_fast_of_file(tmp_path / "a.edf")
+    assert original != corrupted
+
+
+def test_fast_hash_documented_blind_spot_between_windows(tmp_path):
+    """Regression / feature-lock: bit-rot in the gap *between* windows
+    is NOT detected by fast-hash. This is by design — the operator opts
+    into head/middle/tail sampling and accepts the coverage trade-off.
+
+    If this test starts failing (i.e., the write is being detected), the
+    windowing math changed and someone should audit whether the new
+    coverage still matches the documentation.
+    """
+    # Long enough to have a real gap: 20 records → windows at
+    # start (records 0-1), middle (records 9-10), end (records 18-19).
+    # Byte between the start and middle windows should be untouched.
+    _write_edf_for_fast_hash(tmp_path / "a.edf", n_records=20)
+    original, _, details = sha256_fast_of_file(tmp_path / "a.edf")
+
+    gap_offset = (details["window_offsets"]["start"]
+                  + details["window_bytes"] + 8)
+    assert gap_offset < details["window_offsets"]["middle"]
+    with open(tmp_path / "a.edf", "r+b") as f:
+        f.seek(gap_offset)
+        f.write(b"\xff")
+
+    same, _, _ = sha256_fast_of_file(tmp_path / "a.edf")
+    assert same == original, (
+        "fast-hash should not see bit-rot in the untouched gap between "
+        "windows — if this assertion flips, the windowing changed and "
+        "the doc/coverage claim needs updating"
+    )
+
+
+# --- check_transfer_integrity(hash_mode=...) -----------------------------
+
+
+def test_check_transfer_integrity_records_fast_mode_metadata(tmp_path):
+    _write_edf_for_fast_hash(tmp_path / "a.edf")
+    _write_edf_for_fast_hash(tmp_path / "b.edf")
+
+    result = check_transfer_integrity(sorted(tmp_path.glob("*.edf")),
+                                      hash_mode="fast")
+
+    assert result["hash_mode"] == "fast"
+    assert result["hash_mode_by_file"] == {"a.edf": "fast", "b.edf": "fast"}
+    assert set(result["hash_details_by_file"].keys()) == {"a.edf", "b.edf"}
+
+
+def test_check_transfer_integrity_none_mode_skips_hashing(tmp_path):
+    _write_edf_for_fast_hash(tmp_path / "a.edf")
+
+    result = check_transfer_integrity([tmp_path / "a.edf"], hash_mode="none")
+
+    assert result["hash_mode"] == "none"
+    assert result["status"] == "warn"
+    assert result["file_hashes"] == {}
+    assert any("was not run" in msg for msg in result["issues"])
+
+
+def test_check_transfer_integrity_mode_mismatch_warns_not_fails(tmp_path):
+    """Switching hash_mode invalidates the digest comparison — the
+    check should warn and re-record, not spuriously fail every file."""
+    _write_edf_for_fast_hash(tmp_path / "a.edf")
+
+    prior = check_transfer_integrity([tmp_path / "a.edf"], hash_mode="full")
+    switched = check_transfer_integrity(
+        [tmp_path / "a.edf"],
+        previous_hashes=prior["file_hashes"],
+        previous_hash_mode="full",
+        hash_mode="fast",
+    )
+
+    assert switched["status"] == "warn"
+    assert switched["hash_mode"] == "fast"
+    assert switched["mismatches"] == {}
+    assert any("hash_mode changed" in msg for msg in switched["issues"])
+    # And the newly recorded hashes are the fast digests, not the old full ones
+    assert switched["file_hashes"]["a.edf"] != prior["file_hashes"]["a.edf"]
+
+
+def test_check_transfer_integrity_same_mode_still_detects_mismatch(tmp_path):
+    """Regression guard: the mode-mismatch escape hatch must NOT hide a
+    real content change when the mode is unchanged."""
+    _write_edf_for_fast_hash(tmp_path / "a.edf")
+    prior = check_transfer_integrity([tmp_path / "a.edf"], hash_mode="fast")
+
+    # Real bit-rot inside the start window
+    with open(tmp_path / "a.edf", "r+b") as f:
+        f.seek(prior["hash_details_by_file"]["a.edf"]["window_offsets"]["start"])
+        f.write(b"\xff")
+
+    second = check_transfer_integrity(
+        [tmp_path / "a.edf"],
+        previous_hashes=prior["file_hashes"],
+        previous_hash_mode="fast",
+        hash_mode="fast",
+    )
+    assert second["status"] == "fail"
+    assert "a.edf" in second["mismatches"]
+
+
+def test_check_transfer_integrity_invalid_hash_mode_raises(tmp_path):
+    _write_edf_for_fast_hash(tmp_path / "a.edf")
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="hash_mode"):
+        check_transfer_integrity([tmp_path / "a.edf"], hash_mode="quantum")
 
 
 def test_gaps_custom_threshold_recovers_pass(tmp_path):

@@ -13,6 +13,7 @@ The cache is a plain pickle of a ``frozenset[str]``. It's kept under
 
 from __future__ import annotations
 
+import functools
 import pickle
 from pathlib import Path
 
@@ -66,12 +67,17 @@ def _cache_is_fresh(cache_path: Path, countries: tuple[str, ...]) -> bool:
     return True
 
 
+@functools.lru_cache(maxsize=4)
 def load_us_name_dictionary(countries: tuple[str, ...] = ("US",)) -> frozenset[str]:
     """Return the lowercased union of first + last names for ``countries``.
 
-    Disk-cached: subsequent audits in the same deployment reuse the
-    pickled set (~90 MB → ~1 s load). Delete
-    ``data/name_dictionary_cache/`` to force rebuild.
+    Two-level cache:
+      - **in-process** — this function is memoized, so repeated calls in
+        the same process (e.g., ``audit-subject-eeg --parent`` looping
+        across 20 subjects) pay the pickle-load cost only once.
+      - **on-disk** — the derived set is pickled to
+        ``data/name_dictionary_cache/<countries>.pkl`` and rebuilt only
+        when the source CSVs are newer. Delete that dir to force a rebuild.
     """
     cache_path = _cache_path(countries)
     if _cache_is_fresh(cache_path, countries):

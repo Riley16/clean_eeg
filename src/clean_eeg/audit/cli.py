@@ -13,7 +13,13 @@ Options:
                            hash-consistency step always runs)
   --annotation-only        Only run the annotation-dictionary scan
                            (for fast whitelist-seeding iteration)
-  --skip-hashes            Skip the SHA-256 manifest (fast for slow FS)
+  --hash-mode {fast,full,none}
+                           fast (default): hash header + 2 s at start,
+                           middle, and end of each file (catches
+                           tampering, truncation, endpoint bit-rot at
+                           O(MB) per file). full: SHA-256 the whole
+                           file (O(GB) per file). none: skip hashing.
+  --skip-hashes            DEPRECATED alias for --hash-mode none.
   --quiet                  Suppress terminal output (JSON + notebook still written)
   --no-notebook            Skip notebook + HTML rendering
   --print-annot            Print every annotation (subject to future
@@ -34,6 +40,7 @@ from pathlib import Path
 import re
 
 from clean_eeg.audit.annotations import extract_annotations
+from clean_eeg.audit.hashes import VALID_HASH_MODES
 from clean_eeg.audit.select import select_files
 from clean_eeg.audit.subject import (
     AUDIT_JSON_FILENAME,
@@ -170,6 +177,28 @@ def _always_print_warnings(audit: dict, out=None) -> None:
             print(f"    log line {r['line_number']}: {r['redacted_value']!r}", file=out)
 
 
+def _make_streaming_progress(quiet: bool):
+    """Return a progress callback that prints one line per check as it
+    starts and finishes. ``flush=True`` on every print so the operator
+    sees updates even when stdout is a redirect / batch scheduler
+    (Python block-buffers stdout in that case by default).
+
+    Under ``--quiet`` the callback still emits the final summary lines
+    (start=silent, end=one-liner with status + duration) so operators
+    piping the output to a log get a compact per-check trace.
+    """
+    def _cb(*, name: str, phase: str, elapsed_s: float | None = None,
+            status: str | None = None) -> None:
+        if phase == "start" and not quiet:
+            print(f"[audit] running {name} …", flush=True)
+        elif phase == "end":
+            marker = {"pass": "OK  ", "warn": "WARN", "fail": "FAIL"}.get(
+                status or "?", "?   ")
+            print(f"[audit]   [{marker}] {name}  ({elapsed_s:.2f}s)",
+                  flush=True)
+    return _cb
+
+
 def _run_one_subject(subject_dir: Path, args) -> dict:
     # Per-subject output dir: if --output-dir was given, nest under it
     # by subject-folder name (so --parent mode doesn't collide multiple
@@ -182,17 +211,21 @@ def _run_one_subject(subject_dir: Path, args) -> dict:
     audit_exists = (out_dir / AUDIT_JSON_FILENAME).exists()
     if audit_exists and not args.force:
         print(f"[skip] {subject_dir.name}: {out_dir / AUDIT_JSON_FILENAME} exists "
-              f"(pass --force to re-run all checks; hash-consistency check still runs)")
+              f"(pass --force to re-run all checks; hash-consistency check still runs)",
+              flush=True)
 
     vocab, vocab_status = _load_vocab_whitelist(args.vocab_whitelist)
-    print(f"[audit] {vocab_status}")
+    print(f"[audit] {vocab_status}", flush=True)
+    print(f"[audit] auditing {subject_dir}", flush=True)
     audit = audit_subject(
         subject_dir,
         output_dir=out_dir,
         force=args.force,
         annotation_only=args.annotation_only,
         skip_hashes=args.skip_hashes,
+        hash_mode=args.hash_mode,
         vocab_whitelist=vocab,
+        progress=_make_streaming_progress(quiet=args.quiet),
     )
 
     if not args.quiet:
@@ -236,7 +269,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         "outputs land in OUTPUT_DIR/<subject_name>/.")
     p.add_argument("--force", action="store_true")
     p.add_argument("--annotation-only", action="store_true")
-    p.add_argument("--skip-hashes", action="store_true")
+    p.add_argument("--hash-mode", choices=VALID_HASH_MODES, default="fast",
+                   help="fast (default): hash header + 2 s at start, middle, "
+                        "and end of each file. full: SHA-256 the whole file. "
+                        "none: skip hashing entirely.")
+    p.add_argument("--skip-hashes", action="store_true",
+                   help="DEPRECATED alias for --hash-mode none.")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--no-notebook", action="store_true")
     p.add_argument("--print-annot", action="store_true")

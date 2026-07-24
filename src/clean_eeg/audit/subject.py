@@ -14,8 +14,10 @@ subsequent audits catch bit rot on disk — see
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from clean_eeg.audit.annotations import check_annotation_phi_scan
 from clean_eeg.audit.checks import (
@@ -32,6 +34,32 @@ from clean_eeg.print_edf_header import ANNOTATION_STUB_SUFFIX
 
 
 AUDIT_JSON_FILENAME = "edf_audit.json"
+
+
+# ``phase`` is 'start' when a check begins and 'end' when it finishes.
+# On 'end' the callback also receives the elapsed seconds and the check's
+# status string ('pass'/'warn'/'fail') so a CLI can stream one-line
+# updates as the audit progresses.
+ProgressCallback = Callable[..., None]
+
+
+def _run_check(checks: dict, timings: dict, name: str, fn,
+               progress: ProgressCallback | None) -> dict:
+    """Run one check under a stopwatch, wire progress events, store the
+    result + elapsed time under ``name``. Returns the check's result dict
+    so callers can chain further logic on it (e.g. subject-code extraction).
+    """
+    if progress is not None:
+        progress(name=name, phase="start")
+    t0 = time.perf_counter()
+    result = fn()
+    dt = time.perf_counter() - t0
+    checks[name] = result
+    timings[name] = dt
+    if progress is not None:
+        progress(name=name, phase="end", elapsed_s=dt,
+                 status=result.get("status", "?"))
+    return result
 
 
 def _discover_edf_files(subject_dir: Path) -> list[Path]:
@@ -56,8 +84,10 @@ def audit_subject(subject_dir: str | Path,
                   force: bool = False,
                   annotation_only: bool = False,
                   skip_hashes: bool = False,
+                  hash_mode: str = "fast",
                   name_dictionary=None,
                   vocab_whitelist: set[str] | None = None,
+                  progress: ProgressCallback | None = None,
                   ) -> dict:
     """Run the full audit on a single subject directory.
 
@@ -80,25 +110,36 @@ def audit_subject(subject_dir: str | Path,
     edf_files = _discover_edf_files(subject_dir)
     previous = _load_previous_audit(output_dir)
     previous_hashes = None
+    previous_hash_mode = None
     if previous is not None:
         prev_hash_check = previous.get("checks", {}).get("transfer_integrity", {})
         previous_hashes = prev_hash_check.get("file_hashes")
+        previous_hash_mode = prev_hash_check.get("hash_mode")
 
     checks: dict[str, dict] = {}
-    if not skip_hashes:
-        checks["transfer_integrity"] = check_transfer_integrity(
-            edf_files, previous_hashes=previous_hashes)
+    timings: dict[str, float] = {}
+    # ``skip_hashes`` is the legacy flag; ``hash_mode='none'`` is the
+    # new spelling of the same intent. Either one suppresses hashing.
+    effective_hash_mode = "none" if skip_hashes else hash_mode
+    if effective_hash_mode != "none":
+        _run_check(checks, timings, "transfer_integrity",
+                   lambda: check_transfer_integrity(
+                       edf_files, previous_hashes=previous_hashes,
+                       previous_hash_mode=previous_hash_mode,
+                       hash_mode=effective_hash_mode),
+                   progress)
 
     if previous is not None and not force:
         # Idempotent skip: keep prior check results, only refresh the
         # hash step to catch on-disk changes.
         merged = dict(previous)
         merged.setdefault("checks", {})
-        if not skip_hashes:
+        if effective_hash_mode != "none":
             merged["checks"]["transfer_integrity"] = checks["transfer_integrity"]
         merged["skipped"] = True
         merged["generated_at"] = previous.get("generated_at")
         merged["rechecked_at"] = datetime.now(timezone.utc).isoformat()
+        merged["_timings_by_check_s"] = timings
         _write_audit_json(output_dir, merged)
         return merged
 
@@ -109,22 +150,34 @@ def audit_subject(subject_dir: str | Path,
     annotation_carriers = stubs if stubs else recordings
 
     if annotation_only:
-        checks["annotation_phi_scan"] = check_annotation_phi_scan(
-            annotation_carriers, name_dictionary=name_dictionary,
-            vocab_whitelist=vocab_whitelist)
+        _run_check(checks, timings, "annotation_phi_scan",
+                   lambda: check_annotation_phi_scan(
+                       annotation_carriers, name_dictionary=name_dictionary,
+                       vocab_whitelist=vocab_whitelist),
+                   progress)
     else:
-        checks["subject_code_consistency"] = check_subject_code_consistency(edf_files)
-        checks["header_phi_residue"] = check_header_phi_residue(edf_files)
-        checks["recording_gaps"] = check_recording_gaps(recordings)
-        checks["byte_geometry"] = check_byte_geometry(edf_files)
-        checks["annotation_pairing"] = check_annotation_pairing(edf_files)
-        checks["signal_header_uniformity"] = check_signal_header_uniformity(recordings)
-        checks["annotation_phi_scan"] = check_annotation_phi_scan(
-            annotation_carriers, name_dictionary=name_dictionary,
-            vocab_whitelist=vocab_whitelist)
-        checks["log_file"] = check_log_file(subject_dir / LOG_FILENAME
-                                            if (subject_dir / LOG_FILENAME).exists()
-                                            else None)
+        _run_check(checks, timings, "subject_code_consistency",
+                   lambda: check_subject_code_consistency(edf_files), progress)
+        _run_check(checks, timings, "header_phi_residue",
+                   lambda: check_header_phi_residue(edf_files), progress)
+        _run_check(checks, timings, "recording_gaps",
+                   lambda: check_recording_gaps(recordings), progress)
+        _run_check(checks, timings, "byte_geometry",
+                   lambda: check_byte_geometry(edf_files), progress)
+        _run_check(checks, timings, "annotation_pairing",
+                   lambda: check_annotation_pairing(edf_files), progress)
+        _run_check(checks, timings, "signal_header_uniformity",
+                   lambda: check_signal_header_uniformity(recordings), progress)
+        _run_check(checks, timings, "annotation_phi_scan",
+                   lambda: check_annotation_phi_scan(
+                       annotation_carriers, name_dictionary=name_dictionary,
+                       vocab_whitelist=vocab_whitelist),
+                   progress)
+        _run_check(checks, timings, "log_file",
+                   lambda: check_log_file(
+                       subject_dir / LOG_FILENAME
+                       if (subject_dir / LOG_FILENAME).exists() else None),
+                   progress)
 
     subject_code = checks.get("subject_code_consistency", {}).get("subject_code")
     audit = {
@@ -136,6 +189,7 @@ def audit_subject(subject_dir: str | Path,
         "mode": "annotation_only" if annotation_only else "full",
         "checks": checks,
         "overall_status": _overall_status(checks),
+        "_timings_by_check_s": timings,
     }
     _write_audit_json(output_dir, audit)
     return audit
