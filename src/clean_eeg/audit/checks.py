@@ -219,12 +219,40 @@ def check_recording_gaps(edf_paths: Iterable[str | Path],
                 f"Large gap of {g['gap_seconds']:.1f}s between {g['prev_file']!r} "
                 f"and {g['next_file']!r} (threshold {max_gap_seconds}s) — file possibly missing"
             )
-        for o in overlaps:
+        # Overlaps compress: multi-day recordings often carry the same
+        # sub-second boundary overlap on every consecutive-file pair (a
+        # recorder-format quirk, not per-pair drama). Show the first
+        # OVERLAP_INDIVIDUAL_MAX individually plus any that exceed the
+        # running max by more than OVERLAP_JUMP_S seconds — the rest
+        # collapse into one line so the summary stays scannable. Full
+        # per-pair detail is preserved in the JSON under 'overlaps'.
+        if overlaps:
             status = "fail"
-            issues.append(
-                f"Overlap of {abs(o['gap_seconds']):.1f}s between {o['prev_file']!r} "
-                f"and {o['next_file']!r} — possible duplicate/reorder"
-            )
+            OVERLAP_INDIVIDUAL_MAX = 5
+            OVERLAP_JUMP_S = 2.0
+            running_max_abs = 0.0
+            n_shown = 0
+            n_compressed = 0
+            for o in overlaps:
+                abs_gap = abs(o["gap_seconds"])
+                if (n_shown < OVERLAP_INDIVIDUAL_MAX
+                        or abs_gap > running_max_abs + OVERLAP_JUMP_S):
+                    issues.append(
+                        f"Overlap of {abs_gap:.1f}s between "
+                        f"{o['prev_file']!r} and {o['next_file']!r} — "
+                        "possible duplicate/reorder"
+                    )
+                    n_shown += 1
+                    running_max_abs = max(running_max_abs, abs_gap)
+                else:
+                    n_compressed += 1
+            if n_compressed > 0:
+                issues.append(
+                    f"{n_compressed} more consecutive-file overlap(s) "
+                    f"within {OVERLAP_JUMP_S:.0f}s of the "
+                    f"{running_max_abs:.1f}s max — full list in "
+                    f"'overlaps' in edf_audit.json"
+                )
 
     return {
         "check": "recording_gaps",
@@ -349,16 +377,74 @@ _SIGNAL_UNIFORMITY_FIELDS = (
     "dig_min", "dig_max", "phys_dim",
 )
 
+# Float precision for canonicalizing phys_min / phys_max. The EDF ASCII
+# fields carry ~8 chars of precision; rounding to 6 decimals absorbs
+# any floating-point round-trip noise (e.g. 0.9999999 vs 1.0000001)
+# that would otherwise fragment signatures across files that are
+# functionally identical.
+_FLOAT_FIELDS = frozenset({"phys_min", "phys_max"})
+_FLOAT_ROUND_DECIMALS = 6
+
+
+def _canonical_field_value(field: str, value):
+    """Normalize one signal-header field for signature comparison.
+
+    Strings → stripped (guards against trailing padding from fixed-width
+    ASCII slots). Floats → rounded to a stable precision (guards against
+    parse round-trip noise). Everything else passes through."""
+    if value is None:
+        return None
+    if field in _FLOAT_FIELDS:
+        try:
+            return round(float(value), _FLOAT_ROUND_DECIMALS)
+        except (TypeError, ValueError):
+            return value
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
 
 def _signal_header_signature(sigs: list, *, ignore_annotation_channel: bool) -> tuple:
-    """Deterministic hashable signature of a file's signal headers."""
+    """Deterministic hashable signature of a file's signal headers.
+
+    Fields are canonicalized (stripped / rounded) so functionally
+    identical headers produce identical signatures — otherwise minor
+    representation drift across files (float precision, ASCII padding)
+    would make every file appear to have a unique montage.
+    """
     channels = []
     for s in sigs:
         label = str(s.get("label", "")).strip()
         if ignore_annotation_channel and label == EDF_ANNOTATION_LABEL:
             continue
-        channels.append(tuple(s.get(f) for f in _SIGNAL_UNIFORMITY_FIELDS))
+        channels.append(tuple(
+            _canonical_field_value(f, s.get(f))
+            for f in _SIGNAL_UNIFORMITY_FIELDS
+        ))
     return tuple(channels)
+
+
+def _per_field_uniqueness(per_file_channels: dict[str, list[dict]],
+                          *, ignore_annotation_channel: bool
+                          ) -> dict[str, int]:
+    """Diagnostic: for each signal-header field, how many distinct
+    per-file sequences appear? A value of 1 means that field is uniform
+    across the subject; values > 1 name the fields that fragment the
+    signature. Uses the same canonicalization as the signature itself
+    so what's reported matches what caused divergence."""
+    result: dict[str, int] = {}
+    for field in _SIGNAL_UNIFORMITY_FIELDS:
+        sequences: set = set()
+        for chans in per_file_channels.values():
+            seq = tuple(
+                _canonical_field_value(field, c.get(field))
+                for c in chans
+                if not (ignore_annotation_channel
+                        and str(c.get("label", "")).strip() == EDF_ANNOTATION_LABEL)
+            )
+            sequences.add(seq)
+        result[field] = len(sequences)
+    return result
 
 
 def check_signal_header_uniformity(edf_paths: Iterable[str | Path],
@@ -390,6 +476,10 @@ def check_signal_header_uniformity(edf_paths: Iterable[str | Path],
                                            ignore_annotation_channel=ignore_annotation_channel)
         signature_to_files.setdefault(sig, []).append(p.name)
 
+    field_variability = _per_field_uniqueness(
+        per_file_channels, ignore_annotation_channel=ignore_annotation_channel)
+    varying_fields = sorted(f for f, n in field_variability.items() if n > 1)
+
     issues: list[str] = []
     if not signature_to_files:
         status = "fail"
@@ -398,13 +488,37 @@ def check_signal_header_uniformity(edf_paths: Iterable[str | Path],
         status = "pass"
     else:
         status = "fail"
+        n_files = sum(len(v) for v in signature_to_files.values())
         issues.append(
             f"{len(signature_to_files)} distinct signal-header signatures "
-            f"across {sum(len(v) for v in signature_to_files.values())} files "
-            f"— headers should be uniform within a subject"
+            f"across {n_files} files — headers should be uniform within "
+            f"a subject"
         )
-        for i, (sig, files) in enumerate(signature_to_files.items()):
-            issues.append(f"  signature #{i + 1}: files={sorted(files)}")
+        # Diagnostic: name the specific fields that fragment. If N==files
+        # this is usually float-precision or trailing-padding noise;
+        # varying_fields makes that obvious at a glance instead of
+        # forcing the operator to diff N per-signature channel lists
+        # themselves.
+        if varying_fields:
+            per_field_counts = {f: field_variability[f] for f in varying_fields}
+            issues.append(
+                f"  fragmentation is driven by fields with per-file "
+                f"variation: {per_field_counts}"
+            )
+        # Cap the per-signature enumeration — showing 80 lines of file
+        # lists is worse than useless. Full mapping is in edf_audit.json
+        # under 'signatures'.
+        max_sig_lines = 5
+        for i, (sig, files) in enumerate(
+                list(signature_to_files.items())[:max_sig_lines]):
+            issues.append(f"  signature #{i + 1}: {len(files)} file(s), "
+                          f"e.g. {sorted(files)[:3]}")
+        remaining = len(signature_to_files) - max_sig_lines
+        if remaining > 0:
+            issues.append(
+                f"  … and {remaining} more signature(s); see 'signatures' "
+                f"in edf_audit.json for the full mapping"
+            )
 
     # Serialize signatures for JSON: each signature becomes an id → files.
     signatures_out = {}
@@ -422,6 +536,8 @@ def check_signal_header_uniformity(edf_paths: Iterable[str | Path],
         "n_files": sum(len(v) for v in signature_to_files.values()),
         "n_unique_signatures": len(signature_to_files),
         "signatures": signatures_out,
+        "field_variability": field_variability,
+        "varying_fields": varying_fields,
         "ignore_annotation_channel": ignore_annotation_channel,
         "issues": issues,
     }

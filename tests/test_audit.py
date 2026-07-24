@@ -446,6 +446,89 @@ def test_gaps_fail_overlap(tmp_path):
     assert any("duplicate/reorder" in msg for msg in result["issues"])
 
 
+def test_gaps_overlaps_compress_after_first_five(tmp_path):
+    """Multi-day recordings often have the same sub-second boundary
+    overlap on every consecutive pair. The check should surface the
+    first 5 individually, then collapse the remaining similar-magnitude
+    overlaps into a single count-summary line rather than one line per
+    consecutive pair (which drowned the summary for full-length
+    admissions)."""
+    # 12 consecutive files, each 60s long, each starting 0.3s before
+    # the previous ended (11 identical overlaps in total).
+    for i in range(12):
+        _write_edf_stub(tmp_path / f"f{i:02d}.edf",
+                        starttime=f"{i:02d}.00.00",
+                        n_records=3600 + (1 if i > 0 else 0),
+                        record_duration=1.0)
+    # The stub above doesn't overlap; construct precise overlaps by
+    # setting successive starttimes just under the previous end.
+    # Rewrite explicitly: file i starts at 3600*i - 0.3*i seconds
+    # (a 0.3s overlap per pair, cumulative).
+    for f in tmp_path.glob("*.edf"):
+        f.unlink()
+    for i in range(12):
+        # File i starts at (60 - 0.3) * i minutes of session time.
+        # Represent as HH.MM.SS with sub-second lost to the format —
+        # workaround: shift each file forward by 60 - 1 seconds so the
+        # 60s files each overlap the previous by 1s (identical magnitudes).
+        total_s = i * 59  # 60s file, 1s overlap → 59s stride
+        hh, rem = divmod(total_s, 3600)
+        mm, ss = divmod(rem, 60)
+        _write_edf_stub(tmp_path / f"g{i:02d}.edf",
+                        starttime=f"{hh:02d}.{mm:02d}.{ss:02d}",
+                        n_records=60, record_duration=1.0)
+
+    result = check_recording_gaps(sorted(tmp_path.glob("*.edf")))
+
+    assert result["status"] == "fail"
+    # 11 consecutive-pair overlaps in the raw data.
+    assert len(result["overlaps"]) == 11
+    # In the summary text: 5 individual lines + 1 compressed summary line.
+    overlap_issue_lines = [m for m in result["issues"]
+                           if "Overlap of" in m or "consecutive-file overlap" in m]
+    individual = [m for m in overlap_issue_lines if "Overlap of" in m]
+    compressed = [m for m in overlap_issue_lines if "consecutive-file overlap" in m]
+    assert len(individual) == 5, (
+        f"expected first 5 overlaps shown individually, got {len(individual)}: "
+        f"{individual}"
+    )
+    assert len(compressed) == 1, (
+        f"expected 1 compressed summary line, got {compressed}"
+    )
+    # The compressed line should call out the remaining 6 (11 total - 5 shown).
+    assert "6 more" in compressed[0], compressed[0]
+
+
+def test_gaps_overlaps_new_max_breaks_compression(tmp_path):
+    """An overlap that exceeds the running max by more than 2s should
+    be surfaced individually even after the first-5 budget is spent —
+    it signals a genuinely worse anomaly the operator should see."""
+    # 8 files: overlap magnitudes 1, 1, 1, 1, 1, 1 (compressed), 10 (breaks max).
+    starts = []
+    accum = 0
+    for i, stride in enumerate([0, 59, 59, 59, 59, 59, 59, 59, 50]):
+        accum += stride
+        starts.append(accum)
+    for i, total_s in enumerate(starts):
+        hh, rem = divmod(total_s, 3600)
+        mm, ss = divmod(rem, 60)
+        _write_edf_stub(tmp_path / f"g{i:02d}.edf",
+                        starttime=f"{hh:02d}.{mm:02d}.{ss:02d}",
+                        n_records=60, record_duration=1.0)
+
+    result = check_recording_gaps(sorted(tmp_path.glob("*.edf")))
+
+    assert result["status"] == "fail"
+    individual = [m for m in result["issues"] if "Overlap of" in m]
+    # 5 first-shown + 1 new-max (10s > 1s + 2s) = 6 individually shown.
+    # The 5 pre-max identical 1.0s overlaps go into the first-5 budget,
+    # then the pair that overlaps by 10s exceeds the running max by
+    # more than 2s so it's shown individually too.
+    assert len(individual) == 6, individual
+    # The 10s overlap must be one of the individually-shown lines.
+    assert any("10.0s" in m for m in individual), individual
+
+
 def test_gaps_fail_unparseable_header(tmp_path):
     _write_edf_stub(tmp_path / "bad.edf", startdate="ZZ.ZZ.ZZ")
 
@@ -1398,6 +1481,74 @@ def test_uniformity_fail_different_channel_counts(tmp_path):
 def test_uniformity_fail_empty_input():
     result = check_signal_header_uniformity([])
     assert result["status"] == "fail"
+
+
+def test_uniformity_canonicalizes_float_precision_and_string_padding():
+    """Floating-point round-trip noise (phys_min = 0.9999999 vs
+    1.0000001) and trailing ASCII padding on labels/dims must not
+    fragment signatures — otherwise every file in a full admission
+    can end up with its own 'unique' signature purely from
+    representation drift."""
+    from clean_eeg.audit.checks import _signal_header_signature
+
+    file_a = [{"label": "EEG Fp1", "samples_per_record": 250,
+               "phys_min": 0.9999999, "phys_max": -0.9999999,
+               "dig_min": -32768, "dig_max": 32767, "phys_dim": "uV"}]
+    file_b = [{"label": "EEG Fp1     ",  # trailing padding
+               "samples_per_record": 250,
+               "phys_min": 1.0000001, "phys_max": -1.0000001,
+               "dig_min": -32768, "dig_max": 32767, "phys_dim": "uV  "}]
+
+    sig_a = _signal_header_signature(file_a, ignore_annotation_channel=True)
+    sig_b = _signal_header_signature(file_b, ignore_annotation_channel=True)
+    assert sig_a == sig_b, (
+        f"Functionally identical headers must produce identical "
+        f"signatures. Got:\n  a={sig_a}\n  b={sig_b}"
+    )
+
+
+def test_uniformity_reports_per_field_variability(tmp_path):
+    """When signatures fragment, the check must name the specific
+    fields with per-file variation so the operator can tell noise
+    (e.g. phys_min drift only) from real montage change (labels
+    differ)."""
+    # Two files where only phys_min varies — dig_min/dig_max/label all
+    # match. Should fail, and 'varying_fields' should name phys_min /
+    # phys_max only.
+    _write_edf_with_signals(tmp_path / "a.edf",
+                            n_records=5, samples_per_record=100,
+                            phys_min=-3200.0, phys_max=3200.0)
+    _write_edf_with_signals(tmp_path / "b.edf",
+                            n_records=5, samples_per_record=100,
+                            phys_min=-1600.0, phys_max=1600.0)
+
+    result = check_signal_header_uniformity(sorted(tmp_path.glob("*.edf")))
+    assert result["status"] == "fail"
+    assert set(result["varying_fields"]) == {"phys_min", "phys_max"}, (
+        result["varying_fields"]
+    )
+    # And the human-readable issues list surfaces those field names.
+    assert any("phys_min" in m for m in result["issues"]), result["issues"]
+
+
+def test_uniformity_caps_per_signature_enumeration(tmp_path):
+    """When many signatures fragment, the summary must not enumerate
+    every one — that's exactly the noise the compression is meant to
+    avoid. Full mapping still lives in edf_audit.json."""
+    # 8 files with 8 distinct sample rates → 8 signatures.
+    for i in range(8):
+        _write_edf_with_signals(tmp_path / f"f{i}.edf",
+                                n_records=5,
+                                samples_per_record=100 + i * 10)
+
+    result = check_signal_header_uniformity(sorted(tmp_path.glob("*.edf")))
+    assert result["n_unique_signatures"] == 8
+
+    sig_lines = [m for m in result["issues"] if "signature #" in m]
+    # Cap of 5 individual signature lines.
+    assert len(sig_lines) == 5, sig_lines
+    # Plus a "…and N more" trailer.
+    assert any("more signature" in m for m in result["issues"]), result["issues"]
 
 
 def test_uniformity_records_representative_channels(tmp_path):

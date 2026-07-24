@@ -217,28 +217,6 @@ def _resolve_interrupted_prior(err: AuditInterruptedError,
         print("    please answer w, s, or q.", file=sys.stderr, flush=True)
 
 
-def _make_streaming_progress(quiet: bool):
-    """Return a progress callback that prints one line per check as it
-    starts and finishes. ``flush=True`` on every print so the operator
-    sees updates even when stdout is a redirect / batch scheduler
-    (Python block-buffers stdout in that case by default).
-
-    Under ``--quiet`` the callback still emits the final summary lines
-    (start=silent, end=one-liner with status + duration) so operators
-    piping the output to a log get a compact per-check trace.
-    """
-    def _cb(*, name: str, phase: str, elapsed_s: float | None = None,
-            status: str | None = None) -> None:
-        if phase == "start" and not quiet:
-            print(f"[audit] running {name} …", flush=True)
-        elif phase == "end":
-            marker = {"pass": "OK  ", "warn": "WARN", "fail": "FAIL"}.get(
-                status or "?", "?   ")
-            print(f"[audit]   [{marker}] {name}  ({elapsed_s:.2f}s)",
-                  flush=True)
-    return _cb
-
-
 def _run_one_subject(subject_dir: Path, args) -> dict | None:
     """Audit one subject. Returns the audit dict, or ``None`` if the
     operator (or batch mode) chose to skip this subject because a prior
@@ -263,6 +241,11 @@ def _run_one_subject(subject_dir: Path, args) -> dict | None:
     print(f"[audit] auditing {subject_dir}", flush=True)
 
     def _do_audit(force: bool) -> dict:
+        # No streaming progress callback — the audit is fast enough on
+        # real subjects (~10 s) that per-check readout added noise
+        # without helping. The end-of-run summary + warnings block
+        # still show status per check and detailed content for the
+        # checks that produce actionable output.
         return audit_subject(
             subject_dir,
             output_dir=out_dir,
@@ -271,7 +254,7 @@ def _run_one_subject(subject_dir: Path, args) -> dict | None:
             skip_hashes=args.skip_hashes,
             hash_mode=args.hash_mode,
             vocab_whitelist=vocab,
-            progress=_make_streaming_progress(quiet=args.quiet),
+            progress=None,
         )
 
     try:
@@ -299,17 +282,36 @@ def _run_one_subject(subject_dir: Path, args) -> dict | None:
     if args.print_edf_signal_header:
         _print_unique_signal_headers(audit)
 
+    notebook_rendered = False
     if not args.no_notebook:
         from clean_eeg.audit.notebook import render_audit_notebook
         try:
             render_audit_notebook(subject_dir, output_dir=out_dir,
                                   n_channel_plot=args.n_channel_plot,
                                   n_files_plot=args.n_files_plot)
+            notebook_rendered = True
         except Exception as e:
             print(f"[!] Notebook rendering failed for {subject_dir.name}: {e}",
                   file=sys.stderr)
 
+    # Point the operator at the full results — the terminal output is
+    # a scannable summary, but the JSON has every per-file detail and
+    # the HTML render carries plots + inline docstrings.
+    _print_full_results_footer(out_dir, notebook_rendered=notebook_rendered)
+
     return audit
+
+
+def _print_full_results_footer(out_dir: Path, *, notebook_rendered: bool) -> None:
+    """Emit the trailing 'full results at' pointer block. Uses absolute
+    paths so the operator can copy-paste them regardless of cwd."""
+    from clean_eeg.audit.notebook import HTML_FILENAME, NOTEBOOK_FILENAME
+    out_dir = out_dir.resolve()
+    print("\nFull results:")
+    print(f"  JSON:     {out_dir / AUDIT_JSON_FILENAME}")
+    if notebook_rendered:
+        print(f"  Notebook: {out_dir / NOTEBOOK_FILENAME}")
+        print(f"  HTML:     {out_dir / HTML_FILENAME}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
