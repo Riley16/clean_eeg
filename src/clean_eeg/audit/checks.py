@@ -34,6 +34,16 @@ def _gap_threshold_for_pair(prev_dur_s: float, next_dur_s: float) -> float:
     shorter = min(prev_dur_s, next_dur_s)
     return max(0.0, min(GAP_THRESHOLD_ABSOLUTE_MAX_S,
                         shorter - GAP_THRESHOLD_MARGIN_S))
+
+
+def _format_duration(seconds: float) -> str:
+    """Render a duration in seconds OR hours, whichever is more
+    readable. Anything >= 1 h switches to hours (with 2-decimal
+    precision) — otherwise multi-hour gaps get reported as ``43200.0s``
+    which is hard to eyeball at a glance."""
+    if seconds >= 3600.0:
+        return f"{seconds / 3600.0:.2f}h"
+    return f"{seconds:.1f}s"
 from clean_eeg.print_edf_header import (
     ANNOTATION_STUB_SUFFIX,
     EDF_ANNOTATION_LABEL,
@@ -235,9 +245,10 @@ def check_recording_gaps(edf_paths: Iterable[str | Path]) -> dict:
         for g in large_gaps:
             status = "fail"
             issues.append(
-                f"Large gap of {g['gap_seconds']:.1f}s between "
+                f"Large gap of {_format_duration(g['gap_seconds'])} between "
                 f"{g['prev_file']!r} and {g['next_file']!r} "
-                f"(threshold {g['threshold_seconds']:.1f}s) — file possibly missing"
+                f"(threshold {_format_duration(g['threshold_seconds'])}) "
+                f"— file possibly missing"
             )
         # Overlaps compress: multi-day recordings often carry the same
         # sub-second boundary overlap on every consecutive-file pair (a

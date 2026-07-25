@@ -6,9 +6,13 @@
       "PAT REF EEG",
       "PAT BIPOLAR EEG",
       "PAT BP_II EEG",
+      "PAT REF_II EEG",
+      "PAT ALL REF EEG",
       "CAL IN",
       "E/C LAYING ON L\\. SID",
-      "E/C LAYING ON R\\. SID"
+      "E/C LAYING ON R\\. SID",
+      "Stim Start(?:[- ]\\S+)?",
+      "Stim Stop(?:[- ]\\S+)?"
     ],
     "H": [],
     "J": []

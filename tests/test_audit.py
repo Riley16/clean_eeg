@@ -468,6 +468,37 @@ def test_gaps_fail_large_gap_missing_file(tmp_path):
     assert result["large_gaps"][0]["gap_seconds"] == 3600.0
     assert result["large_gaps"][0]["threshold_seconds"] == 600.0
     assert any("possibly missing" in msg for msg in result["issues"])
+    # 3600s hits the >= 1 h threshold → formatted as hours, not seconds.
+    assert any("1.00h" in msg for msg in result["issues"]), result["issues"]
+
+
+def test_gaps_multi_hour_gap_formats_as_hours(tmp_path):
+    # 12-hour gap between two 1-hour files — the raw seconds number
+    # (43200s) is hard to eyeball, so the summary switches to hours.
+    _write_edf_stub(tmp_path / "a.edf",
+                    starttime="00.00.00", n_records=3600, record_duration=1.0)
+    _write_edf_stub(tmp_path / "c.edf",
+                    starttime="13.00.00", n_records=3600, record_duration=1.0)
+
+    result = check_recording_gaps(sorted(tmp_path.glob("*.edf")))
+
+    assert result["status"] == "fail"
+    assert result["large_gaps"][0]["gap_seconds"] == 12 * 3600.0
+    issue = next(m for m in result["issues"] if "Large gap" in m)
+    assert "12.00h" in issue
+    # Threshold (10 min = 600s) still renders in seconds.
+    assert "600.0s" in issue
+
+
+def test_format_duration_switches_units_at_one_hour():
+    from clean_eeg.audit.checks import _format_duration
+    assert _format_duration(0.0) == "0.0s"
+    assert _format_duration(30.0) == "30.0s"
+    assert _format_duration(3599.9) == "3599.9s"
+    # Exactly one hour — threshold is inclusive.
+    assert _format_duration(3600.0) == "1.00h"
+    assert _format_duration(7200.0) == "2.00h"
+    assert _format_duration(90000.0) == "25.00h"
 
 
 def test_gaps_fail_overlap(tmp_path):

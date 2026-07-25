@@ -94,13 +94,27 @@ def test_default_shipped_whitelist_loads(tmp_path):
     assert isinstance(wl, BoilerplateWhitelist)
 
     # CUDA (site 'A') boilerplate phrases from the shipped file must
-    # fullmatch what R1652A's annotation audit actually flagged.
+    # fullmatch what R1652A / R1659A's annotation audits actually
+    # flagged.
     for phrase in ("PAT REF EEG", "PAT BIPOLAR EEG", "PAT BP_II EEG",
+                    "PAT REF_II EEG", "PAT ALL REF EEG",
                     "CAL IN", "E/C LAYING ON L. SID",
                     "E/C LAYING ON R. SID"):
         assert wl.matches(phrase, site_code="A"), (
             f"shipped CUDA whitelist should match {phrase!r}"
         )
+
+    # Stim Start / Stim Stop patterns accept an optional single-word
+    # suffix with either dash or space separator.
+    for phrase in ("Stim Start", "Stim Start LPC1-LPC2",
+                    "Stim Start-LPC1", "Stim Stop",
+                    "Stim Stop LOF6-LOF7", "Stim Stop-target"):
+        assert wl.matches(phrase, site_code="A"), (
+            f"shipped Stim regex should match {phrase!r}"
+        )
+    # But NOT arbitrary suffixes that go beyond one token — otherwise
+    # 'Stim Start CAROL VISITED' would silence the Carol PHI.
+    assert not wl.matches("Stim Start CAROL VISITED", site_code="A")
 
     # And crucially, those same phrases must NOT silence a longer
     # annotation that happens to contain them (fullmatch semantics).
