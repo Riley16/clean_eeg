@@ -82,6 +82,17 @@ def _load_vocab_whitelist(path: Path | None) -> tuple[set[str], str]:
     return tokens, f"vocab whitelist: {len(tokens)} token(s) from {path}"
 
 
+SUMMARY_SKIP_CHECKS = frozenset({
+    # annotation_phi_scan issues are the same tokens the
+    # 'Annotation name-dictionary matches' block in
+    # _always_print_warnings prints in more detail — the summary line
+    # would duplicate that info without adding anything. The check
+    # still runs, still lands in edf_audit.json, and still contributes
+    # to overall_status (so a FAIL is still visible at the top).
+    "annotation_phi_scan",
+})
+
+
 def _print_summary(audit: dict, out=None) -> None:
     out = out or sys.stdout
     print(f"\n=== Audit: {audit['subject_dir']} ===", file=out)
@@ -89,6 +100,8 @@ def _print_summary(audit: dict, out=None) -> None:
     print(f"Files: {audit['n_files']}   Mode: {audit['mode']}   "
           f"Overall: {audit['overall_status'].upper()}", file=out)
     for name, r in audit["checks"].items():
+        if name in SUMMARY_SKIP_CHECKS:
+            continue
         marker = {"pass": "OK  ", "warn": "WARN", "fail": "FAIL"}[r["status"]]
         print(f"  [{marker}] {name}", file=out)
         for issue in r.get("issues", []):
