@@ -12,10 +12,28 @@ from typing import Iterable
 
 from clean_eeg.clean_subject_eeg import (
     BASE_START_DATE,
-    MAX_RECORDING_GAP_SECONDS,
     SUBJECT_CODE_PATTERN,
     is_valid_subject_code,
 )
+
+# Recording-gap threshold: per-pair, dynamic. Absolute upper bound of
+# 10 minutes (real clinical recorders can rest between files for
+# maintenance/handoff without missing data), floored by the shorter
+# adjacent recording's duration minus 5 minutes (so on very long
+# recordings the 10-min cap dominates, but on short recordings a gap
+# comparable to the recording itself is still flagged). Clamped at 0
+# so recordings < 5 min flag any positive gap.
+GAP_THRESHOLD_ABSOLUTE_MAX_S = 600.0   # 10 minutes
+GAP_THRESHOLD_MARGIN_S = 300.0          # 5 minutes below recording length
+
+
+def _gap_threshold_for_pair(prev_dur_s: float, next_dur_s: float) -> float:
+    """Threshold above which the gap between two consecutive recordings
+    is flagged. See :data:`GAP_THRESHOLD_ABSOLUTE_MAX_S` docstring for
+    the shape."""
+    shorter = min(prev_dur_s, next_dur_s)
+    return max(0.0, min(GAP_THRESHOLD_ABSOLUTE_MAX_S,
+                        shorter - GAP_THRESHOLD_MARGIN_S))
 from clean_eeg.print_edf_header import (
     ANNOTATION_STUB_SUFFIX,
     EDF_ANNOTATION_LABEL,
@@ -149,9 +167,7 @@ def _parse_edf_starttime(starttime_str: str) -> time | None:
         return None
 
 
-def check_recording_gaps(edf_paths: Iterable[str | Path],
-                         *,
-                         max_gap_seconds: float = MAX_RECORDING_GAP_SECONDS) -> dict:
+def check_recording_gaps(edf_paths: Iterable[str | Path]) -> dict:
     """Detect anomalous gaps or overlaps between consecutive recordings
     on the *cleaned* (relative-to-1985) timeline. Large gaps typically
     indicate a file missing from the transfer; overlaps indicate a
@@ -159,8 +175,9 @@ def check_recording_gaps(edf_paths: Iterable[str | Path],
 
     Duration per file = ``n_records * record_duration`` from the main
     header. Files are sorted by their start ``datetime`` (startdate +
-    starttime). Gaps < 0 are overlaps, gaps > ``max_gap_seconds`` are
-    flagged as large. Consistent with the pipeline's threshold.
+    starttime). Gaps < 0 are overlaps, gaps exceeding
+    :func:`_gap_threshold_for_pair` (per-pair, adaptive) are flagged
+    as large.
     """
     per_file: list[dict] = []
     unparseable: list[str] = []
@@ -196,12 +213,14 @@ def check_recording_gaps(edf_paths: Iterable[str | Path],
     for prev, nxt in zip(per_file, per_file[1:]):
         gap_s = (datetime.fromisoformat(nxt["start"])
                  - datetime.fromisoformat(prev["end"])).total_seconds()
+        threshold_s = _gap_threshold_for_pair(
+            prev["duration_s"], nxt["duration_s"])
         entry = {"prev_file": prev["file"], "next_file": nxt["file"],
-                 "gap_seconds": gap_s}
+                 "gap_seconds": gap_s, "threshold_seconds": threshold_s}
         gaps.append(entry)
         if gap_s < 0:
             overlaps.append(entry)
-        elif gap_s > max_gap_seconds:
+        elif gap_s > threshold_s:
             large_gaps.append(entry)
 
     issues: list[str] = []
@@ -216,8 +235,9 @@ def check_recording_gaps(edf_paths: Iterable[str | Path],
         for g in large_gaps:
             status = "fail"
             issues.append(
-                f"Large gap of {g['gap_seconds']:.1f}s between {g['prev_file']!r} "
-                f"and {g['next_file']!r} (threshold {max_gap_seconds}s) — file possibly missing"
+                f"Large gap of {g['gap_seconds']:.1f}s between "
+                f"{g['prev_file']!r} and {g['next_file']!r} "
+                f"(threshold {g['threshold_seconds']:.1f}s) — file possibly missing"
             )
         # Overlaps compress: multi-day recordings often carry the same
         # sub-second boundary overlap on every consecutive-file pair (a
@@ -228,7 +248,7 @@ def check_recording_gaps(edf_paths: Iterable[str | Path],
         # per-pair detail is preserved in the JSON under 'overlaps'.
         if overlaps:
             status = "fail"
-            OVERLAP_INDIVIDUAL_MAX = 5
+            OVERLAP_INDIVIDUAL_MAX = 2
             OVERLAP_JUMP_S = 2.0
             running_max_abs = 0.0
             n_shown = 0
@@ -258,7 +278,8 @@ def check_recording_gaps(edf_paths: Iterable[str | Path],
         "check": "recording_gaps",
         "status": status,
         "n_files": len(per_file) + len(unparseable),
-        "max_gap_seconds_threshold": max_gap_seconds,
+        "gap_threshold_absolute_max_s": GAP_THRESHOLD_ABSOLUTE_MAX_S,
+        "gap_threshold_margin_s": GAP_THRESHOLD_MARGIN_S,
         "files_by_start": per_file,
         "gaps": gaps,
         "large_gaps": large_gaps,
@@ -416,6 +437,68 @@ def _signal_header_signature(sigs: list, *, ignore_annotation_channel: bool) -> 
     return tuple(channels)
 
 
+def _describe_signature_diff(ref_sig: tuple, this_sig: tuple) -> list[str]:
+    """Human-readable diff between two signatures, one line per axis
+    that differs. Skips fields that match. For ``label``, reports
+    missing/extra labels or a same-set-different-order finding. For
+    scalar-across-channels fields (samples_per_record, phys_dim),
+    reports the distinct values seen in each side.
+
+    Kept compact so operators aren't buried in full label lists — the
+    complete channel arrays remain in edf_audit.json under
+    ``signatures``.
+    """
+    lines: list[str] = []
+    ref_by_field = {
+        f: tuple(ch[i] for ch in ref_sig)
+        for i, f in enumerate(_SIGNAL_UNIFORMITY_FIELDS)
+    }
+    this_by_field = {
+        f: tuple(ch[i] for ch in this_sig)
+        for i, f in enumerate(_SIGNAL_UNIFORMITY_FIELDS)
+    }
+
+    # Labels get bespoke diff (missing / extra / reordered) because the
+    # channel LIST is the most informative representation.
+    ref_labels = ref_by_field["label"]
+    this_labels = this_by_field["label"]
+    if ref_labels != this_labels:
+        ref_set, this_set = set(ref_labels), set(this_labels)
+        missing = ref_set - this_set
+        extra = this_set - ref_set
+        parts: list[str] = []
+        if missing:
+            parts.append(f"missing: {sorted(missing)}")
+        if extra:
+            parts.append(f"extra: {sorted(extra)}")
+        if not parts:
+            # Same set, different order — likely a channel-reorder, not a
+            # montage change. Common and worth calling out distinctly.
+            parts.append("same labels, different channel order")
+        lines.append(f"labels differ — {'; '.join(parts)}")
+
+    # Other fields: report distinct values seen on each side. If the
+    # field is uniform across channels within a signature, the set is
+    # small; if it varies within a channel array, the set summarizes.
+    for field in _SIGNAL_UNIFORMITY_FIELDS:
+        if field == "label":
+            continue
+        ref_vals = ref_by_field[field]
+        this_vals = this_by_field[field]
+        if ref_vals == this_vals:
+            continue
+        # sorted() may fail on mixed types; guard with default=str.
+        ref_uniq = sorted({v for v in ref_vals if v is not None},
+                          key=str)
+        this_uniq = sorted({v for v in this_vals if v is not None},
+                           key=str)
+        lines.append(
+            f"{field} differs — reference: {ref_uniq}, this: {this_uniq}"
+        )
+
+    return lines
+
+
 def _per_field_uniqueness(per_file_channels: dict[str, list[dict]],
                           *, ignore_annotation_channel: bool
                           ) -> dict[str, int]:
@@ -497,15 +580,21 @@ def check_signal_header_uniformity(edf_paths: Iterable[str | Path],
                 f"  fragmentation is driven by fields with per-file "
                 f"variation: {per_field_counts}"
             )
-        # Cap the per-signature enumeration — showing 80 lines of file
-        # lists is worse than useless. Full mapping is in edf_audit.json
-        # under 'signatures'.
+        # Per-signature enumeration with a diff against signature #1
+        # (chosen as the reference — arbitrary but stable). Capped so
+        # very fragmented outputs don't drown the summary; full
+        # mapping is in edf_audit.json under 'signatures'.
         max_sig_lines = 5
-        for i, (sig, files) in enumerate(
-                list(signature_to_files.items())[:max_sig_lines]):
+        sig_items = list(signature_to_files.items())
+        ref_sig = sig_items[0][0]
+        for i, (sig, files) in enumerate(sig_items[:max_sig_lines]):
+            marker = " (reference)" if i == 0 else ""
             issues.append(f"  signature #{i + 1}: {len(files)} file(s), "
-                          f"e.g. {sorted(files)[:3]}")
-        remaining = len(signature_to_files) - max_sig_lines
+                          f"e.g. {sorted(files)[:3]}{marker}")
+            if i > 0:
+                for line in _describe_signature_diff(ref_sig, sig):
+                    issues.append(f"      vs #1: {line}")
+        remaining = len(sig_items) - max_sig_lines
         if remaining > 0:
             issues.append(
                 f"  … and {remaining} more signature(s); see 'signatures' "

@@ -93,19 +93,37 @@ SUMMARY_SKIP_CHECKS = frozenset({
 })
 
 
-def _print_summary(audit: dict, out=None) -> None:
+def _print_summary(audit: dict, out=None,
+                   print_subject_header: bool = True,
+                   show_passes: bool = False) -> None:
     out = out or sys.stdout
-    print(f"\n=== Audit: {audit['subject_dir']} ===", file=out)
+    if print_subject_header:
+        # Skipped in --parent mode where a bigger visual banner has
+        # already announced the subject; showing the single-line
+        # header here as well would duplicate the path immediately
+        # below the banner.
+        print(f"\n=== Audit: {audit['subject_dir']} ===", file=out)
     print(f"Subject code: {audit.get('subject_code')}", file=out)
     print(f"Files: {audit['n_files']}   Mode: {audit['mode']}   "
           f"Overall: {audit['overall_status'].upper()}", file=out)
+    n_hidden_passes = 0
     for name, r in audit["checks"].items():
         if name in SUMMARY_SKIP_CHECKS:
+            continue
+        # [OK] lines are noise for the common "everything passed" case
+        # — hide them by default so WARN/FAIL stands out. -v surfaces
+        # them again when the operator wants to confirm nothing got
+        # silently skipped.
+        if r["status"] == "pass" and not show_passes:
+            n_hidden_passes += 1
             continue
         marker = {"pass": "OK  ", "warn": "WARN", "fail": "FAIL"}[r["status"]]
         print(f"  [{marker}] {name}", file=out)
         for issue in r.get("issues", []):
             print(f"          - {issue}", file=out)
+    if n_hidden_passes and not show_passes:
+        print(f"  ({n_hidden_passes} passing check(s) hidden — pass -v to show)",
+              file=out)
 
 
 def _print_annotations(subject_dir: Path,
@@ -179,8 +197,14 @@ def _always_print_warnings(audit: dict, out=None) -> None:
               file=out)
         for token, hits in matches.items():
             print(f"    '{token}' × {len(hits)}", file=out)
-            for h in hits[:3]:
-                print(f"        {h['file']} @ {h['onset']}s: {h['text']!r}", file=out)
+            # Every hit is shown (not just the first 3) — the operator
+            # audits each context to decide whether it's real PHI or a
+            # false positive. Annotation text goes at the START of the
+            # line, then a tab, then file/onset — so file names align
+            # in a column and scanning across many hits is fast.
+            for h in hits:
+                print(f"        {h['text']!r}\t{h['file']} @ {h['onset']}s",
+                      file=out)
 
     log = audit["checks"].get("log_file", {})
     ann_redactions = [r for r in log.get("redactions", [])
@@ -230,10 +254,36 @@ def _resolve_interrupted_prior(err: AuditInterruptedError,
         print("    please answer w, s, or q.", file=sys.stderr, flush=True)
 
 
-def _run_one_subject(subject_dir: Path, args) -> dict | None:
+def _print_subject_banner(subject_dir: Path, out=None) -> None:
+    """Loud visual separator printed at the top of each subject in
+    ``--parent`` mode — makes it unambiguous where one subject's
+    output ends and the next begins. Format:
+
+        ============================================================
+        ============================================================
+        === Audit: <subject_dir> ===
+        ============================================================
+        ============================================================
+    """
+    out = out or sys.stdout
+    bar = "=" * 60
+    print(bar, file=out)
+    print(bar, file=out)
+    print(f"=== Audit: {subject_dir} ===", file=out)
+    print(bar, file=out)
+    print(bar, file=out)
+
+
+def _run_one_subject(subject_dir: Path, args,
+                     *, printed_banner: bool = False) -> dict | None:
     """Audit one subject. Returns the audit dict, or ``None`` if the
     operator (or batch mode) chose to skip this subject because a prior
     run was interrupted.
+
+    ``printed_banner`` = True when the caller (parent-mode loop)
+    already printed a subject-header banner; ``_print_summary`` then
+    skips its own single-line ``=== Audit ===`` header to avoid
+    duplicating the subject path immediately below the banner.
     """
     # Per-subject output dir: if --output-dir was given, nest under it
     # by subject-folder name (so --parent mode doesn't collide multiple
@@ -284,7 +334,9 @@ def _run_one_subject(subject_dir: Path, args) -> dict | None:
         audit = _do_audit(True)
 
     if not args.quiet:
-        _print_summary(audit)
+        _print_summary(audit,
+                       print_subject_header=not printed_banner,
+                       show_passes=args.verbose >= 1)
     _always_print_warnings(audit)  # never suppressed
     if args.print_annot:
         _print_annotations(subject_dir,
@@ -385,8 +437,14 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         overall_fail = False
         skipped: list[str] = []
-        for s in subjects:
-            audit = _run_one_subject(s, args)
+        for i, s in enumerate(subjects):
+            # 5 blank lines between subjects — visually separates the
+            # end of one subject's audit (which can be dozens of lines
+            # for a fragmented one) from the start of the next.
+            if i > 0:
+                print("\n" * 5, end="")
+            _print_subject_banner(s)
+            audit = _run_one_subject(s, args, printed_banner=True)
             if audit is None:
                 skipped.append(s.name)
                 continue

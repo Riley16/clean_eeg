@@ -402,24 +402,62 @@ def test_gaps_pass_contiguous_files(tmp_path):
 
 
 def test_gaps_pass_within_threshold(tmp_path):
-    # 30-second gap between two files — under the 60s pipeline threshold.
+    # Two 1-hour files with a 5-minute gap. Per-pair threshold =
+    # min(600, 3600-300) = 600 s (10 min). 300 s gap < 600 s → pass.
     _write_edf_stub(tmp_path / "a.edf",
-                    starttime="00.00.00", n_records=60, record_duration=1.0)
+                    starttime="00.00.00", n_records=3600, record_duration=1.0)
     _write_edf_stub(tmp_path / "b.edf",
-                    starttime="00.01.30", n_records=60, record_duration=1.0)
+                    starttime="01.05.00", n_records=3600, record_duration=1.0)
 
     result = check_recording_gaps(sorted(tmp_path.glob("*.edf")))
 
     assert result["status"] == "pass"
-    assert result["gaps"][0]["gap_seconds"] == 30.0
+    assert result["gaps"][0]["gap_seconds"] == 300.0
+    assert result["gaps"][0]["threshold_seconds"] == 600.0
+
+
+def test_gaps_pass_at_absolute_cap(tmp_path):
+    # Two 1-hour files with a 9-min gap — under the 10-min absolute cap.
+    _write_edf_stub(tmp_path / "a.edf",
+                    starttime="00.00.00", n_records=3600, record_duration=1.0)
+    _write_edf_stub(tmp_path / "b.edf",
+                    starttime="01.09.00", n_records=3600, record_duration=1.0)
+
+    result = check_recording_gaps(sorted(tmp_path.glob("*.edf")))
+
+    assert result["status"] == "pass"
+    assert result["gaps"][0]["gap_seconds"] == 540.0
+
+
+def test_gaps_threshold_scales_with_short_recordings(tmp_path):
+    # Two 10-min files: threshold = min(600, 600-300) = 300 s.
+    # A 4-min (240 s) gap passes; a 6-min (360 s) gap fails.
+    _write_edf_stub(tmp_path / "short_a.edf",
+                    starttime="00.00.00", n_records=600, record_duration=1.0)
+    _write_edf_stub(tmp_path / "short_b.edf",
+                    starttime="00.14.00", n_records=600, record_duration=1.0)  # 4 min gap
+    result = check_recording_gaps(sorted(tmp_path.glob("*.edf")))
+    assert result["status"] == "pass"
+    assert result["gaps"][0]["threshold_seconds"] == 300.0
+
+    for f in tmp_path.glob("*.edf"):
+        f.unlink()
+    _write_edf_stub(tmp_path / "short_a.edf",
+                    starttime="00.00.00", n_records=600, record_duration=1.0)
+    _write_edf_stub(tmp_path / "short_b.edf",
+                    starttime="00.16.00", n_records=600, record_duration=1.0)  # 6 min gap
+    result = check_recording_gaps(sorted(tmp_path.glob("*.edf")))
+    assert result["status"] == "fail"
+    assert len(result["large_gaps"]) == 1
+    assert result["large_gaps"][0]["gap_seconds"] == 360.0
 
 
 def test_gaps_fail_large_gap_missing_file(tmp_path):
-    # 1-hour gap between two 60s files — well past the 60s threshold.
+    # 1-hour gap between two 1-hour files — well past the 10-min cap.
     _write_edf_stub(tmp_path / "a.edf",
-                    starttime="00.00.00", n_records=60, record_duration=1.0)
+                    starttime="00.00.00", n_records=3600, record_duration=1.0)
     _write_edf_stub(tmp_path / "c.edf",
-                    starttime="01.01.00", n_records=60, record_duration=1.0)
+                    starttime="02.00.00", n_records=3600, record_duration=1.0)
 
     result = check_recording_gaps(sorted(tmp_path.glob("*.edf")))
 
@@ -428,6 +466,7 @@ def test_gaps_fail_large_gap_missing_file(tmp_path):
     assert result["large_gaps"][0]["prev_file"] == "a.edf"
     assert result["large_gaps"][0]["next_file"] == "c.edf"
     assert result["large_gaps"][0]["gap_seconds"] == 3600.0
+    assert result["large_gaps"][0]["threshold_seconds"] == 600.0
     assert any("possibly missing" in msg for msg in result["issues"])
 
 
@@ -446,32 +485,17 @@ def test_gaps_fail_overlap(tmp_path):
     assert any("duplicate/reorder" in msg for msg in result["issues"])
 
 
-def test_gaps_overlaps_compress_after_first_five(tmp_path):
-    """Multi-day recordings often have the same sub-second boundary
-    overlap on every consecutive pair. The check should surface the
-    first 5 individually, then collapse the remaining similar-magnitude
+def test_gaps_overlaps_compress_after_first_two(tmp_path):
+    """Multi-day recordings often carry the same sub-second boundary
+    overlap on every consecutive pair. The check surfaces the first 2
+    individually, then collapses the remaining similar-magnitude
     overlaps into a single count-summary line rather than one line per
     consecutive pair (which drowned the summary for full-length
     admissions)."""
-    # 12 consecutive files, each 60s long, each starting 0.3s before
-    # the previous ended (11 identical overlaps in total).
+    # 12 files, each 60s long, each starting 1s before the previous
+    # ended → 11 identical 1s overlaps.
     for i in range(12):
-        _write_edf_stub(tmp_path / f"f{i:02d}.edf",
-                        starttime=f"{i:02d}.00.00",
-                        n_records=3600 + (1 if i > 0 else 0),
-                        record_duration=1.0)
-    # The stub above doesn't overlap; construct precise overlaps by
-    # setting successive starttimes just under the previous end.
-    # Rewrite explicitly: file i starts at 3600*i - 0.3*i seconds
-    # (a 0.3s overlap per pair, cumulative).
-    for f in tmp_path.glob("*.edf"):
-        f.unlink()
-    for i in range(12):
-        # File i starts at (60 - 0.3) * i minutes of session time.
-        # Represent as HH.MM.SS with sub-second lost to the format —
-        # workaround: shift each file forward by 60 - 1 seconds so the
-        # 60s files each overlap the previous by 1s (identical magnitudes).
-        total_s = i * 59  # 60s file, 1s overlap → 59s stride
+        total_s = i * 59
         hh, rem = divmod(total_s, 3600)
         mm, ss = divmod(rem, 60)
         _write_edf_stub(tmp_path / f"g{i:02d}.edf",
@@ -481,32 +505,30 @@ def test_gaps_overlaps_compress_after_first_five(tmp_path):
     result = check_recording_gaps(sorted(tmp_path.glob("*.edf")))
 
     assert result["status"] == "fail"
-    # 11 consecutive-pair overlaps in the raw data.
     assert len(result["overlaps"]) == 11
-    # In the summary text: 5 individual lines + 1 compressed summary line.
     overlap_issue_lines = [m for m in result["issues"]
                            if "Overlap of" in m or "consecutive-file overlap" in m]
     individual = [m for m in overlap_issue_lines if "Overlap of" in m]
     compressed = [m for m in overlap_issue_lines if "consecutive-file overlap" in m]
-    assert len(individual) == 5, (
-        f"expected first 5 overlaps shown individually, got {len(individual)}: "
+    assert len(individual) == 2, (
+        f"expected first 2 overlaps shown individually, got {len(individual)}: "
         f"{individual}"
     )
     assert len(compressed) == 1, (
         f"expected 1 compressed summary line, got {compressed}"
     )
-    # The compressed line should call out the remaining 6 (11 total - 5 shown).
-    assert "6 more" in compressed[0], compressed[0]
+    # 11 total - 2 shown = 9 compressed.
+    assert "9 more" in compressed[0], compressed[0]
 
 
 def test_gaps_overlaps_new_max_breaks_compression(tmp_path):
     """An overlap that exceeds the running max by more than 2s should
-    be surfaced individually even after the first-5 budget is spent —
+    be surfaced individually even after the first-2 budget is spent —
     it signals a genuinely worse anomaly the operator should see."""
-    # 8 files: overlap magnitudes 1, 1, 1, 1, 1, 1 (compressed), 10 (breaks max).
+    # 8 files, 7 overlap pairs: 6 at 1s + 1 at 10s.
     starts = []
     accum = 0
-    for i, stride in enumerate([0, 59, 59, 59, 59, 59, 59, 59, 50]):
+    for stride in [0, 59, 59, 59, 59, 59, 59, 59, 50]:
         accum += stride
         starts.append(accum)
     for i, total_s in enumerate(starts):
@@ -520,11 +542,9 @@ def test_gaps_overlaps_new_max_breaks_compression(tmp_path):
 
     assert result["status"] == "fail"
     individual = [m for m in result["issues"] if "Overlap of" in m]
-    # 5 first-shown + 1 new-max (10s > 1s + 2s) = 6 individually shown.
-    # The 5 pre-max identical 1.0s overlaps go into the first-5 budget,
-    # then the pair that overlaps by 10s exceeds the running max by
-    # more than 2s so it's shown individually too.
-    assert len(individual) == 6, individual
+    # 2 first-shown (1.0s each) + 1 new-max (10.0s > 1.0s + 2s tolerance)
+    # = 3 individually shown.
+    assert len(individual) == 3, individual
     # The 10s overlap must be one of the individually-shown lines.
     assert any("10.0s" in m for m in individual), individual
 
@@ -1946,18 +1966,67 @@ def test_check_transfer_integrity_invalid_hash_mode_raises(tmp_path):
         check_transfer_integrity([tmp_path / "a.edf"], hash_mode="quantum")
 
 
-def test_gaps_custom_threshold_recovers_pass(tmp_path):
-    # A 30-min gap fails at the default 60s threshold but should pass
-    # when the operator overrides to 3600s.
-    _write_edf_stub(tmp_path / "a.edf",
-                    starttime="00.00.00", n_records=60, record_duration=1.0)
-    _write_edf_stub(tmp_path / "b.edf",
-                    starttime="00.31.00", n_records=60, record_duration=1.0)
+# Removed test_gaps_custom_threshold_recovers_pass — the max_gap_seconds
+# override parameter was dropped in favor of a per-pair adaptive threshold
+# (see GAP_THRESHOLD_ABSOLUTE_MAX_S in audit/checks.py). Custom overrides
+# would fight the adaptive logic; if a knob is needed later, it should
+# adjust the absolute cap rather than replace the per-pair scaling.
 
-    default = check_recording_gaps(sorted(tmp_path.glob("*.edf")))
-    lenient = check_recording_gaps(sorted(tmp_path.glob("*.edf")),
-                                   max_gap_seconds=3600)
 
-    assert default["status"] == "fail"
-    assert lenient["status"] == "pass"
-    assert lenient["max_gap_seconds_threshold"] == 3600
+# --- summary printer: [OK] hiding by default ------------------------------
+
+def _fake_audit_result(check_statuses: dict) -> dict:
+    """Assemble a minimal audit dict for _print_summary tests."""
+    return {
+        "subject_dir": "/some/path",
+        "subject_code": "R1755A",
+        "n_files": 3,
+        "mode": "full",
+        "overall_status": ("fail" if "fail" in check_statuses.values()
+                           else "warn" if "warn" in check_statuses.values()
+                           else "pass"),
+        "checks": {name: {"status": s, "issues": []}
+                    for name, s in check_statuses.items()},
+    }
+
+
+def test_summary_hides_ok_checks_by_default(capsys):
+    from clean_eeg.audit.cli import _print_summary
+    audit = _fake_audit_result({
+        "subject_code_consistency": "pass",
+        "header_phi_residue": "pass",
+        "recording_gaps": "fail",
+    })
+    _print_summary(audit)
+    out = capsys.readouterr().out
+    # FAIL check surfaced; PASS checks hidden.
+    assert "[FAIL] recording_gaps" in out
+    assert "[OK  ] subject_code_consistency" not in out
+    assert "[OK  ] header_phi_residue" not in out
+    # But operator is told that hidden passes exist.
+    assert "2 passing check(s) hidden" in out
+
+
+def test_summary_shows_ok_checks_when_verbose(capsys):
+    from clean_eeg.audit.cli import _print_summary
+    audit = _fake_audit_result({
+        "subject_code_consistency": "pass",
+        "recording_gaps": "fail",
+    })
+    _print_summary(audit, show_passes=True)
+    out = capsys.readouterr().out
+    assert "[OK  ] subject_code_consistency" in out
+    assert "[FAIL] recording_gaps" in out
+    # The "hidden" hint should not appear when we're showing everything.
+    assert "hidden" not in out
+
+
+def test_summary_skips_subject_header_when_banner_printed(capsys):
+    from clean_eeg.audit.cli import _print_summary
+    audit = _fake_audit_result({"recording_gaps": "pass"})
+    _print_summary(audit, print_subject_header=False)
+    out = capsys.readouterr().out
+    # Path banner (=== Audit: ... ===) should NOT appear.
+    assert "=== Audit:" not in out
+    # But per-check counts still render.
+    assert "Subject code:" in out
