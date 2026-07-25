@@ -56,6 +56,11 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="SSH username (defaults to $USER).")
     p.add_argument("--yes", "-y", action="store_true",
                    help="Skip the interactive confirmation prompt.")
+    p.add_argument("--background", "-b", action="store_true",
+                   help="Launch the transfer in a detached background process "
+                        "(via nohup) that survives SSH disconnects. Writes "
+                        "transfer.sh + transfer.log alongside the output dir; "
+                        "tail -f the log to monitor progress.")
     return p
 
 
@@ -98,15 +103,24 @@ def main(argv: list[str] | None = None) -> int:
             return 130
 
     try:
-        transfer_subject(
+        result = transfer_subject(
             args.output_dir,
             ssh_user=args.user,
             dry_run=False,
+            background=args.background,
         )
     except RuntimeError as e:
         print(f"Transfer failed: {e}", file=sys.stderr)
         return 2
-    print("\nTransfer complete.")
+    if args.background:
+        print(f"\nTransfer launched in background (pid {result.background_pid}).")
+        print(f"  script: {result.background_script}")
+        print(f"  log:    {result.background_log}")
+        print(f"  monitor: tail -f {result.background_log}")
+        print("The transfer will continue if this shell exits or the SSH "
+              "connection drops.")
+    else:
+        print("\nTransfer complete.")
     return 0
 
 

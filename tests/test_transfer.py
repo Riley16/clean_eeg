@@ -316,3 +316,69 @@ def test_transfer_subject_raises_on_preflight_failure(tmp_path):
     (out / MANIFEST_FILENAME).unlink()
     with pytest.raises(RuntimeError, match="Preflight failed"):
         transfer_subject(out, ssh_user="testuser", dry_run=True)
+
+
+# ---------- background transfer ----------
+
+def test_execute_plan_background_writes_script_and_log(tmp_path, monkeypatch):
+    """Background launcher must write a shell script + log alongside
+    the output dir, and return the child pid. Doesn't actually run
+    the transfer (Popen is monkeypatched)."""
+    import clean_eeg.transfer as _tr
+    out = _make_subject_dir(tmp_path)
+    plan = build_transfer_plan(
+        out, subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        ssh_user="testuser", use_rsync=True,
+    )
+
+    captured = {}
+
+    class _FakeProc:
+        pid = 12345
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return _FakeProc()
+
+    monkeypatch.setattr(_tr.subprocess, "Popen", fake_popen)
+
+    pid, script_path, log_path = _tr.execute_plan_background(plan, out)
+    assert pid == 12345
+    assert script_path == out / "transfer.sh"
+    assert log_path == out / "transfer.log"
+    # Shell script must exist and be executable.
+    assert script_path.exists()
+    assert script_path.stat().st_mode & 0o111  # executable bit
+    script = script_path.read_text()
+    assert "set -e" in script
+    assert "rsync" in script
+    assert "ssh" in script  # mkdir step
+    # nohup + start_new_session detach the child from the terminal.
+    assert captured["argv"][0] == "nohup"
+    assert captured["kwargs"]["start_new_session"] is True
+
+
+def test_transfer_subject_background_flag_launches_detached(tmp_path,
+                                                              monkeypatch):
+    """The background=True path must call execute_plan_background,
+    not execute_plan, and stash the pid + paths on the returned plan."""
+    import clean_eeg.transfer as _tr
+    out = _make_subject_dir(tmp_path)
+
+    fg_calls = []
+    bg_calls = []
+    monkeypatch.setattr(_tr, "execute_plan",
+                        lambda plan: fg_calls.append(plan))
+    monkeypatch.setattr(
+        _tr, "execute_plan_background",
+        lambda plan, output_path: bg_calls.append(plan) or
+        (99999, output_path / "transfer.sh", output_path / "transfer.log"),
+    )
+
+    plan = transfer_subject(out, ssh_user="testuser", background=True)
+    assert fg_calls == [], "background=True must skip execute_plan"
+    assert len(bg_calls) == 1
+    assert plan.background_pid == 99999
+    assert plan.background_log == out / "transfer.log"

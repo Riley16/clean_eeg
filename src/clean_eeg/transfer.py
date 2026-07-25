@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import random
 import re
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -89,12 +90,18 @@ class TransferPlan:
     """Command lines that ``execute_plan`` will run. Exposed for tests
     (so dry-run mode returns an inspectable plan) and for the
     end-of-run prompt (so the operator can see exactly what will be
-    invoked before confirming)."""
+    invoked before confirming). When ``transfer_subject`` is called
+    with ``background=True``, the returned plan carries the child
+    process's pid + the paths to the shell script and log file so the
+    CLI can surface them to the operator."""
     mkdir_argv: list[str]
     upload_argv: list[str]
     perms_argv: list[str]
     remote_dir: str
     transport: str  # "rsync" or "scp"
+    background_pid: int | None = None
+    background_script: Path | None = None
+    background_log: Path | None = None
 
 
 def _iter_edfs(output_path: Path) -> list[Path]:
@@ -379,6 +386,57 @@ def execute_plan(plan: TransferPlan) -> None:
         _run(plan.perms_argv)
 
 
+def execute_plan_background(plan: TransferPlan, output_path: Path,
+                            ) -> tuple[int, Path, Path]:
+    """Run the full transfer in a detached background process. Survives
+    the parent shell exiting (nohup + start_new_session) so an SSH
+    connection drop mid-upload doesn't kill the transfer.
+
+    Composes all three plan steps into a shell script written next to
+    the output ``deidentify.json`` so the operator can inspect exactly
+    what will run (and re-run manually if the background process
+    fails). Stdout+stderr from the child stream to ``transfer.log``
+    in the same directory — ``tail -f transfer.log`` shows live
+    progress.
+
+    Returns ``(pid, script_path, log_path)``. The parent exits
+    immediately after the child is launched; the caller prints the
+    pid + paths so the operator can monitor.
+    """
+    script_path = output_path / "transfer.sh"
+    log_path = output_path / "transfer.log"
+
+    # shlex.quote every arg so paths with spaces, quotes, etc. survive
+    # the shell round-trip. Each step goes on its own line so the log
+    # is readable; `set -e` aborts on the first failure so we don't
+    # chmod a directory whose upload failed halfway.
+    lines = ["#!/usr/bin/env bash", "set -e", ""]
+    for label, argv in (("mkdir", plan.mkdir_argv),
+                        ("upload", plan.upload_argv),
+                        ("perms", plan.perms_argv)):
+        if not argv:
+            continue
+        lines.append(f"echo '=== {label} ==='")
+        lines.append(" ".join(shlex.quote(a) for a in argv))
+        lines.append("")
+    script_path.write_text("\n".join(lines))
+    script_path.chmod(0o755)
+
+    # nohup + start_new_session detaches the child from the controlling
+    # terminal so SIGHUP on ssh disconnect doesn't kill it. stdin
+    # redirected from /dev/null so the child can't try to read from a
+    # (soon-vanishing) terminal.
+    log_fh = open(log_path, "w")
+    proc = subprocess.Popen(
+        ["nohup", "bash", str(script_path)],
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return proc.pid, script_path, log_path
+
+
 def transfer_subject(output_path: str | Path, *,
                      ssh_user: str | None = None,
                      dry_run: bool = False,
@@ -386,6 +444,7 @@ def transfer_subject(output_path: str | Path, *,
                      site_map: dict[str, str] | None = None,
                      remote_dir_override: str | None = None,
                      skip_perms: bool = False,
+                     background: bool = False,
                      ) -> TransferPlan:
     """Preflight, then execute (unless ``dry_run``). Returns the
     composed :class:`TransferPlan` either way.
@@ -398,6 +457,12 @@ def transfer_subject(output_path: str | Path, *,
     ``remote_dir_override``: send to this remote path verbatim instead
     of the site-derived destination. Test-only; production code should
     not pass this.
+
+    ``background``: launch the transfer in a detached background
+    process that survives SSH disconnects (see
+    :func:`execute_plan_background`). Returns as soon as the child is
+    launched; the caller is responsible for surfacing pid + log path
+    to the operator.
     """
     output_path = Path(output_path)
     result = preflight_deidentified_output(output_path, site_map=site_map)
@@ -425,6 +490,15 @@ def transfer_subject(output_path: str | Path, *,
         remote_dir_override=remote_dir_override,
         skip_perms=skip_perms,
     )
-    if not dry_run:
+    if dry_run:
+        return plan
+    if background:
+        pid, script_path, log_path = execute_plan_background(plan, output_path)
+        # Stash on the plan so the CLI can surface these to the
+        # operator without needing to duplicate the return signature.
+        plan.background_pid = pid
+        plan.background_script = script_path
+        plan.background_log = log_path
+    else:
         execute_plan(plan)
     return plan
