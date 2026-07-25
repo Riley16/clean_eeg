@@ -41,6 +41,10 @@ from pathlib import Path
 
 import re
 
+from clean_eeg.annotation_boilerplate import (
+    BoilerplateWhitelistError,
+    load_whitelist,
+)
 from clean_eeg.audit.annotations import extract_annotations
 from clean_eeg.audit.hashes import VALID_HASH_MODES
 from clean_eeg.audit.select import select_files
@@ -50,7 +54,7 @@ from clean_eeg.audit.subject import (
     _discover_edf_files,
     audit_subject,
 )
-from clean_eeg.paths import DATA_DIR
+from clean_eeg.paths import ANNOTATION_BOILERPLATE_WHITELIST_PATH, DATA_DIR
 
 
 # Matches EDF+ timekeeping-shaped strings the pipeline treats as
@@ -80,6 +84,27 @@ def _load_vocab_whitelist(path: Path | None) -> tuple[set[str], str]:
         return set(), f"vocab whitelist: {path} does not exist (using empty set)"
     tokens = set(json.loads(path.read_text()))
     return tokens, f"vocab whitelist: {len(tokens)} token(s) from {path}"
+
+
+def _load_boilerplate_whitelist(path: Path | None):
+    """Return ``(BoilerplateWhitelist, status_message)`` — the audit's
+    per-site + shared regex list for annotation-level pre-filtering
+    (annotations that fullmatch a listed pattern are skipped before
+    the name-dict scan runs). Malformed JSON returns an empty
+    whitelist rather than crashing the audit, but surfaces the error
+    loudly in the status message so operators notice."""
+    if path is None or not path.exists():
+        wl = load_whitelist(None)
+        return wl, "boilerplate whitelist: none loaded"
+    try:
+        wl = load_whitelist(path)
+    except BoilerplateWhitelistError as e:
+        wl = load_whitelist(None)
+        return wl, f"boilerplate whitelist: MALFORMED ({e}) — using empty"
+    n_shared = len(wl.shared)
+    n_per_site = sum(len(v) for v in wl.per_site.values())
+    return wl, (f"boilerplate whitelist: {n_shared} shared + {n_per_site} "
+                f"per-site pattern(s) from {path}")
 
 
 SUMMARY_SKIP_CHECKS = frozenset({
@@ -300,7 +325,10 @@ def _run_one_subject(subject_dir: Path, args,
               flush=True)
 
     vocab, vocab_status = _load_vocab_whitelist(args.vocab_whitelist)
+    boilerplate, bp_status = _load_boilerplate_whitelist(
+        ANNOTATION_BOILERPLATE_WHITELIST_PATH)
     print(f"[audit] {vocab_status}", flush=True)
+    print(f"[audit] {bp_status}", flush=True)
     print(f"[audit] auditing {subject_dir}", flush=True)
 
     def _do_audit(force: bool) -> dict:
@@ -317,6 +345,7 @@ def _run_one_subject(subject_dir: Path, args,
             skip_hashes=args.skip_hashes,
             hash_mode=args.hash_mode,
             vocab_whitelist=vocab,
+            boilerplate_whitelist=boilerplate,
             progress=None,
         )
 

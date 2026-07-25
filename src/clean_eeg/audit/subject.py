@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from clean_eeg.annotation_boilerplate import BoilerplateWhitelist
 from clean_eeg.audit.annotations import check_annotation_phi_scan
 from clean_eeg.audit.checks import (
     check_annotation_pairing,
@@ -172,6 +173,7 @@ def audit_subject(subject_dir: str | Path,
                   hash_mode: str = "fast",
                   name_dictionary=None,
                   vocab_whitelist: set[str] | None = None,
+                  boilerplate_whitelist: BoilerplateWhitelist | None = None,
                   progress: ProgressCallback | None = None,
                   ) -> dict:
     """Run the full audit on a single subject directory.
@@ -264,10 +266,15 @@ def audit_subject(subject_dir: str | Path,
     annotation_carriers = stubs if stubs else recordings
 
     if annotation_only:
+        # In annotation-only mode we don't run subject_code_consistency,
+        # so site_code stays None → only the shared boilerplate bucket
+        # applies. That's the safe default when we don't know the site.
         _run_check(checks, timings, "annotation_phi_scan",
                    lambda: check_annotation_phi_scan(
                        annotation_carriers, name_dictionary=name_dictionary,
-                       vocab_whitelist=vocab_whitelist),
+                       vocab_whitelist=vocab_whitelist,
+                       boilerplate_whitelist=boilerplate_whitelist,
+                       site_code=None),
                    progress)
     else:
         _run_check(checks, timings, "subject_code_consistency",
@@ -282,10 +289,17 @@ def audit_subject(subject_dir: str | Path,
                    lambda: check_annotation_pairing(edf_files), progress)
         _run_check(checks, timings, "signal_header_uniformity",
                    lambda: check_signal_header_uniformity(recordings), progress)
+        # Derive site_code from the subject_code that
+        # subject_code_consistency parsed off the patient_id field —
+        # last letter is the site by convention (see SITE_CODE_TO_INCOMING_FOLDER).
+        _sc = checks.get("subject_code_consistency", {}).get("subject_code")
+        _site_code = _sc[-1] if _sc else None
         _run_check(checks, timings, "annotation_phi_scan",
                    lambda: check_annotation_phi_scan(
                        annotation_carriers, name_dictionary=name_dictionary,
-                       vocab_whitelist=vocab_whitelist),
+                       vocab_whitelist=vocab_whitelist,
+                       boilerplate_whitelist=boilerplate_whitelist,
+                       site_code=_site_code),
                    progress)
         _run_check(checks, timings, "log_file",
                    lambda: check_log_file(

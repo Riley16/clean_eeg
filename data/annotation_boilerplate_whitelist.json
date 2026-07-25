@@ -2,7 +2,14 @@
   "shared": [],
   "per_site": {
     "S": [],
-    "A": [],
+    "A": [
+      "PAT REF EEG",
+      "PAT BIPOLAR EEG",
+      "PAT BP_II EEG",
+      "CAL IN",
+      "E/C LAYING ON L\\. SID",
+      "E/C LAYING ON R\\. SID"
+    ],
     "H": [],
     "J": []
   }

@@ -87,10 +87,41 @@ def test_invalid_regex_raises(tmp_path):
 
 
 def test_default_shipped_whitelist_loads(tmp_path):
-    """The empty shipped whitelist at data/annotation_boilerplate_whitelist.json
-    must load cleanly — sites populate it over time."""
+    """The shipped whitelist at data/annotation_boilerplate_whitelist.json
+    must load cleanly and match its documented per-site phrases."""
     from clean_eeg.paths import ANNOTATION_BOILERPLATE_WHITELIST_PATH
     wl = load_whitelist(ANNOTATION_BOILERPLATE_WHITELIST_PATH)
-    # Empty by default; matches nothing.
-    assert not wl.matches("anything", site_code="A")
     assert isinstance(wl, BoilerplateWhitelist)
+
+    # CUDA (site 'A') boilerplate phrases from the shipped file must
+    # fullmatch what R1652A's annotation audit actually flagged.
+    for phrase in ("PAT REF EEG", "PAT BIPOLAR EEG", "PAT BP_II EEG",
+                    "CAL IN", "E/C LAYING ON L. SID",
+                    "E/C LAYING ON R. SID"):
+        assert wl.matches(phrase, site_code="A"), (
+            f"shipped CUDA whitelist should match {phrase!r}"
+        )
+
+    # And crucially, those same phrases must NOT silence a longer
+    # annotation that happens to contain them (fullmatch semantics).
+    assert not wl.matches("CAL IN CAROL AT 3PM", site_code="A")
+    # Per-site scoping — CUDA phrases don't fire at other sites.
+    assert not wl.matches("CAL IN", site_code="S")
+
+
+def test_matches_uses_fullmatch_not_substring():
+    """Fullmatch is what makes pre-filtering safe: unanchored patterns
+    can only silence annotations that they cover completely, not any
+    annotation that contains them as a substring."""
+    import json as _json
+    import re as _re
+    wl = BoilerplateWhitelist(
+        shared=[_re.compile("hello world")],
+        per_site={},
+    )
+    # Exact match → silenced.
+    assert wl.matches("hello world")
+    # Substring only → NOT silenced (would silence PHI in
+    # "hello world dr smith visited" otherwise).
+    assert not wl.matches("hello world dr smith visited")
+    assert not wl.matches("say hello world!")

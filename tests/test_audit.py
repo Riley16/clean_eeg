@@ -784,21 +784,21 @@ _TEST_NAMES = {"john", "smith", "sarah", "o'connor", "jean-luc"}
 
 
 def test_scan_pass_no_annotations():
-    per_ann, inv = scan_annotation_texts([], _TEST_NAMES)
+    per_ann, inv, _stats = scan_annotation_texts([], _TEST_NAMES)
     assert per_ann == []
     assert inv == {}
 
 
 def test_scan_pass_no_name_tokens():
     anns = [{"onset": 1.0, "text": "seizure onset"}]
-    per_ann, inv = scan_annotation_texts(anns, _TEST_NAMES)
+    per_ann, inv, _stats = scan_annotation_texts(anns, _TEST_NAMES)
     assert per_ann == []
     assert inv == {}
 
 
 def test_scan_fail_dictionary_hit():
     anns = [{"onset": 1.0, "text": "patient John reports headache"}]
-    per_ann, inv = scan_annotation_texts(anns, _TEST_NAMES)
+    per_ann, inv, _stats = scan_annotation_texts(anns, _TEST_NAMES)
     assert len(per_ann) == 1
     assert per_ann[0]["matched_tokens"] == ["john"]
     assert list(inv) == ["john"]
@@ -808,14 +808,14 @@ def test_scan_case_insensitive_match():
     anns = [{"onset": 1.0, "text": "SMITH visit"},
             {"onset": 2.0, "text": "Smith visit"},
             {"onset": 3.0, "text": "smith visit"}]
-    per_ann, inv = scan_annotation_texts(anns, _TEST_NAMES)
+    per_ann, inv, _stats = scan_annotation_texts(anns, _TEST_NAMES)
     assert len(per_ann) == 3
     assert inv["smith"] and len(inv["smith"]) == 3
 
 
 def test_scan_multiple_hits_in_one_annotation():
     anns = [{"onset": 1.0, "text": "John Smith saw Sarah"}]
-    per_ann, inv = scan_annotation_texts(anns, _TEST_NAMES)
+    per_ann, inv, _stats = scan_annotation_texts(anns, _TEST_NAMES)
     assert len(per_ann) == 1
     assert set(per_ann[0]["matched_tokens"]) == {"john", "smith", "sarah"}
     assert set(inv) == {"john", "smith", "sarah"}
@@ -823,7 +823,7 @@ def test_scan_multiple_hits_in_one_annotation():
 
 def test_scan_pass_whitelisted_token_ignored():
     anns = [{"onset": 1.0, "text": "seizure noted by John"}]
-    per_ann, inv = scan_annotation_texts(anns, _TEST_NAMES,
+    per_ann, inv, _stats = scan_annotation_texts(anns, _TEST_NAMES,
                                           vocab_whitelist={"John"})
     assert per_ann == []
     assert inv == {}
@@ -832,7 +832,7 @@ def test_scan_pass_whitelisted_token_ignored():
 def test_scan_handles_hyphenated_and_apostrophe_names():
     anns = [{"onset": 1.0, "text": "seen by Jean-Luc"},
             {"onset": 2.0, "text": "notes from O'Connor"}]
-    per_ann, inv = scan_annotation_texts(anns, _TEST_NAMES)
+    per_ann, inv, _stats = scan_annotation_texts(anns, _TEST_NAMES)
     assert len(per_ann) == 2
     assert set(inv) == {"jean-luc", "o'connor"}
 
@@ -840,8 +840,93 @@ def test_scan_handles_hyphenated_and_apostrophe_names():
 def test_scan_ignores_numeric_and_punctuation():
     # +1.5s and (12:03) contain no letter tokens, so no false matches.
     anns = [{"onset": 1.0, "text": "+1.5s (12:03)"}]
-    per_ann, _ = scan_annotation_texts(anns, _TEST_NAMES)
+    per_ann, _, _stats = scan_annotation_texts(anns, _TEST_NAMES)
     assert per_ann == []
+
+
+def test_scan_skips_short_annotations():
+    """Annotations under MIN_ANNOTATION_LENGTH_TO_SCAN (6) are not
+    scanned — short status codes like 'PT', 'OFF', 'EEG', 'RN' are
+    almost never PHI-carrying. Would-be name hits inside short
+    annotations are silenced."""
+    anns = [
+        {"onset": 1.0, "text": "PT"},           # 2 chars → skip
+        {"onset": 2.0, "text": "John"},          # 4 chars → skip, even though
+                                                  #    'john' IS in the name dict
+        {"onset": 3.0, "text": "AWAKE"},         # 5 chars → skip
+        {"onset": 4.0, "text": "JOHN IN"},       # 7 chars → scan (matches 'john')
+    ]
+    per_ann, inv, stats = scan_annotation_texts(anns, _TEST_NAMES)
+    assert stats["n_skipped_short"] == 3
+    assert stats["n_scanned"] == 1
+    # Only the JOHN IN annotation was scanned + flagged.
+    assert len(per_ann) == 1
+    assert per_ann[0]["text"] == "JOHN IN"
+    assert list(inv) == ["john"]
+
+
+def test_scan_boilerplate_whitelist_suppresses_matching_annotation():
+    """A per-site boilerplate regex that fullmatches an annotation
+    prevents that annotation from being scanned at all — so any name
+    tokens inside are silenced along with the boilerplate."""
+    from clean_eeg.annotation_boilerplate import BoilerplateWhitelist
+    import re as _re
+    wl = BoilerplateWhitelist(
+        shared=[],
+        per_site={"A": [_re.compile(r"PAT REF EEG")]},
+    )
+    anns = [
+        {"onset": 1.0, "text": "PAT REF EEG"},       # matches → skip
+        {"onset": 2.0, "text": "seizure by Sarah"},  # no match → scan
+    ]
+    per_ann, inv, stats = scan_annotation_texts(
+        anns, _TEST_NAMES, boilerplate_whitelist=wl, site_code="A")
+    assert stats["n_skipped_boilerplate"] == 1
+    assert stats["n_scanned"] == 1
+    assert len(per_ann) == 1
+    assert per_ann[0]["text"] == "seizure by Sarah"
+    assert "sarah" in inv
+
+
+def test_scan_boilerplate_whitelist_fullmatch_semantics():
+    """Boilerplate matching uses fullmatch — a permissive pattern like
+    'CAL IN' only silences the exact annotation, NOT longer annotations
+    that happen to contain it. Otherwise 'CAL IN CAROL AT 3PM' would
+    silence the Carol PHI."""
+    from clean_eeg.annotation_boilerplate import BoilerplateWhitelist
+    import re as _re
+    wl = BoilerplateWhitelist(
+        shared=[],
+        per_site={"A": [_re.compile(r"CAL IN")]},
+    )
+    _names = _TEST_NAMES | {"carol"}
+    anns = [
+        {"onset": 1.0, "text": "CAL IN"},                # fullmatch → skip
+        {"onset": 2.0, "text": "CAL IN CAROL AT 3PM"},   # substr only → SCAN
+    ]
+    per_ann, inv, stats = scan_annotation_texts(
+        anns, _names, boilerplate_whitelist=wl, site_code="A")
+    assert stats["n_skipped_boilerplate"] == 1
+    assert stats["n_scanned"] == 1
+    # The longer annotation was scanned and Carol was caught.
+    assert len(per_ann) == 1
+    assert "carol" in per_ann[0]["matched_tokens"]
+
+
+def test_scan_boilerplate_whitelist_wrong_site_does_not_apply():
+    """A per-site pattern only fires for its own site. Otherwise a
+    CUDA-specific phrase could silence PHI at UTHSCSA."""
+    from clean_eeg.annotation_boilerplate import BoilerplateWhitelist
+    import re as _re
+    wl = BoilerplateWhitelist(
+        shared=[],
+        per_site={"A": [_re.compile(r"CAL IN")]},
+    )
+    anns = [{"onset": 1.0, "text": "CAL IN"}]
+    per_ann, _, stats = scan_annotation_texts(
+        anns, _TEST_NAMES, boilerplate_whitelist=wl, site_code="S")
+    assert stats["n_skipped_boilerplate"] == 0
+    assert stats["n_scanned"] == 1  # not silenced at site S
 
 
 # --- annotation extraction + end-to-end check ------------------------------

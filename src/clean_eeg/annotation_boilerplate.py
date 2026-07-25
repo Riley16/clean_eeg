@@ -40,15 +40,25 @@ class BoilerplateWhitelist:
     per_site: dict[str, list[re.Pattern]] = field(default_factory=dict)
 
     def matches(self, text: str, site_code: str | None = None) -> bool:
-        """True if ``text`` matches any shared regex, or any regex under
-        the ``site_code`` bucket. Unknown ``site_code`` falls through to
-        shared-only. ``None`` site_code also uses shared-only."""
+        """True if ``text`` matches (via ``re.fullmatch``) any shared
+        regex, or any regex under the ``site_code`` bucket. Unknown
+        ``site_code`` falls through to shared-only. ``None``
+        site_code also uses shared-only.
+
+        Full-match semantics — the regex must match the ENTIRE text,
+        not a substring — because the intended use is "silence known-
+        safe phrases outright." A substring-match on a permissive
+        pattern like ``"CAL IN"`` could silence a legitimate PHI-
+        bearing annotation like ``"CAL IN CAROL AT 3PM"`` where the
+        interesting content follows the boilerplate. Operators who
+        want partial matches can write ``".*something.*"`` explicitly.
+        """
         for pat in self.shared:
-            if pat.search(text):
+            if pat.fullmatch(text):
                 return True
         if site_code:
             for pat in self.per_site.get(site_code, ()):
-                if pat.search(text):
+                if pat.fullmatch(text):
                     return True
         return False
 
