@@ -318,7 +318,11 @@ def clean_subject_edf_files(
     force_load_all: bool = False,
     auto_transfer_response: Union[str, None] = None,
     wipe_annotations: bool = False,
+    recursive: bool = False,
+    approve_confirmations: Union[set, None] = None,
 ):
+    if approve_confirmations is None:
+        approve_confirmations = set()
     from clean_eeg.benchmark import BenchmarkCollector
     bench = BenchmarkCollector(enabled=benchmark)
 
@@ -339,7 +343,8 @@ def clean_subject_edf_files(
                                            load_method=load_method,
                                            raise_errors=raise_errors,
                                            force_load_all=force_load_all,
-                                           bench=bench)
+                                           bench=bench,
+                                           recursive=recursive)
     except ConsecutiveLoadFailureLimit as e:
         # Do NOT write a manifest and do NOT offer transfer — an
         # operator whose files won't load must not be handed an upload
@@ -357,7 +362,8 @@ def clean_subject_edf_files(
         )
 
     _validate_EDF_meta_data(EDF_meta_data, subject_name=subject_name, verbosity=verbosity,
-                            skip_header_name_check=skip_header_name_check)
+                            skip_header_name_check=skip_header_name_check,
+                            approve_confirmations=approve_confirmations)
     min_start_time = _get_start_time_earliest_recording(EDF_meta_data, verbosity=verbosity)
 
     # Select files for signal integrity audit. When skip_audit is True,
@@ -456,7 +462,14 @@ def clean_subject_edf_files(
                 ))
 
             clean_start_time = edf['header']['startdate']
-            filename_no_ext = os.path.splitext(filename)[0]
+            # Under --recursive, `filename` is a relative path like
+            # 'subdir1/foo.edf' — split off the basename for the human-facing
+            # clean_filename, and use the dirname to place the output in the
+            # matching subdir of output_path. Under non-recursive discovery,
+            # dirname is '' and the join collapses to the flat root behavior.
+            source_subdir = os.path.dirname(filename)
+            source_basename = os.path.basename(filename)
+            filename_no_ext = os.path.splitext(source_basename)[0]
             subject_val = subject_code
             # Year deliberately omitted: it would always be 1985 (the
             # BASE_START_DATE used to anchor de-identified relative
@@ -464,8 +477,13 @@ def clean_subject_edf_files(
             # Month/day still encode the relative offset between the
             # subject's recordings within a session.
             clean_filename = f"{filename_no_ext}_{subject_val}_{clean_start_time.strftime('%m.%d__%H.%M.%S')}.edf"
-            clean_full_path = os.path.join(output_path, clean_filename)
+            clean_full_path = os.path.join(output_path, source_subdir, clean_filename)
             clean_annotations_path = str(clean_full_path).replace('.edf', '_annotations.edf')
+            if source_subdir:
+                # Rewrite mode with recursion needs the mirrored subdir to
+                # exist before shutil.move / write_edf_pyedflib writes into it.
+                # In-place mode: dir already exists (source lived there).
+                os.makedirs(os.path.dirname(clean_full_path), exist_ok=True)
             if inplace:
                 with bench.step("write_inplace", file=filename):
                     shutil.move(input_file_path, clean_full_path)
@@ -949,7 +967,8 @@ def _load_edf_metadata(input_path: str,
                        repair_phys_ranges: bool = True,
                        raise_errors: bool = False,
                        force_load_all: bool = False,
-                       bench=None):
+                       bench=None,
+                       recursive: bool = False):
     from clean_eeg.repair_edf import (
         validate_edf_minimum_size,
         repair_main_header_numeric_fields,
@@ -962,10 +981,21 @@ def _load_edf_metadata(input_path: str,
     failed_files: list[tuple[str, str]] = []  # (filename, error_message)
     consecutive_failures = 0
     # sorted() so the consecutive-failure counter and the tqdm progress
-    # bar are deterministic — os.listdir order is filesystem-dependent
-    # and makes load-cap behavior unpredictable across platforms.
-    for filename in tqdm(sorted(os.listdir(input_path)),
-                          desc="Loading EDF meta-data..."):
+    # bar are deterministic — os.listdir / os.walk order is filesystem-
+    # dependent and makes load-cap behavior unpredictable across platforms.
+    if recursive:
+        # rglob returns absolute Paths; convert to sorted relative-path strings
+        # (POSIX-style separators) so `filename` retains the subdir prefix and
+        # downstream os.path.join(input_path, filename) stays valid on all platforms.
+        from pathlib import Path
+        candidates = sorted(
+            str(p.relative_to(input_path)).replace(os.sep, "/")
+            for p in Path(input_path).rglob("*")
+            if p.is_file() and p.suffix.lower() == ".edf"
+        )
+    else:
+        candidates = sorted(os.listdir(input_path))
+    for filename in tqdm(candidates, desc="Loading EDF meta-data..."):
         if not filename.lower().endswith('.edf'):
             continue
         full_path = os.path.join(input_path, filename)
@@ -1042,8 +1072,13 @@ def _get_start_time_earliest_recording(EDF_meta_data: dict, verbosity: int = 0) 
 
 
 def _validate_EDF_meta_data(EDF_meta_data: dict, subject_name: Union[PersonalName, None],
-                            verbosity: int = 0, skip_header_name_check: bool = False):
-    _check_recording_gaps(EDF_meta_data, verbosity=verbosity)
+                            verbosity: int = 0, skip_header_name_check: bool = False,
+                            approve_confirmations: Union[set, None] = None):
+    if approve_confirmations is None:
+        approve_confirmations = set()
+    _check_recording_gaps(EDF_meta_data,
+                          verbosity=verbosity,
+                          approve_confirmations=approve_confirmations)
     if skip_header_name_check:
         print("Skipping EDF header subject-name consistency check "
               "(--skip_header_name_check). Name redaction will still run against all header fields.")
@@ -1053,7 +1088,10 @@ def _validate_EDF_meta_data(EDF_meta_data: dict, subject_name: Union[PersonalNam
     _check_signal_header_consistency(EDF_meta_data, verbosity=verbosity)
 
 
-def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0):
+def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0,
+                          approve_confirmations: Union[set, None] = None):
+    if approve_confirmations is None:
+        approve_confirmations = set()
     # check for gaps between recordings greater than 1 hour
     start_times = list()
     end_times = dict()
@@ -1090,7 +1128,11 @@ def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0):
             if gap.total_seconds() < MIN_RECORDING_GAP_ERROR_SECONDS:
                 confirm_continue = True
     if confirm_continue:
-        continue_input = logged_input("Continue? yes/no: ")
+        if "recording-gaps" in approve_confirmations:
+            print("[!] Recording-gap warnings auto-approved via "
+                  "--approve-confirmations recording-gaps.")
+        else:
+            continue_input = logged_input("Continue? yes/no: ")
     if continue_input.lower() not in ['yes', 'y']:
         raise RuntimeError("Aborting EDF de-identification conversion due to recording gap.")
 
@@ -1270,13 +1312,25 @@ def get_clean_eeg_cli_arguments():
                              "sidecar is written. Requires per-subject confirmation (type the "
                              "subject code) unless suppressed via --approve-confirmations. "
                              "Preserves EDF+ mandatory record-timekeeping TALs.")
+    parser.add_argument("--recursive", "-r",
+                        dest="recursive", action="store_true",
+                        help="Discover EDF files recursively under --input_path and process "
+                             "them together as one subject. Output preserves the source subdir "
+                             "structure (in-place: file renamed in its original subdir; rewrite: "
+                             "output mirrors input tree under --copy_path). All discovered files "
+                             "must belong to the same subject — the subject-code and header "
+                             "consistency checks span the full recursive set. Multi-session "
+                             "inputs commonly trigger the recording-gap prompt many times; use "
+                             "--approve-confirmations recording-gaps to auto-answer 'yes'.")
     parser.add_argument("--approve-confirmations", "--approve_confirmations",
                         dest="approve_confirmations", nargs="+", default=[],
-                        choices=["wipe-annotations"],
-                        help="List of destructive-operation confirmation prompts to auto-approve "
-                             "(for headless / non-interactive runs). Each type must be listed "
-                             "explicitly — there is no global --yes. New confirmation types must "
-                             "be added to `choices` explicitly, forcing per-type opt-in.")
+                        choices=["wipe-annotations", "recording-gaps"],
+                        help="List of destructive-operation or safety-check confirmation "
+                             "prompts to auto-approve (for headless / non-interactive runs). "
+                             "Each type must be listed explicitly — there is no global --yes. "
+                             "New confirmation types must be added to `choices` explicitly, "
+                             "forcing per-type opt-in. Available: 'wipe-annotations', "
+                             "'recording-gaps'.")
 
     args = parser.parse_args()
 
@@ -1416,6 +1470,8 @@ if __name__ == "__main__":
             force=args.force,
             force_load_all=args.force_load_all,
             wipe_annotations=args.wipe_annotations,
+            recursive=args.recursive,
+            approve_confirmations=set(args.approve_confirmations),
         )
 
     except Exception:

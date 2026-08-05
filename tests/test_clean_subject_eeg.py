@@ -1527,3 +1527,154 @@ def test_confirm_wipe_annotations_unrelated_approvals_do_not_bypass(capsys):
     )
     assert result is True
     assert prompt_called, "prompt should have been shown when wipe-annotations not in approved"
+
+
+# --- --recursive -----------------------------------------------------------
+
+
+def _build_recursive_fixture(root, base_edf: str, subdirs: list[str]) -> list[str]:
+    """Copy the same source EDF into each subdir under ``root``. Returns
+    the created file paths in discovery order. Each subdir gets a copy
+    named after the original, so recursive discovery finds all of them.
+    """
+    created = []
+    for i, sub in enumerate(subdirs):
+        d = root / sub
+        d.mkdir(parents=True, exist_ok=True)
+        # Unique filename per subdir so we don't collide even without the
+        # timestamp-based clean_filename disambiguation. Recording start
+        # times are identical (same source file) so the gap check between
+        # copies is 0 — no gap prompt fires.
+        dst = d / f"file_{i}.edf"
+        shutil.copyfile(base_edf, dst)
+        created.append(str(dst))
+    return created
+
+
+@pytest.mark.parametrize("inplace", [True, False])
+def test_recursive_discovers_files_in_subdirs(monkeypatch, tmp_path, inplace):
+    """Positive: --recursive picks up EDFs from nested subdirs and
+    processes them alongside root files. Output preserves subdir layout.
+    """
+    # y for the recording-gap prompt (same as sibling tests — the fixture
+    # copies span >60s between the two source recordings).
+    responses = iter(["y"])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    _build_recursive_fixture(input_dir, SUBJECT_EDF_PATH1,
+                             ["session_a", "session_b/subsub"])
+
+    if inplace:
+        output_dir = input_dir
+    else:
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+
+    clean_subject_edf_files(
+        subject_name=PATIENT_NAME,
+        subject_code=SUBJECT_CODE,
+        input_path=str(input_dir),
+        output_path=str(output_dir),
+        inplace=inplace,
+        recursive=True,
+        auto_transfer_response="n",
+    )
+
+    # Both subdirs should exist under output_dir with a cleaned file inside.
+    for sub in ["session_a", "session_b/subsub"]:
+        out_sub = output_dir / sub
+        edfs = list(out_sub.glob("*.edf"))
+        # No _annotations sidecars in this assertion — we care about
+        # the main output landing in the correct subdir.
+        mains = [e for e in edfs if "_annotations" not in e.name]
+        assert len(mains) == 1, f"expected 1 cleaned EDF in {out_sub}, got {mains}"
+
+
+def test_recursive_flat_input_unchanged(monkeypatch, tmp_path):
+    """Regression: --recursive on a flat directory behaves like the
+    non-recursive default. Guards against the recursive walk missing
+    root-level files.
+    """
+    responses = iter(["y"])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    shutil.copyfile(SUBJECT_EDF_PATH1, input_dir / "a.edf")
+    shutil.copyfile(SUBJECT_EDF_PATH2, input_dir / "b.edf")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    clean_subject_edf_files(
+        subject_name=PATIENT_NAME,
+        subject_code=SUBJECT_CODE,
+        input_path=str(input_dir),
+        output_path=str(output_dir),
+        inplace=False,
+        recursive=True,
+        auto_transfer_response="n",
+    )
+    mains = [p for p in output_dir.glob("*.edf") if "_annotations" not in p.name]
+    assert len(mains) == 2, f"expected 2 cleaned EDFs at output root, got {mains}"
+
+
+def test_recording_gaps_bypassed_by_approve_confirmations(monkeypatch, tmp_path, capsys):
+    """Positive bypass: --approve-confirmations recording-gaps skips the
+    interactive prompt. Uses a monkeypatched input that raises so the
+    test fails loudly if the prompt is triggered.
+    """
+    def _no_prompt(_):
+        raise AssertionError("gap prompt should have been bypassed")
+    monkeypatch.setattr("builtins.input", _no_prompt)
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    shutil.copyfile(SUBJECT_EDF_PATH1, input_dir / "a.edf")
+    shutil.copyfile(SUBJECT_EDF_PATH2, input_dir / "b.edf")  # ~59-min gap
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    clean_subject_edf_files(
+        subject_name=PATIENT_NAME,
+        subject_code=SUBJECT_CODE,
+        input_path=str(input_dir),
+        output_path=str(output_dir),
+        inplace=False,
+        approve_confirmations={"recording-gaps"},
+        auto_transfer_response="n",
+    )
+    out = capsys.readouterr().out
+    assert "auto-approved" in out.lower()
+
+
+def test_recording_gaps_prompt_still_fires_without_bypass(monkeypatch, tmp_path):
+    """Negative guard: an unrelated approval entry must NOT bypass the
+    gap prompt. Same "no global --yes" invariant as wipe-annotations.
+    """
+    prompt_called = []
+    def _record_prompt(p):
+        prompt_called.append(p)
+        return "y"
+    monkeypatch.setattr("builtins.input", _record_prompt)
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    shutil.copyfile(SUBJECT_EDF_PATH1, input_dir / "a.edf")
+    shutil.copyfile(SUBJECT_EDF_PATH2, input_dir / "b.edf")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    clean_subject_edf_files(
+        subject_name=PATIENT_NAME,
+        subject_code=SUBJECT_CODE,
+        input_path=str(input_dir),
+        output_path=str(output_dir),
+        inplace=False,
+        approve_confirmations={"wipe-annotations"},  # unrelated
+        auto_transfer_response="n",
+    )
+    # At least the gap prompt should have been shown; other prompts may fire too.
+    gap_prompts = [p for p in prompt_called if "Continue?" in p]
+    assert gap_prompts, "gap prompt should have fired when 'recording-gaps' not in approved"
