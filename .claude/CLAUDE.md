@@ -62,6 +62,8 @@ Three-layer approach using Presidio:
 2. **Title + initials patterns** — regex for "Dr. J. O'Connor" style
 3. **Fuzzy matching** — Levenshtein distance ≤1 via custom recognizer
 
+Alternative: `--wipe-annotations` skips redaction entirely and DELETES all non-timekeeping annotations from the output (preserves EDF+ mandatory record-timekeeping TALs). No `_annotations.edf` sidecar is written under wipe mode. Requires per-subject confirmation (type the subject code); bypass via `--approve-confirmations wipe-annotations` for headless / SSH-without-PTY runs. Use for deployments that prefer wipe-over-redact when the annotation content isn't clinically load-bearing.
+
 ### In-Place EDF Modification (modify_edf_inplace.py)
 - Creates temp EDF with updated headers via pyedflib
 - Copies only header bytes back to original file (preserves signal data)

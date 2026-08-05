@@ -1360,3 +1360,170 @@ def test_manifest_records_fast_hash_for_every_output(tmp_path, monkeypatch):
     assert manifest["hash_mode"] == "fast"
     assert manifest["subject_code"] == SUBJECT_CODE
     assert manifest["site_code"] == SUBJECT_CODE[-1]
+
+
+# --- --wipe-annotations ----------------------------------------------------
+
+
+def _n_data_records_from_header(path: str) -> int:
+    """Read n_records (bytes 236-244 of the EDF main header) directly."""
+    with open(path, "rb") as f:
+        f.seek(236)
+        return int(f.read(8).decode().strip())
+
+
+def _count_timekeeping_tals(edf_path: str) -> int:
+    """Byte-level count of records whose annotation channel starts with
+    a timekeeping TAL (``+<onset>\\x14\\x14``). Verifies the timekeeping
+    delimiter survives ``clear_edf_annotations_inplace`` in every record.
+    """
+    from clean_eeg.modify_edf_inplace import (
+        get_annotation_signal_header_index,
+        get_signal_header_fields,
+        get_header_field,
+        TOTAL_HEADER_BYTES,
+        SIGNAL_HEADER_BYTES,
+    )
+    ann_idx = get_annotation_signal_header_index(edf_path)
+    lengths = [n * 2 for n in get_signal_header_fields(edf_path, field='num_samples')]
+    ann_len = lengths[ann_idx]
+    ann_off_in_record = sum(lengths[:ann_idx])
+    total_record_length = sum(lengths)
+    n_signals = len(lengths)
+    n_records = get_header_field(edf_path, 'num_data_records')
+    n_with_tk = 0
+    with open(edf_path, "rb") as f:
+        for i in range(n_records):
+            offset = (TOTAL_HEADER_BYTES + SIGNAL_HEADER_BYTES * n_signals
+                      + total_record_length * i + ann_off_in_record)
+            f.seek(offset)
+            record = f.read(ann_len)
+            if b"\x14\x14" in record[:64] and record.startswith(b"+"):
+                n_with_tk += 1
+    return n_with_tk
+
+
+def _run_wipe_pipeline(monkeypatch, tmp_output, inplace: bool) -> str:
+    """Common driver for the wipe integration tests. Returns output_path."""
+    # Recording-gap 'y' — same as the sibling test_clean_subject_edf_files.
+    responses = iter(["y"])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+
+    if tmp_output.exists():
+        shutil.rmtree(tmp_output)
+    os.makedirs(tmp_output)
+    if inplace:
+        shutil.copyfile(SUBJECT_EDF_PATH1, tmp_output / os.path.basename(SUBJECT_EDF_PATH1))
+        shutil.copyfile(SUBJECT_EDF_PATH2, tmp_output / os.path.basename(SUBJECT_EDF_PATH2))
+
+    clean_subject_edf_files(
+        subject_name=PATIENT_NAME,
+        subject_code=SUBJECT_CODE,
+        input_path=str(TEST_SUBJECT_DATA_DIR) if not inplace else str(tmp_output),
+        output_path=str(tmp_output),
+        inplace=inplace,
+        wipe_annotations=True,
+        auto_transfer_response="n",
+    )
+    return str(tmp_output)
+
+
+def _wipe_output_edfs(output_path: str) -> list[str]:
+    return [os.path.join(output_path, f)
+            for f in os.listdir(output_path)
+            if f.endswith(".edf") and "_annotations" not in f]
+
+
+@pytest.mark.parametrize("inplace", [True, False])
+def test_wipe_annotations_removes_all_events(monkeypatch, tmp_path, inplace):
+    """Positive: pyedflib reports zero annotation texts on wipe output."""
+    import pyedflib
+    output_path = _run_wipe_pipeline(monkeypatch, tmp_path / "out", inplace=inplace)
+    edfs = _wipe_output_edfs(output_path)
+    assert edfs, "no output EDFs produced"
+    for edf in edfs:
+        with pyedflib.EdfReader(edf) as f:
+            onsets, durations, texts = f.readAnnotations()
+        assert len(texts) == 0, f"{edf}: expected 0 annotations, got {len(texts)}"
+
+
+@pytest.mark.parametrize("inplace", [True, False])
+def test_wipe_annotations_preserves_timekeeping_tals(monkeypatch, tmp_path, inplace):
+    """Byte-level guard: every data record still has a timekeeping TAL.
+
+    ``clear_edf_annotations_inplace`` zeros bytes AFTER the ``\\x14\\x14``
+    delimiter — if a future refactor accidentally strips the timekeeping
+    prefix too, this test fires before we ship a spec-noncompliant EDF+.
+    """
+    output_path = _run_wipe_pipeline(monkeypatch, tmp_path / "out", inplace=inplace)
+    edfs = _wipe_output_edfs(output_path)
+    assert edfs
+    for edf in edfs:
+        n_records = _n_data_records_from_header(edf)
+        n_tk = _count_timekeeping_tals(edf)
+        assert n_tk == n_records, \
+            f"{edf}: timekeeping TAL count {n_tk} != n_records {n_records}"
+
+
+@pytest.mark.parametrize("inplace", [True, False])
+def test_wipe_annotations_skips_stub_creation(monkeypatch, tmp_path, inplace):
+    """Negative: no ``*_annotations.edf`` sidecar is written."""
+    output_path = _run_wipe_pipeline(monkeypatch, tmp_path / "out", inplace=inplace)
+    stubs = [f for f in os.listdir(output_path) if f.endswith("_annotations.edf")]
+    assert stubs == [], f"unexpected stubs: {stubs}"
+
+
+def test_confirm_wipe_annotations_accepts_subject_code(capsys):
+    from clean_eeg.clean_subject_eeg import confirm_wipe_annotations
+    result = confirm_wipe_annotations(
+        "R1755J", approved=set(), input_fn=lambda _: "R1755J")
+    assert result is True
+    assert "Confirmed" in capsys.readouterr().out
+
+
+def test_confirm_wipe_annotations_rejects_wrong_code(capsys):
+    from clean_eeg.clean_subject_eeg import confirm_wipe_annotations
+    # Case mismatch is deliberately rejected — the prompt says
+    # "case-sensitive" and hospital-code letters carry meaning.
+    result = confirm_wipe_annotations(
+        "R1755J", approved=set(), input_fn=lambda _: "r1755j")
+    assert result is False
+    assert "does not match" in capsys.readouterr().out
+
+
+def test_confirm_wipe_annotations_rejects_yes_shortcut(capsys):
+    from clean_eeg.clean_subject_eeg import confirm_wipe_annotations
+    # Guard against operators reflexively typing "yes" from other tools.
+    result = confirm_wipe_annotations(
+        "R1755J", approved=set(), input_fn=lambda _: "yes")
+    assert result is False
+
+
+def test_confirm_wipe_annotations_bypassed_by_approve_confirmations(capsys):
+    from clean_eeg.clean_subject_eeg import confirm_wipe_annotations
+    # Sentinel: if the prompt is called under the bypass, this raises.
+    result = confirm_wipe_annotations(
+        "R1755J",
+        approved={"wipe-annotations"},
+        input_fn=lambda _: (_ for _ in ()).throw(AssertionError("prompt called")),
+    )
+    assert result is True
+    out = capsys.readouterr().out
+    assert "auto-approved" in out
+    assert "R1755J" in out
+
+
+def test_confirm_wipe_annotations_unrelated_approvals_do_not_bypass(capsys):
+    """The list is per-type: an ``approved`` set containing an unrelated
+    entry must still prompt for wipe. Guards the "no global --yes"
+    invariant against a future refactor that treats the set generically.
+    """
+    from clean_eeg.clean_subject_eeg import confirm_wipe_annotations
+    prompt_called = []
+    result = confirm_wipe_annotations(
+        "R1755J",
+        approved={"some-other-future-confirmation"},
+        input_fn=lambda p: (prompt_called.append(p) or "R1755J"),
+    )
+    assert result is True
+    assert prompt_called, "prompt should have been shown when wipe-annotations not in approved"

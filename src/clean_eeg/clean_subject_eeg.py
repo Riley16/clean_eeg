@@ -60,7 +60,8 @@ class ConsecutiveLoadFailureLimit(RuntimeError):
 def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_start_time,
                    redactor: Union[SubjectNameRedactor, None] = None,
                    review_events: Union[list, None] = None,
-                   source_file: Union[str, None] = None):
+                   source_file: Union[str, None] = None,
+                   wipe_annotations: bool = False):
     # remove protected health information (PHI) from EEG
     # accepts EDF data in 'pyedflib' format
 
@@ -87,6 +88,22 @@ def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_star
                               redactor=redactor)
         for sh in edf_data['signal_headers']
     ]
+    if wipe_annotations:
+        # Skip Presidio entirely — the write path will call
+        # clear_edf_annotations_inplace on the output, which zeros every
+        # non-timekeeping annotation TAL byte-for-byte. Handing pyedflib
+        # an empty annotation tuple in the rewrite path keeps its
+        # annotation channel wired up correctly (only timekeeping TALs
+        # get written, which is what we want).
+        clean_annotations = (np.array([]), np.array([]), np.array([]))
+    else:
+        clean_annotations = deidentify_edf_annotations(
+            edf_data['annotations'],
+            subject_name=subject_name,
+            redactor=redactor,
+            review_events=review_events,
+            source_file=source_file,
+        )
     return {
         'header': deidentify_edf_header(edf_data['header'],
                                         subject_name=subject_name,
@@ -94,11 +111,7 @@ def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_star
                                         earliest_recording_start_time=earliest_recording_start_time,
                                         redactor=redactor),
         'signal_headers': clean_signal_headers,
-        'annotations': deidentify_edf_annotations(edf_data['annotations'],
-                                                  subject_name=subject_name,
-                                                  redactor=redactor,
-                                                  review_events=review_events,
-                                                  source_file=source_file),
+        'annotations': clean_annotations,
         'signals': edf_data['signals'],
     }
 
@@ -190,6 +203,44 @@ def is_valid_subject_code(subject_code,
     return re.match(pattern, subject_code) is not None
 
 
+def confirm_wipe_annotations(subject_code: str,
+                             approved: set[str],
+                             input_fn=None) -> bool:
+    """Interactive per-subject confirmation for --wipe-annotations.
+
+    The operator must type the exact ``subject_code`` (case-sensitive)
+    to authorize deletion of all non-timekeeping annotations for that
+    subject. Rejects "yes", "y", empty input, or any wrong code.
+
+    ``approved`` is the set from ``--approve-confirmations``: if it
+    contains ``'wipe-annotations'``, the prompt is skipped and a loud
+    banner is printed instead. Each destructive confirmation type must
+    be listed explicitly — this is intentionally NOT a global bypass.
+
+    ``input_fn`` is a hook for testing (default: ``logged_input`` from
+    ``clean_eeg.log``, which wraps ``input()`` and also writes the
+    typed response to log.out so ``--wipe-annotations`` invocations
+    are auditable).
+    """
+    if "wipe-annotations" in approved:
+        print(f"[!] --wipe-annotations auto-approved for {subject_code} "
+              "via --approve-confirmations. All non-timekeeping annotations "
+              "will be permanently deleted from the output EDFs.")
+        return True
+
+    if input_fn is None:
+        input_fn = logged_input
+    print(f"[!] --wipe-annotations will PERMANENTLY DELETE all non-timekeeping "
+          f"annotations from the output EDFs for subject {subject_code}.")
+    typed = input_fn(f"Type the subject code ({subject_code}) to CONFIRM: ")
+    if typed == subject_code:
+        print(f"[wipe] Confirmed. Proceeding with wipe of annotations for {subject_code}.")
+        return True
+    print(f"[wipe] Confirmation input {typed!r} does not match subject code "
+          f"{subject_code!r}. Aborting — no files were modified.")
+    return False
+
+
 def deidentify_start_date_time(recording_start_time, earliest_recording_start_time):
     shifted_time = recording_start_time - earliest_recording_start_time + BASE_START_DATE
     return shifted_time
@@ -266,6 +317,7 @@ def clean_subject_edf_files(
     force: bool = False,
     force_load_all: bool = False,
     auto_transfer_response: Union[str, None] = None,
+    wipe_annotations: bool = False,
 ):
     from clean_eeg.benchmark import BenchmarkCollector
     bench = BenchmarkCollector(enabled=benchmark)
@@ -385,6 +437,7 @@ def clean_subject_edf_files(
                     redactor=redactor,
                     review_events=review_events,
                     source_file=filename,
+                    wipe_annotations=wipe_annotations,
                 )
             with bench.step("validate_header_roundtrip", file=filename):
                 truncation_warnings = validate_header_roundtrip(
@@ -417,10 +470,14 @@ def clean_subject_edf_files(
                 with bench.step("write_inplace", file=filename):
                     shutil.move(input_file_path, clean_full_path)
                     output_artifacts.append(clean_full_path)
-                    create_annotations_only_edf(clean_annotations_path,
-                                                header=edf['header'],
-                                                annotations=edf['annotations'])
-                    output_artifacts.append(clean_annotations_path)
+                    if not wipe_annotations:
+                        # Sidecar stub — skipped under --wipe-annotations because
+                        # the annotations we'd write into it are the ones the
+                        # operator asked us to delete.
+                        create_annotations_only_edf(clean_annotations_path,
+                                                    header=edf['header'],
+                                                    annotations=edf['annotations'])
+                        output_artifacts.append(clean_annotations_path)
                     update_edf_header_inplace(clean_full_path,
                                               header_updates=edf['header'],
                                               signal_header_updates=edf['signal_headers'])
@@ -429,6 +486,14 @@ def clean_subject_edf_files(
                 with bench.step("write_edf_pyedflib", file=filename):
                     write_edf_pyedflib(edf, clean_full_path, digital=read_digital)
                     output_artifacts.append(clean_full_path)
+                    if wipe_annotations:
+                        # Same primitive as the in-place branch so both modes
+                        # converge on byte-identical annotation-channel state
+                        # (timekeeping TALs preserved, all event TAL bytes zeroed).
+                        clear_edf_annotations_inplace(clean_full_path)
+            if wipe_annotations:
+                print(f"[wipe] {filename}: wiped, validated "
+                      "(0 non-timekeeping annotations remain)")
             # Per-file success is reflected in the tqdm postfix
             # (redactions/quarantined counters) — dropping the old
             # scrolling 'Cleaned EDF file at:' line keeps the terminal
@@ -1198,6 +1263,20 @@ def get_clean_eeg_cli_arguments():
                         help=f"Bypass the {MAX_CONSECUTIVE_LOAD_FAILURES}-consecutive-load-failure "
                              "abort. Use only after inspecting the failed files' errors and "
                              "confirming the remaining files are worth attempting.")
+    parser.add_argument("--wipe-annotations", "--wipe_annotations",
+                        dest="wipe_annotations", action="store_true",
+                        help="DELETE all non-timekeeping annotations from the output EDF "
+                             "instead of Presidio-redacting them. No separate '_annotations.edf' "
+                             "sidecar is written. Requires per-subject confirmation (type the "
+                             "subject code) unless suppressed via --approve-confirmations. "
+                             "Preserves EDF+ mandatory record-timekeeping TALs.")
+    parser.add_argument("--approve-confirmations", "--approve_confirmations",
+                        dest="approve_confirmations", nargs="+", default=[],
+                        choices=["wipe-annotations"],
+                        help="List of destructive-operation confirmation prompts to auto-approve "
+                             "(for headless / non-interactive runs). Each type must be listed "
+                             "explicitly — there is no global --yes. New confirmation types must "
+                             "be added to `choices` explicitly, forcing per-type opt-in.")
 
     args = parser.parse_args()
 
@@ -1318,6 +1397,11 @@ if __name__ == "__main__":
             last_name=args.last_name
         )
 
+        if args.wipe_annotations:
+            approved = set(args.approve_confirmations)
+            if not confirm_wipe_annotations(args.subject_code, approved):
+                raise SystemExit(1)
+
         clean_subject_edf_files(
             input_path=args.input_path,
             output_path=args.output_path,
@@ -1331,6 +1415,7 @@ if __name__ == "__main__":
             skip_audit=args.skip_audit,
             force=args.force,
             force_load_all=args.force_load_all,
+            wipe_annotations=args.wipe_annotations,
         )
 
     except Exception:
