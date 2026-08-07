@@ -1649,6 +1649,68 @@ def test_recording_gaps_bypassed_by_approve_confirmations(monkeypatch, tmp_path,
     assert "auto-approved" in out.lower()
 
 
+def test_quiet_gap_check_suppresses_details_but_prints_summary(
+        monkeypatch, tmp_path, capsys):
+    """Positive: --quiet-gap-check silences per-gap WARNING lines and
+    the auto-approval banner but still prints a one-line summary.
+    Check still enforces its logic (approve-confirmations bypass fires).
+    """
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    shutil.copyfile(SUBJECT_EDF_PATH1, input_dir / "a.edf")
+    shutil.copyfile(SUBJECT_EDF_PATH2, input_dir / "b.edf")  # ~59-min gap
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    clean_subject_edf_files(
+        subject_name=PATIENT_NAME,
+        subject_code=SUBJECT_CODE,
+        input_path=str(input_dir),
+        output_path=str(output_dir),
+        inplace=False,
+        approve_confirmations={"recording-gaps"},
+        quiet_gap_check=True,
+        auto_transfer_response="n",
+    )
+    out = capsys.readouterr().out
+    # Detail lines suppressed:
+    assert "WARNING: Gap of" not in out
+    assert "This may indicate missing recording files" not in out
+    # Auto-approval banner also suppressed (would be redundant noise):
+    assert "auto-approved" not in out.lower()
+    # Summary still surfaces:
+    assert "[gaps] 1 large gap(s)" in out
+
+
+def test_quiet_gap_check_default_still_prints_details(monkeypatch, tmp_path, capsys):
+    """Negative: without --quiet-gap-check the existing WARNING output
+    is unchanged. Guards against the flag flipping default behavior.
+    """
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    shutil.copyfile(SUBJECT_EDF_PATH1, input_dir / "a.edf")
+    shutil.copyfile(SUBJECT_EDF_PATH2, input_dir / "b.edf")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    clean_subject_edf_files(
+        subject_name=PATIENT_NAME,
+        subject_code=SUBJECT_CODE,
+        input_path=str(input_dir),
+        output_path=str(output_dir),
+        inplace=False,
+        # quiet_gap_check defaults to False
+        auto_transfer_response="n",
+    )
+    out = capsys.readouterr().out
+    assert "WARNING: Gap of" in out
+    assert "[gaps]" not in out  # summary is quiet-mode-only
+
+
 def test_recording_gaps_prompt_still_fires_without_bypass(monkeypatch, tmp_path):
     """Negative guard: an unrelated approval entry must NOT bypass the
     gap prompt. Same "no global --yes" invariant as wipe-annotations.

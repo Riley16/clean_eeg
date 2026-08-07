@@ -320,6 +320,7 @@ def clean_subject_edf_files(
     wipe_annotations: bool = False,
     recursive: bool = False,
     approve_confirmations: Union[set, None] = None,
+    quiet_gap_check: bool = False,
 ):
     if approve_confirmations is None:
         approve_confirmations = set()
@@ -363,7 +364,8 @@ def clean_subject_edf_files(
 
     _validate_EDF_meta_data(EDF_meta_data, subject_name=subject_name, verbosity=verbosity,
                             skip_header_name_check=skip_header_name_check,
-                            approve_confirmations=approve_confirmations)
+                            approve_confirmations=approve_confirmations,
+                            quiet_gap_check=quiet_gap_check)
     min_start_time = _get_start_time_earliest_recording(EDF_meta_data, verbosity=verbosity)
 
     # Select files for signal integrity audit. When skip_audit is True,
@@ -1073,12 +1075,14 @@ def _get_start_time_earliest_recording(EDF_meta_data: dict, verbosity: int = 0) 
 
 def _validate_EDF_meta_data(EDF_meta_data: dict, subject_name: Union[PersonalName, None],
                             verbosity: int = 0, skip_header_name_check: bool = False,
-                            approve_confirmations: Union[set, None] = None):
+                            approve_confirmations: Union[set, None] = None,
+                            quiet_gap_check: bool = False):
     if approve_confirmations is None:
         approve_confirmations = set()
     _check_recording_gaps(EDF_meta_data,
                           verbosity=verbosity,
-                          approve_confirmations=approve_confirmations)
+                          approve_confirmations=approve_confirmations,
+                          quiet_gap_check=quiet_gap_check)
     if skip_header_name_check:
         print("Skipping EDF header subject-name consistency check "
               "(--skip_header_name_check). Name redaction will still run against all header fields.")
@@ -1089,7 +1093,14 @@ def _validate_EDF_meta_data(EDF_meta_data: dict, subject_name: Union[PersonalNam
 
 
 def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0,
-                          approve_confirmations: Union[set, None] = None):
+                          approve_confirmations: Union[set, None] = None,
+                          quiet_gap_check: bool = False):
+    """Detect gaps/overlaps between recordings. ``quiet_gap_check``
+    suppresses per-gap WARNING output and the auto-approval banner —
+    the check itself still runs and still errors on unsafe conditions.
+    Intended for multi-session recursive audits where dozens of gap
+    warnings would otherwise flood the log.
+    """
     if approve_confirmations is None:
         approve_confirmations = set()
     # check for gaps between recordings greater than 1 hour
@@ -1102,6 +1113,9 @@ def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0,
         file_duration_manual = data['header']['record_duration'] * data['header']['n_records']
         file_duration = data['header']['file_duration']
         if not np.isclose(file_duration, file_duration_manual, atol=0.5):
+            # Per-file integrity warning — printed regardless of
+            # quiet_gap_check because it's about a single file's own
+            # header consistency, not gaps between files.
             print(f"WARNING: EDF file {filename} has inconsistent file duration (pyedflib duration: "
                   f"{file_duration} s vs. manual calculation: {file_duration_manual} s).")
         end_time = start_time + timedelta(seconds=file_duration)
@@ -1109,28 +1123,40 @@ def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0,
     start_times.sort(key=lambda x: x[1])  # sort by datetime
     continue_input = 'yes'
     confirm_continue = False
+    n_large_gaps = 0
+    n_overlaps = 0
     for i in range(1, len(start_times)):
         prev_filename, _ = start_times[i-1]
         curr_filename, curr_start_time = start_times[i]
         gap = curr_start_time - end_times[prev_filename]
         end_time_prev = end_times[prev_filename]
         if gap.total_seconds() > MAX_RECORDING_GAP_SECONDS:
-            print(f"WARNING: Gap of {gap} between neighboring recordings:\n"
-                  f"{prev_filename} (end: {end_time_prev}) and\n"
-                  f"{curr_filename} (start: {curr_start_time}).")
-            print('This may indicate missing recording files. Double check no additional recording files are available.')
+            n_large_gaps += 1
+            if not quiet_gap_check:
+                print(f"WARNING: Gap of {gap} between neighboring recordings:\n"
+                      f"{prev_filename} (end: {end_time_prev}) and\n"
+                      f"{curr_filename} (start: {curr_start_time}).")
+                print('This may indicate missing recording files. Double check no additional recording files are available.')
             confirm_continue = True
         elif gap.total_seconds() < MIN_RECORDING_GAP_WARNING_SECONDS:
-            print(f"WARNING: Overlap of {abs(gap.total_seconds())} seconds between neighboring recordings:\n"
-                  f"{prev_filename} (end: {end_time_prev}) and\n"
-                  f"{curr_filename} (start: {curr_start_time}).")
-            print('This may indicate corrupted EDF files. Check with the data analysis team.')
+            n_overlaps += 1
+            if not quiet_gap_check:
+                print(f"WARNING: Overlap of {abs(gap.total_seconds())} seconds between neighboring recordings:\n"
+                      f"{prev_filename} (end: {end_time_prev}) and\n"
+                      f"{curr_filename} (start: {curr_start_time}).")
+                print('This may indicate corrupted EDF files. Check with the data analysis team.')
             if gap.total_seconds() < MIN_RECORDING_GAP_ERROR_SECONDS:
                 confirm_continue = True
+    if quiet_gap_check and (n_large_gaps or n_overlaps):
+        # One-line summary in quiet mode so the operator still knows
+        # something was flagged. Kept minimal — details went to nowhere.
+        print(f"[gaps] {n_large_gaps} large gap(s), {n_overlaps} overlap(s) "
+              "detected (details suppressed by --quiet-gap-check).")
     if confirm_continue:
         if "recording-gaps" in approve_confirmations:
-            print("[!] Recording-gap warnings auto-approved via "
-                  "--approve-confirmations recording-gaps.")
+            if not quiet_gap_check:
+                print("[!] Recording-gap warnings auto-approved via "
+                      "--approve-confirmations recording-gaps.")
         else:
             continue_input = logged_input("Continue? yes/no: ")
     if continue_input.lower() not in ['yes', 'y']:
@@ -1331,6 +1357,16 @@ def get_clean_eeg_cli_arguments():
                              "New confirmation types must be added to `choices` explicitly, "
                              "forcing per-type opt-in. Available: 'wipe-annotations', "
                              "'recording-gaps'.")
+    parser.add_argument("--quiet-gap-check", "--quiet_gap_check",
+                        dest="quiet_gap_check", action="store_true",
+                        help="Suppress per-gap WARNING output from the recording-gap "
+                             "check. The check still runs and still fires the prompt "
+                             "(or auto-approval banner) on unsafe conditions — only the "
+                             "noisy per-gap detail lines are silenced. Print a one-line "
+                             "'[gaps] N large gap(s), M overlap(s)' summary if any were "
+                             "detected. Intended for multi-session --recursive audits "
+                             "where legitimate gaps between sessions would otherwise "
+                             "flood the log.")
 
     args = parser.parse_args()
 
@@ -1472,6 +1508,7 @@ if __name__ == "__main__":
             wipe_annotations=args.wipe_annotations,
             recursive=args.recursive,
             approve_confirmations=set(args.approve_confirmations),
+            quiet_gap_check=args.quiet_gap_check,
         )
 
     except Exception:
