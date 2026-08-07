@@ -1684,6 +1684,39 @@ def test_quiet_gap_check_suppresses_details_but_prints_summary(
     assert "[gaps] 1 large gap(s)" in out
 
 
+def test_quiet_gap_check_alone_bypasses_prompt(monkeypatch, tmp_path, capsys):
+    """Positive: --quiet-gap-check ALONE (no --approve-confirmations)
+    silences AND auto-approves. Guards headless / SSH-without-PTY use.
+    Monkeypatched input raises if the prompt fires.
+    """
+    def _no_prompt(_):
+        raise AssertionError("prompt should have been bypassed by --quiet-gap-check")
+    monkeypatch.setattr("builtins.input", _no_prompt)
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    shutil.copyfile(SUBJECT_EDF_PATH1, input_dir / "a.edf")
+    shutil.copyfile(SUBJECT_EDF_PATH2, input_dir / "b.edf")  # ~59-min gap
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    clean_subject_edf_files(
+        subject_name=PATIENT_NAME,
+        subject_code=SUBJECT_CODE,
+        input_path=str(input_dir),
+        output_path=str(output_dir),
+        inplace=False,
+        quiet_gap_check=True,
+        # No approve_confirmations passed — quiet_gap_check alone must
+        # be enough to bypass the prompt.
+        auto_transfer_response="n",
+    )
+    out = capsys.readouterr().out
+    assert "WARNING: Gap of" not in out
+    assert "auto-approved" not in out.lower()
+    assert "[gaps] 1 large gap(s)" in out
+
+
 def test_quiet_gap_check_default_still_prints_details(monkeypatch, tmp_path, capsys):
     """Negative: without --quiet-gap-check the existing WARNING output
     is unchanged. Guards against the flag flipping default behavior.

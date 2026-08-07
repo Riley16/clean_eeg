@@ -1095,11 +1095,13 @@ def _validate_EDF_meta_data(EDF_meta_data: dict, subject_name: Union[PersonalNam
 def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0,
                           approve_confirmations: Union[set, None] = None,
                           quiet_gap_check: bool = False):
-    """Detect gaps/overlaps between recordings. ``quiet_gap_check``
-    suppresses per-gap WARNING output and the auto-approval banner —
-    the check itself still runs and still errors on unsafe conditions.
-    Intended for multi-session recursive audits where dozens of gap
-    warnings would otherwise flood the log.
+    """Detect gaps/overlaps between recordings. ``quiet_gap_check``:
+      - suppresses per-gap WARNING output and the auto-approval banner
+      - AUTO-APPROVES the confirmation prompt (equivalent to also
+        passing ``recording-gaps`` to ``--approve-confirmations``)
+    Intended for pooling files that are intentionally non-consecutive
+    (e.g. multi-session --recursive audits) where legitimate large gaps
+    would otherwise flood the log and block on interactive confirmation.
     """
     if approve_confirmations is None:
         approve_confirmations = set()
@@ -1153,7 +1155,9 @@ def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0,
         print(f"[gaps] {n_large_gaps} large gap(s), {n_overlaps} overlap(s) "
               "detected (details suppressed by --quiet-gap-check).")
     if confirm_continue:
-        if "recording-gaps" in approve_confirmations:
+        auto_approved = (
+            "recording-gaps" in approve_confirmations or quiet_gap_check)
+        if auto_approved:
             if not quiet_gap_check:
                 print("[!] Recording-gap warnings auto-approved via "
                       "--approve-confirmations recording-gaps.")
@@ -1359,14 +1363,17 @@ def get_clean_eeg_cli_arguments():
                              "'recording-gaps'.")
     parser.add_argument("--quiet-gap-check", "--quiet_gap_check",
                         dest="quiet_gap_check", action="store_true",
-                        help="Suppress per-gap WARNING output from the recording-gap "
-                             "check. The check still runs and still fires the prompt "
-                             "(or auto-approval banner) on unsafe conditions — only the "
-                             "noisy per-gap detail lines are silenced. Print a one-line "
-                             "'[gaps] N large gap(s), M overlap(s)' summary if any were "
-                             "detected. Intended for multi-session --recursive audits "
-                             "where legitimate gaps between sessions would otherwise "
-                             "flood the log.")
+                        help="Silence AND auto-approve the recording-gap check. "
+                             "Suppresses per-gap WARNING details and the "
+                             "auto-approval banner; auto-answers 'yes' to the "
+                             "continue-on-gaps prompt (equivalent to also passing "
+                             "--approve-confirmations recording-gaps). Prints a "
+                             "one-line '[gaps] N large gap(s), M overlap(s)' summary "
+                             "if anything fires. Use ONLY when the input files are "
+                             "intentionally non-consecutive (e.g. pooling separate "
+                             "sessions of the same subject) — gaps are the pipeline's "
+                             "primary signal for missing files, so silencing them "
+                             "opens a real hole in the transfer-integrity check.")
 
     args = parser.parse_args()
 
