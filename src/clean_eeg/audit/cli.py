@@ -317,13 +317,23 @@ def _collect_flagged_filenames(audit: dict) -> dict[str, list[str]]:
     return flagged
 
 
-def _print_failed_deid_headers(audit: dict, subject_dir: Path, out=None) -> None:
+def _print_failed_deid_headers(audit: dict, subject_dir: Path,
+                               *, redact_phi: bool = False,
+                               out=None) -> None:
     """Dump the EDF header for every file the audit's critical-findings
     banner flagged — pipeline-failed (from ``log_file``), unrenamed
     (from ``filename_convention``), and off-year recording_id (from
     ``header_phi_residue``). Read via the byte-level parser so files
     pyedflib refuses to open still yield a header. Read-only — NEVER
     attempts to re-clean.
+
+    ``redact_phi=False`` (default) shows the raw header AS IT EXISTS
+    ON DISK POST-CLEANING. The whole point of dumping a failed-file
+    header is diagnostic — if we mask the PHI-carrying fields, we
+    hide the exact evidence needed to decide what went wrong. Opt
+    into masking (``--redact-header-dump``) only when the audit
+    output is going to be shared with someone who shouldn't see raw
+    PHI in the case that cleaning failed.
 
     Reasons accumulate per file so an operator seeing e.g. the same
     file flagged as BOTH unrenamed AND off-year gets the full context
@@ -337,6 +347,10 @@ def _print_failed_deid_headers(audit: dict, subject_dir: Path, out=None) -> None
         return
     print(f"\n[!] Dumping headers for {len(flagged)} flagged file(s) "
           "(no re-clean attempted):", file=out)
+    if not redact_phi:
+        print("    NOTE: PHI-carrying header fields shown UNREDACTED so a "
+              "failed cleaning is diagnosable. Pass --redact-header-dump "
+              "before sharing this output.", file=out)
     for name in sorted(flagged):
         # Absolute path so an operator running the audit from an arbitrary
         # cwd (or copy-pasting from a scrollback) can act on the output
@@ -350,7 +364,7 @@ def _print_failed_deid_headers(audit: dict, subject_dir: Path, out=None) -> None
             print(f"    (file not present at {path}; skipping)", file=out)
             continue
         try:
-            print_header(str(path), redact_phi=True, out=out)
+            print_header(str(path), redact_phi=redact_phi, out=out)
         except Exception as e:
             print(f"    ERROR while reading header: {e}", file=out)
 
@@ -521,7 +535,8 @@ def _run_one_subject(subject_dir: Path, args,
     # Read-only header dump for every file the pipeline failed on.
     # NEVER attempts to re-run the cleaner — the operator inspects
     # the header and decides what to do (repair, exclude, escalate).
-    _print_failed_deid_headers(audit, subject_dir)
+    _print_failed_deid_headers(audit, subject_dir,
+                               redact_phi=args.redact_header_dump)
     if args.print_annot:
         _print_annotations(subject_dir,
                            sample_n=args.print_annot_sample_n,
@@ -606,6 +621,15 @@ def _build_parser() -> argparse.ArgumentParser:
                         "every annotation verbatim.")
     p.add_argument("--print-edf-header", action="store_true")
     p.add_argument("--print-edf-signal-header", action="store_true")
+    p.add_argument("--redact-header-dump", "--redact_header_dump",
+                   dest="redact_header_dump", action="store_true",
+                   help="Mask patient_id / recording_id / startdate / "
+                        "starttime in the failed-file header dump. Default "
+                        "OFF because the dump is diagnostic — masking hides "
+                        "the exact evidence of what went wrong. Enable this "
+                        "flag ONLY when the audit output will be shared "
+                        "with someone who shouldn't see raw PHI in the case "
+                        "that cleaning failed.")
     p.add_argument("--n-channel-plot", type=int, default=5,
                    help="Channels per EEG snippet plot in the notebook.")
     p.add_argument("--n-files-plot", type=int, default=4,
