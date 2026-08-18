@@ -912,6 +912,39 @@ def test_log_failed_deid_captures_error_message(tmp_path):
     assert "raise OSError" not in entry["error_message"]
 
 
+def test_log_failed_deid_matches_when_concatenated_to_tqdm_progress(tmp_path):
+    """Regression: on some terminals / tee configurations, the pipeline's
+    tqdm progress bar writes its update without a trailing newline
+    (\\r-based overwrite), and the very next print() from the pipeline
+    lands ON THE SAME LINE. Real captured example from a user report:
+
+        Loading EDF meta-data...:  13%|xxxx| 6/47 [00:06<...]ERROR: Failed to load EDF file DA1564PX.edf:
+
+    A ^ERROR: anchor would miss this. The parser must search
+    ANYWHERE in the line.
+    """
+    log = tmp_path / "log.out"
+    log.write_text(
+        "Loading EDF meta-data...:   0%|                     | 0/47 [00:00<?, ?it/s]\n"
+        "Loading EDF meta-data...:  13%|xxxxx        | 6/47 [00:06<00:40,  1.02it/s]"
+        "ERROR: Failed to load EDF file DA1564PX.edf:\n"
+        "\n"
+        "OSError: the file is not EDF(+) or BDF(+) compliant "
+        "(it contains format errors)\n"
+        "\n"
+        "Stack trace (for the data team):\n"
+        "Traceback ...\n"
+    )
+    result = check_log_file(log)
+    assert result["n_failed_deid_files"] == 1, (
+        f"expected 1 failed_deid_file, got errors={result['errors']!r}, "
+        f"failed_deid_files={result['failed_deid_files']!r}"
+    )
+    entry = result["failed_deid_files"][0]
+    assert entry["filename"] == "DA1564PX.edf"
+    assert "not EDF" in entry["error_message"]
+
+
 def test_log_failed_deid_survives_tqdm_carriage_returns(tmp_path):
     """Regression: tqdm writes progress-bar updates with \r-terminated
     lines when stderr isn't a TTY (headless / SSH), and the pipeline's

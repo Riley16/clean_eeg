@@ -23,8 +23,18 @@ from pathlib import Path
 
 LOG_FILENAME = "log.out"
 
-_WARNING_RE = re.compile(r"^WARNING:", re.IGNORECASE)
-_ERROR_RE = re.compile(r"^ERROR:", re.IGNORECASE)
+# Patterns match ANYWHERE in the line (not just at the start). Rationale:
+# under headless / non-TTY runs, tqdm writes its progress-bar updates
+# with \r-terminated overwrites onto stderr; the pipeline tees stdout +
+# stderr into the same log.out. In practice we've seen the pipeline's
+# ERROR / WARNING print get concatenated onto the tail of the most
+# recent tqdm progress line -- so a strict ^ERROR: anchor misses these
+# lines. Word-boundary + substring match on ERROR:/WARNING: still
+# rejects prose that merely mentions the word "error" ("ERROR:"
+# specifically is a stable marker the pipeline uses only for real log
+# records).
+_WARNING_RE = re.compile(r"\bWARNING:", re.IGNORECASE)
+_ERROR_RE = re.compile(r"\bERROR:", re.IGNORECASE)
 # The pipeline emits (from [clean_subject_eeg.py:181]):
 #   Subject protected health information detected in EDF <field>;
 #   redacted value: "<value>". Alert the data analysis team.
@@ -40,8 +50,10 @@ _REDACTION_RE = re.compile(
 # The <name> is what the file was called BEFORE any pipeline rename,
 # so it's the original untimestamped filename (which is also what
 # ends up sitting in the transferred output dir as a not-cleaned file).
+# Same reasoning as _ERROR_RE above -- no ^ anchor, use \b so tqdm
+# progress-bar smashed into the ERROR line doesn't hide the match.
 _FAILED_DEID_RE = re.compile(
-    r"^ERROR:\s+Failed to (?:load|de-identify) EDF file\s+([^\s:]+)",
+    r"\bERROR:\s+Failed to (?:load|de-identify) EDF file\s+([^\s:]+)",
     re.IGNORECASE,
 )
 
@@ -70,7 +82,10 @@ def _extract_error_message_after(lines: list[str], start_idx: int) -> str:
         if s.startswith("Stack trace") or s.startswith("Skipping this file") \
                 or s.startswith("Partially-processed"):
             break
-        if _ERROR_RE.match(s) or _WARNING_RE.match(s):
+        # search() (not match()) so an ERROR/WARNING concatenated onto
+        # the tail of a tqdm progress line still counts as "the next
+        # log record" and terminates the extraction cleanly.
+        if _ERROR_RE.search(s) or _WARNING_RE.search(s):
             break
         if s.strip():
             msg_parts.append(s.strip())
@@ -120,11 +135,15 @@ def check_log_file(log_path: str | Path | None) -> dict:
     all_lines = text.split("\n")
     for i, line in enumerate(all_lines, start=1):
         stripped = line.rstrip("\n")
-        if _WARNING_RE.match(stripped):
+        # search() everywhere, not match() -- tqdm progress bars can
+        # concatenate onto the tail of the ERROR/WARNING line before a
+        # newline lands, so anchoring at position 0 would miss the log
+        # records the pipeline actually emitted.
+        if _WARNING_RE.search(stripped):
             warnings.append({"line_number": i, "text": stripped})
-        if _ERROR_RE.match(stripped):
+        if _ERROR_RE.search(stripped):
             errors.append({"line_number": i, "text": stripped})
-        m_fail = _FAILED_DEID_RE.match(stripped)
+        m_fail = _FAILED_DEID_RE.search(stripped)
         if m_fail:
             failed_deid.append({
                 "line_number": i,
