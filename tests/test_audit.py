@@ -881,6 +881,24 @@ def test_log_pass_when_no_failed_deid_lines(tmp_path):
     assert result["failed_deid_files"] == []
 
 
+def test_log_failed_deid_survives_tqdm_carriage_returns(tmp_path):
+    """Regression: tqdm writes progress-bar updates with \r-terminated
+    lines when stderr isn't a TTY (headless / SSH), and the pipeline's
+    tee captures them all into log.out. A naive readline() would see
+    'Loading files...\\rERROR: Failed to load X:' as ONE line and the
+    ^ERROR: anchor would fail. The parser must split on \\r too.
+    """
+    log = tmp_path / "log.out"
+    log.write_bytes(
+        b"Loading files...\r50%|xxxxx     |\r"
+        b"ERROR: Failed to load EDF file NA3621K6.edf: OSError: cannot open\n"
+        b"Done.\n"
+    )
+    result = check_log_file(log)
+    assert result["n_failed_deid_files"] == 1
+    assert result["failed_deid_files"][0]["filename"] == "NA3621K6.edf"
+
+
 def test_log_warn_on_redactions(tmp_path):
     log = tmp_path / "log.out"
     log.write_text(

@@ -289,33 +289,63 @@ def _print_critical_banner(audit: dict, *, label: str, out=None) -> None:
     print(bar + "\n", file=out)
 
 
-def _print_failed_deid_headers(audit: dict, subject_dir: Path, out=None) -> None:
-    """When the pipeline log reports files it failed to de-identify,
-    dump each of those files' EDF headers via the byte-level parser
-    (works even when pyedflib refuses to open the file). Read-only —
-    NEVER attempts to re-clean.
+def _collect_flagged_filenames(audit: dict) -> dict[str, list[str]]:
+    """Return ``{filename: [reason, ...]}`` for every file the audit
+    flagged as critical (pipeline-failed, unrenamed, or off-year
+    recording_id). The same file can be flagged by multiple categories
+    — reasons are accumulated so the header dump can show all of them.
+    """
+    checks = audit.get("checks", {})
+    flagged: dict[str, list[str]] = {}
 
-    Skips silently when there are no failed files. Filenames come from
-    the log-parsed ``ERROR: Failed to (load|de-identify) EDF file <name>``
-    lines and are resolved as ``subject_dir/<name>``. Files that no
-    longer exist on disk at that path are annotated and skipped (the
-    header dump is best-effort, not fatal).
+    for f in checks.get("log_file", {}).get("failed_deid_files") or []:
+        flagged.setdefault(f["filename"], []).append(
+            "log.out reports pipeline failed to load/de-identify")
+
+    for name in checks.get("filename_convention", {}).get("unrenamed_files") or []:
+        flagged.setdefault(name, []).append(
+            "filename lacks pipeline's rename suffix")
+
+    residue = checks.get("header_phi_residue", {})
+    year_range = residue.get("expected_year_range") or []
+    if year_range:
+        for name, yr in (residue.get("recording_id_years_by_file") or {}).items():
+            if yr is not None and not (year_range[0] <= yr <= year_range[1]):
+                flagged.setdefault(name, []).append(
+                    f"recording_id year {yr} outside expected "
+                    f"[{year_range[0]}, {year_range[1]}]")
+    return flagged
+
+
+def _print_failed_deid_headers(audit: dict, subject_dir: Path, out=None) -> None:
+    """Dump the EDF header for every file the audit's critical-findings
+    banner flagged — pipeline-failed (from ``log_file``), unrenamed
+    (from ``filename_convention``), and off-year recording_id (from
+    ``header_phi_residue``). Read via the byte-level parser so files
+    pyedflib refuses to open still yield a header. Read-only — NEVER
+    attempts to re-clean.
+
+    Reasons accumulate per file so an operator seeing e.g. the same
+    file flagged as BOTH unrenamed AND off-year gets the full context
+    in one dump section instead of two disjoint sections.
     """
     from clean_eeg.print_edf_header import print_header
 
     out = out or sys.stdout
-    failed = audit.get("checks", {}).get("log_file", {}).get("failed_deid_files") or []
-    if not failed:
+    flagged = _collect_flagged_filenames(audit)
+    if not flagged:
         return
-    names = sorted({f["filename"] for f in failed})
-    print(f"\n[!] Dumping headers for {len(names)} file(s) the pipeline "
-          "failed to de-identify (no re-clean attempted):", file=out)
-    for name in names:
+    print(f"\n[!] Dumping headers for {len(flagged)} flagged file(s) "
+          "(no re-clean attempted):", file=out)
+    for name in sorted(flagged):
         # Absolute path so an operator running the audit from an arbitrary
         # cwd (or copy-pasting from a scrollback) can act on the output
         # without having to reconstruct the parent directory.
         path = (subject_dir / name).resolve()
+        reasons = flagged[name]
         print(f"\n--- header dump: {path} ---", file=out)
+        for r in reasons:
+            print(f"    reason: {r}", file=out)
         if not path.exists():
             print(f"    (file not present at {path}; skipping)", file=out)
             continue

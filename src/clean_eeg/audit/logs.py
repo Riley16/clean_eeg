@@ -77,27 +77,35 @@ def check_log_file(log_path: str | Path | None) -> dict:
     errors: list[dict] = []
     redactions: list[dict] = []
     failed_deid: list[dict] = []
-    with open(log_path, encoding="utf-8", errors="replace") as f:
-        for i, line in enumerate(f, start=1):
-            stripped = line.rstrip("\n")
-            if _WARNING_RE.match(stripped):
-                warnings.append({"line_number": i, "text": stripped})
-            if _ERROR_RE.match(stripped):
-                errors.append({"line_number": i, "text": stripped})
-            m_fail = _FAILED_DEID_RE.match(stripped)
-            if m_fail:
-                failed_deid.append({
-                    "line_number": i,
-                    "filename": m_fail.group(1),
-                    "text": stripped,
-                })
-            m = _REDACTION_RE.search(stripped)
-            if m:
-                redactions.append({
-                    "line_number": i,
-                    "field": m.group(1),
-                    "redacted_value": m.group(2),
-                })
+    # Read the whole file and normalize CR into LF before line-splitting.
+    # tqdm writes progress bars with \r-terminated updates when its
+    # stream isn't a TTY, so a naive readline() would see something like
+    # "Loading files...\rERROR: Failed to load X:" as ONE line and the
+    # ^ERROR: anchor would fail to match. Splitting on \r|\n\r|\n keeps
+    # the ERROR line separate regardless of how the pipeline's tee
+    # captured stderr.
+    text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    for i, line in enumerate(text.split("\n"), start=1):
+        stripped = line.rstrip("\n")
+        if _WARNING_RE.match(stripped):
+            warnings.append({"line_number": i, "text": stripped})
+        if _ERROR_RE.match(stripped):
+            errors.append({"line_number": i, "text": stripped})
+        m_fail = _FAILED_DEID_RE.match(stripped)
+        if m_fail:
+            failed_deid.append({
+                "line_number": i,
+                "filename": m_fail.group(1),
+                "text": stripped,
+            })
+        m = _REDACTION_RE.search(stripped)
+        if m:
+            redactions.append({
+                "line_number": i,
+                "field": m.group(1),
+                "redacted_value": m.group(2),
+            })
 
     issues: list[str] = []
     if errors or failed_deid:
