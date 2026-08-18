@@ -7,6 +7,7 @@ from pathlib import Path
 from clean_eeg.audit.checks import (
     check_annotation_pairing,
     check_byte_geometry,
+    check_filename_convention,
     check_header_phi_residue,
     check_recording_gaps,
     check_signal_header_uniformity,
@@ -284,6 +285,39 @@ def test_fail_empty_input():
     assert any("No EDF files" in msg for msg in result["issues"])
 
 
+# --- filename convention ----------------------------------------------------
+
+
+def test_filename_convention_pass_pipeline_output(tmp_path):
+    # The pipeline renames to {stem}_{subject_code}_{MM.DD__HH.MM.SS}.edf
+    for name in (
+        "NA3621LS_R1747A_01.14__14.32.22.edf",
+        "NA3621LT_R1747A_01.14__15.22.10.edf",
+        "NA3621LS_R1747A_01.14__14.32.22_annotations.edf",  # stub sidecar
+    ):
+        _write_edf_stub(tmp_path / name)
+    result = check_filename_convention(sorted(tmp_path.glob("*.edf")))
+    assert result["status"] == "pass"
+    assert result["unrenamed_files"] == []
+
+
+def test_filename_convention_fail_missing_timestamp_suffix(tmp_path):
+    # The problematic file from the user report: original name kept,
+    # no _R1XXXY_MM.DD__HH.MM.SS suffix. Sibling that WAS renamed
+    # should still be recognized as OK.
+    _write_edf_stub(tmp_path / "NA3621LS_R1747A_01.14__14.32.22.edf")
+    _write_edf_stub(tmp_path / "NA3621K6.edf")  # bypassed the pipeline
+    result = check_filename_convention(sorted(tmp_path.glob("*.edf")))
+    assert result["status"] == "fail"
+    assert result["unrenamed_files"] == ["NA3621K6.edf"]
+    assert any("bypassed" in msg and "NA3621K6.edf" in msg for msg in result["issues"])
+
+
+def test_filename_convention_fail_empty_input():
+    result = check_filename_convention([])
+    assert result["status"] == "fail"
+
+
 # --- header PHI-residue -----------------------------------------------------
 
 
@@ -367,6 +401,48 @@ def test_residue_permits_recording_span_up_to_max_years(tmp_path):
 
     assert result["status"] == "pass"
     assert result["expected_year_range"] == [1985, 1987]
+
+
+def test_residue_pass_recording_id_in_expected_year_range(tmp_path):
+    _write_edf_stub(tmp_path / "a.edf", startdate="01.01.85",
+                    recording_id="Startdate 01-JAN-1985 X X NKC-EEG-1200A_V01.00")
+    result = check_header_phi_residue([tmp_path / "a.edf"])
+    assert result["status"] == "pass"
+    assert result["recording_id_years_by_file"]["a.edf"] == 1985
+
+
+def test_residue_fail_real_year_in_recording_id_bypasses_header_shift(tmp_path):
+    """The collaborator-cleaned file the user reported: patient_id was
+    scrubbed to sentinels but the recording_id still embeds the real
+    recording year. Distinct from the startdate check because a file
+    could have startdate shifted but recording_id still carry the
+    original year if the write path was patchwork.
+    """
+    _write_edf_stub(
+        tmp_path / "clean.edf",
+        startdate="01.01.85",
+        recording_id="Startdate 01-JAN-1985 X X NKC-EEG-1200A_V01.00",
+    )
+    _write_edf_stub(
+        tmp_path / "leaked.edf",
+        startdate="01.01.85",
+        recording_id="Startdate 13-JUN-2024 X X NKC-EEG-1200A_V01.00",
+    )
+    result = check_header_phi_residue(sorted(tmp_path.glob("*.edf")))
+    assert result["status"] == "fail"
+    assert result["recording_id_years_by_file"]["leaked.edf"] == 2024
+    assert any("recording_id embedded year 2024" in msg for msg in result["issues"])
+    assert any("bypassed" in msg for msg in result["issues"])
+
+
+def test_residue_recording_id_missing_startdate_prefix_is_None(tmp_path):
+    # Non-EDF+-standard recording_id without the "Startdate DD-MMM-YYYY"
+    # prefix should NOT be reported as year-off — we can't derive a year.
+    _write_edf_stub(tmp_path / "a.edf",
+                    recording_id="Free-form recording metadata")
+    result = check_header_phi_residue([tmp_path / "a.edf"])
+    assert result["recording_id_years_by_file"]["a.edf"] is None
+    assert not any("recording_id embedded year" in msg for msg in result["issues"])
 
 
 # --- recording gaps ---------------------------------------------------------
@@ -770,7 +846,39 @@ def test_log_fail_on_errors(tmp_path):
     result = check_log_file(log)
     assert result["status"] == "fail"
     assert result["n_errors"] == 1
-    assert any("1 ERROR" in msg for msg in result["issues"])
+    assert any("additional ERROR" in msg for msg in result["issues"])
+
+
+def test_log_fail_when_pipeline_skipped_file_via_load_error(tmp_path):
+    """Positive: 'ERROR: Failed to load EDF file NA3621K6.edf: ...'
+    gets parsed into ``failed_deid_files`` with the bare filename.
+    """
+    log = tmp_path / "log.out"
+    log.write_text(
+        "Loading files...\n"
+        "ERROR: Failed to load EDF file NA3621K6.edf: OSError: ...\n"
+        "ERROR: Failed to de-identify EDF file NB0102XX.edf: KeyError('startdate')\n"
+        "Done.\n"
+    )
+    result = check_log_file(log)
+    assert result["status"] == "fail"
+    assert result["n_failed_deid_files"] == 2
+    names = [f["filename"] for f in result["failed_deid_files"]]
+    assert names == ["NA3621K6.edf", "NB0102XX.edf"]
+    assert any("failed pipeline de-identification" in msg
+               and "NA3621K6.edf" in msg
+               for msg in result["issues"])
+
+
+def test_log_pass_when_no_failed_deid_lines(tmp_path):
+    """Negative: a log with no 'Failed to load/de-identify EDF file'
+    lines should NOT populate failed_deid_files.
+    """
+    log = tmp_path / "log.out"
+    log.write_text("Loading files ...\nDone.\n")
+    result = check_log_file(log)
+    assert result["n_failed_deid_files"] == 0
+    assert result["failed_deid_files"] == []
 
 
 def test_log_warn_on_redactions(tmp_path):
@@ -1054,19 +1162,27 @@ def _build_clean_subject(tmp_path: Path,
     subject_dir.mkdir()
     pid = f"{subject_code} X 01-JAN-1900 unknown unknown"
 
-    for i, (name, starttime) in enumerate([("a", "00.00.00"), ("b", "00.01.00")]):
+    # Filenames must match the pipeline's rename convention
+    # ({stem}_{subject_code}_{MM.DD__HH.MM.SS}.edf) so the new
+    # check_filename_convention pass on this "clean" fixture.
+    for i, (name_stem, starttime, stamp) in enumerate([
+        ("a", "00.00.00", "01.01__00.00.00"),
+        ("b", "00.01.00", "01.01__00.01.00"),
+    ]):
+        clean_name = f"{name_stem}_{subject_code}_{stamp}.edf"
         sig = (np.sin(np.linspace(0, 20, 6000)) * 1000).astype("<i2")
-        _write_edf_with_signals(subject_dir / f"{name}.edf",
+        _write_edf_with_signals(subject_dir / clean_name,
                                 n_records=60, samples_per_record=100,
                                 starttime=starttime,
                                 channel_samples=[sig])
         # Rewrite patient_id to include the subject code (helper defaults
         # to R1755J so this is just belt-and-braces for varied fixtures).
-        _patch_patient_id(subject_dir / f"{name}.edf", pid)
+        _patch_patient_id(subject_dir / clean_name, pid)
 
-        _write_edf_with_annotations(subject_dir / f"{name}_annotations.edf",
+        stub_name = f"{name_stem}_{subject_code}_{stamp}_annotations.edf"
+        _write_edf_with_annotations(subject_dir / stub_name,
                                     annotations or [(0.5, None, "seizure")])
-        _patch_patient_id(subject_dir / f"{name}_annotations.edf", pid)
+        _patch_patient_id(subject_dir / stub_name, pid)
 
     (subject_dir / "log.out").write_text(
         "=== clean_eeg log started 2026-07-22 ===\n"
@@ -1089,9 +1205,10 @@ def test_e2e_audit_pass_on_clean_subject(tmp_path):
     assert audit["subject_code"] == "R1755J"
     assert audit["mode"] == "full"
     expected_checks = {
-        "subject_code_consistency", "header_phi_residue", "recording_gaps",
-        "byte_geometry", "annotation_pairing", "signal_header_uniformity",
-        "annotation_phi_scan", "transfer_integrity", "log_file",
+        "subject_code_consistency", "filename_convention", "header_phi_residue",
+        "recording_gaps", "byte_geometry", "annotation_pairing",
+        "signal_header_uniformity", "annotation_phi_scan",
+        "transfer_integrity", "log_file",
     }
     assert set(audit["checks"]) == expected_checks
     # log has no WARNING/ERROR/redactions → pass; everything else pass.
@@ -1144,7 +1261,8 @@ def test_e2e_audit_detects_bit_rot_on_second_run(tmp_path):
     audit_subject(subject_dir, name_dictionary={"nonexistent"})
 
     # Modify a file post-audit — the always-on hash check must catch it.
-    with open(subject_dir / "a.edf", "r+b") as f:
+    target = next(subject_dir.glob("a_*.edf"))
+    with open(target, "r+b") as f:
         f.seek(255)
         f.write(b"\xff")
 

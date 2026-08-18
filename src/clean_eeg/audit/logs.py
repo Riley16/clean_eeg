@@ -32,6 +32,18 @@ _REDACTION_RE = re.compile(
     r'Subject protected health information detected in EDF (\S+); '
     r'redacted value: "(.+)"\.'
 )
+# The pipeline emits either of these when a file fails de-id and is
+# skipped from the run (from [clean_subject_eeg.py] _load_edf_metadata
+# and the per-file cleaning try/except):
+#   ERROR: Failed to load EDF file <name>: <exception>
+#   ERROR: Failed to de-identify EDF file <name>: <exception>
+# The <name> is what the file was called BEFORE any pipeline rename,
+# so it's the original untimestamped filename (which is also what
+# ends up sitting in the transferred output dir as a not-cleaned file).
+_FAILED_DEID_RE = re.compile(
+    r"^ERROR:\s+Failed to (?:load|de-identify) EDF file\s+([^\s:]+)",
+    re.IGNORECASE,
+)
 
 
 def check_log_file(log_path: str | Path | None) -> dict:
@@ -54,7 +66,9 @@ def check_log_file(log_path: str | Path | None) -> dict:
             "log_path": str(log_path) if log_path is not None else None,
             "log_present": False,
             "n_warnings": 0, "n_errors": 0, "n_redactions": 0,
+            "n_failed_deid_files": 0,
             "warnings": [], "errors": [], "redactions": [],
+            "failed_deid_files": [],
             "issues": [f"No pipeline '{LOG_FILENAME}' present — "
                        "provenance/warnings from cleaning are unavailable"],
         }
@@ -62,6 +76,7 @@ def check_log_file(log_path: str | Path | None) -> dict:
     warnings: list[dict] = []
     errors: list[dict] = []
     redactions: list[dict] = []
+    failed_deid: list[dict] = []
     with open(log_path, encoding="utf-8", errors="replace") as f:
         for i, line in enumerate(f, start=1):
             stripped = line.rstrip("\n")
@@ -69,6 +84,13 @@ def check_log_file(log_path: str | Path | None) -> dict:
                 warnings.append({"line_number": i, "text": stripped})
             if _ERROR_RE.match(stripped):
                 errors.append({"line_number": i, "text": stripped})
+            m_fail = _FAILED_DEID_RE.match(stripped)
+            if m_fail:
+                failed_deid.append({
+                    "line_number": i,
+                    "filename": m_fail.group(1),
+                    "text": stripped,
+                })
             m = _REDACTION_RE.search(stripped)
             if m:
                 redactions.append({
@@ -78,9 +100,20 @@ def check_log_file(log_path: str | Path | None) -> dict:
                 })
 
     issues: list[str] = []
-    if errors:
+    if errors or failed_deid:
         status = "fail"
-        issues.append(f"{len(errors)} ERROR line(s) in pipeline log")
+        if failed_deid:
+            names = sorted({f["filename"] for f in failed_deid})
+            issues.append(
+                f"{len(failed_deid)} file(s) failed pipeline de-identification "
+                f"and were SKIPPED from the run: {names}"
+            )
+        # If there are additional ERROR lines beyond the failed-deid
+        # summary, surface a count too (some ERRORs are unrelated to
+        # per-file failure and worth flagging separately).
+        other_errors = len(errors) - len(failed_deid)
+        if other_errors > 0:
+            issues.append(f"{other_errors} additional ERROR line(s) in pipeline log")
     elif warnings or redactions:
         status = "warn"
         if warnings:
@@ -101,8 +134,10 @@ def check_log_file(log_path: str | Path | None) -> dict:
         "n_warnings": len(warnings),
         "n_errors": len(errors),
         "n_redactions": len(redactions),
+        "n_failed_deid_files": len(failed_deid),
         "warnings": warnings,
         "errors": errors,
         "redactions": redactions,
+        "failed_deid_files": failed_deid,
         "issues": issues,
     }

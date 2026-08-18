@@ -29,20 +29,28 @@ class PipelineLogger:
     def add_phi(self, text: str):
         """Register a string as PHI to be scrubbed from all log output.
 
-        Patterns with fewer than 3 alphabetic characters are ignored — a
-        single-letter middle initial like ``"L"`` would otherwise replace
-        every ``L`` in the log (in ``Loading``, ``Volumes``, ``False``, ...).
-        Initials are still redacted in context by the title-and-initials
-        regex via the end-of-run ``redact_log_file`` Presidio pass.
+        The pattern is anchored with ``\\b`` boundaries so ``"Mark"``
+        does not match inside ``"Marks"`` or ``"Markup"``. A trailing
+        period is stripped so ``"L."`` and ``"L"`` produce the same
+        pattern (the operator often passes middle initials either way).
 
-        The pattern is anchored with ``\\b`` boundaries so ``"Mark"`` does
-        not match inside ``"Marks"`` or ``"Markup"``.
+        Case-sensitivity depends on the number of alphabetic characters:
+          - 3+ chars → case-INSENSITIVE (typical name matching).
+          - 1-2 chars (single/double-letter initials) → case-SENSITIVE.
+            A middle initial ``"L"`` scrubs ``"L Smith"`` and
+            ``"Dr. L."`` but not every ``L`` in ``"Loading"``,
+            ``"Volumes"``, ``"False"`` (Loading's L is followed by a
+            word char, so ``\\b`` already excludes it) — and case
+            sensitivity ensures we also don't scrub every lowercase
+            ``l`` in ordinary English text.
         """
-        text = text.strip()
-        if sum(c.isalpha() for c in text) < 3:
+        text = text.strip().rstrip(".")
+        n_alpha = sum(c.isalpha() for c in text)
+        if n_alpha == 0:
             return
+        flags = 0 if n_alpha < 3 else re.IGNORECASE
         self._phi_patterns.append(
-            re.compile(r"\b" + re.escape(text) + r"\b", re.IGNORECASE)
+            re.compile(r"\b" + re.escape(text) + r"\b", flags)
         )
 
     def scrub(self, text: str) -> str:

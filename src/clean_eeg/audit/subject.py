@@ -26,6 +26,7 @@ from clean_eeg.audit.annotations import check_annotation_phi_scan
 from clean_eeg.audit.checks import (
     check_annotation_pairing,
     check_byte_geometry,
+    check_filename_convention,
     check_header_phi_residue,
     check_recording_gaps,
     check_signal_header_uniformity,
@@ -279,6 +280,8 @@ def audit_subject(subject_dir: str | Path,
     else:
         _run_check(checks, timings, "subject_code_consistency",
                    lambda: check_subject_code_consistency(edf_files), progress)
+        _run_check(checks, timings, "filename_convention",
+                   lambda: check_filename_convention(edf_files), progress)
         _run_check(checks, timings, "header_phi_residue",
                    lambda: check_header_phi_residue(edf_files), progress)
         _run_check(checks, timings, "recording_gaps",

@@ -72,6 +72,70 @@ def test_phi_scrub_case_insensitive(tmp_path):
     assert content.count("[PHI_REDACTED]") == 3
 
 
+def test_middle_initial_single_letter_scrubbed_case_sensitive(tmp_path):
+    """Regression: a single-letter middle initial should scrub standalone
+    uppercase occurrences (as in a name context) without exploding into
+    every 'L' inside 'Loading', 'False', etc.
+    """
+    log_path = str(tmp_path / "log.out")
+    logger = PipelineLogger(log_path)
+    logger.add_phi("L")
+    try:
+        print("Dr. L. Smith arrived")
+        print("Loading files and Volumes into cache; False alarms")
+    finally:
+        logger.close()
+
+    content = open(log_path).read()
+    # Positive: standalone 'L' in name context is redacted.
+    assert "Dr. L. Smith" not in content
+    assert "[PHI_REDACTED]" in content
+    # Negative: interior 'L' inside common English words is preserved
+    # because \b keeps it out AND we're case-sensitive so lowercase
+    # 'l' inside 'Loading' etc. is safe too.
+    assert "Loading" in content
+    assert "Volumes" in content
+    assert "False" in content
+
+
+def test_middle_initial_lowercase_l_preserved(tmp_path):
+    """Case-sensitive matching: a lowercase standalone 'l' is NOT
+    scrubbed when the PHI pattern is 'L' (initials are conventionally
+    written uppercase; a lowercase 'l' in prose is almost never PHI).
+    """
+    log_path = str(tmp_path / "log.out")
+    logger = PipelineLogger(log_path)
+    logger.add_phi("L")
+    try:
+        print("some rare lowercase l here")
+    finally:
+        logger.close()
+
+    content = open(log_path).read()
+    assert "some rare lowercase l here" in content
+    assert "[PHI_REDACTED]" not in content
+
+
+def test_middle_initial_with_trailing_period_normalized(tmp_path):
+    """``add_phi('L.')`` should be equivalent to ``add_phi('L')`` — the
+    trailing period gets stripped so the pattern still matches ``L``
+    at word boundaries.
+    """
+    log_path = str(tmp_path / "log.out")
+    logger = PipelineLogger(log_path)
+    logger.add_phi("L.")
+    try:
+        print("Dr. L. Smith and L there")
+    finally:
+        logger.close()
+
+    content = open(log_path).read()
+    assert "L. Smith" not in content or "[PHI_REDACTED]" in content
+    # Both 'L.' and standalone 'L' should be scrubbed.
+    # 'Dr.' should survive.
+    assert "Dr." in content
+
+
 def test_rescrub_retroactive(tmp_path):
     """rescrub() should scrub PHI from log entries written before the pattern was registered."""
     log_path = str(tmp_path / "log.out")

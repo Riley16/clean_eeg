@@ -210,6 +210,108 @@ def _print_unique_signal_headers(audit: dict, out=None) -> None:
             print(f"      {ch}", file=out)
 
 
+def _critical_finding_lines(audit: dict) -> list[str]:
+    """Collect the load-bearing "you must look at this" findings that
+    demand the banner at the very top and bottom of the audit output.
+    Each returned string is one line inside the banner box.
+
+    Critical categories:
+      - Files the pipeline explicitly failed to de-identify and skipped
+        (from ``log_file.failed_deid_files``).
+      - Files sitting in the transferred subject dir that don't match
+        the pipeline's timestamped rename pattern (from
+        ``filename_convention.unrenamed_files``).
+      - Files with a recording_id / startdate year outside the
+        expected de-identified range (from
+        ``header_phi_residue.recording_id_years_by_file`` +
+        ``startdates_by_file``) — signals the file bypassed the
+        header-shift step.
+    """
+    checks = audit.get("checks", {})
+    lines: list[str] = []
+    log = checks.get("log_file", {})
+    failed = log.get("failed_deid_files") or []
+    if failed:
+        names = sorted({f["filename"] for f in failed})
+        lines.append(f"{len(failed)} FILE(S) PIPELINE FAILED TO DE-IDENTIFY (SKIPPED):")
+        for name in names:
+            lines.append(f"  - {name}")
+
+    fname_check = checks.get("filename_convention", {})
+    unrenamed = fname_check.get("unrenamed_files") or []
+    if unrenamed:
+        lines.append(
+            f"{len(unrenamed)} FILE(S) DO NOT MATCH PIPELINE RENAME PATTERN "
+            "(BYPASSED CLEANING):")
+        for name in unrenamed:
+            lines.append(f"  - {name}")
+
+    residue = checks.get("header_phi_residue", {})
+    year_range = residue.get("expected_year_range") or []
+    if year_range:
+        rid_years = residue.get("recording_id_years_by_file", {}) or {}
+        off_recid = {name: yr for name, yr in rid_years.items()
+                     if yr is not None and not (year_range[0] <= yr <= year_range[1])}
+        if off_recid:
+            lines.append(
+                f"{len(off_recid)} FILE(S) HAVE REAL RECORDING YEAR IN "
+                "recording_id (HEADER-SHIFT BYPASSED):")
+            for name, yr in sorted(off_recid.items()):
+                lines.append(f"  - {name}: year {yr}")
+    return lines
+
+
+def _print_critical_banner(audit: dict, *, label: str, out=None) -> None:
+    """Emit a big UPPERCASE banner listing critical findings, or nothing
+    if there are none. ``label`` distinguishes TOP vs BOTTOM placement."""
+    out = out or sys.stdout
+    lines = _critical_finding_lines(audit)
+    if not lines:
+        return
+    width = max(70, max(len(ln) for ln in lines) + 4)
+    bar = "!" * width
+    print(f"\n{bar}", file=out)
+    header = f"!! CRITICAL AUDIT FINDINGS ({label}) — MANUAL REVIEW REQUIRED !!"
+    print(header.center(width, "!"), file=out)
+    print(bar, file=out)
+    for ln in lines:
+        print(f"!! {ln}", file=out)
+    print(bar + "\n", file=out)
+
+
+def _print_failed_deid_headers(audit: dict, subject_dir: Path, out=None) -> None:
+    """When the pipeline log reports files it failed to de-identify,
+    dump each of those files' EDF headers via the byte-level parser
+    (works even when pyedflib refuses to open the file). Read-only —
+    NEVER attempts to re-clean.
+
+    Skips silently when there are no failed files. Filenames come from
+    the log-parsed ``ERROR: Failed to (load|de-identify) EDF file <name>``
+    lines and are resolved as ``subject_dir/<name>``. Files that no
+    longer exist on disk at that path are annotated and skipped (the
+    header dump is best-effort, not fatal).
+    """
+    from clean_eeg.print_edf_header import print_header
+
+    out = out or sys.stdout
+    failed = audit.get("checks", {}).get("log_file", {}).get("failed_deid_files") or []
+    if not failed:
+        return
+    names = sorted({f["filename"] for f in failed})
+    print(f"\n[!] Dumping headers for {len(names)} file(s) the pipeline "
+          "failed to de-identify (no re-clean attempted):", file=out)
+    for name in names:
+        path = subject_dir / name
+        print(f"\n--- header dump: {name} ---", file=out)
+        if not path.exists():
+            print(f"    (file not present at {path}; skipping)", file=out)
+            continue
+        try:
+            print_header(str(path), redact_phi=True, out=out)
+        except Exception as e:
+            print(f"    ERROR while reading header: {e}", file=out)
+
+
 def _always_print_warnings(audit: dict, out=None) -> None:
     """Always echo name-dictionary matches and any pipeline redactions
     into annotations, even under --quiet — these are the load-bearing
@@ -362,11 +464,21 @@ def _run_one_subject(subject_dir: Path, args,
         # 'wipe' — clear sentinel by re-running with force=True.
         audit = _do_audit(True)
 
+    # Critical-findings banner at the TOP of the audit output — before
+    # the summary — so an operator scrolling through many subjects can
+    # immediately spot the ones that need manual review. Same banner
+    # repeats at the BOTTOM (see below) so critical findings survive
+    # the tail-of-terminal view when the middle scrolls off.
+    _print_critical_banner(audit, label="TOP")
     if not args.quiet:
         _print_summary(audit,
                        print_subject_header=not printed_banner,
                        show_passes=args.verbose >= 1)
     _always_print_warnings(audit)  # never suppressed
+    # Read-only header dump for every file the pipeline failed on.
+    # NEVER attempts to re-run the cleaner — the operator inspects
+    # the header and decides what to do (repair, exclude, escalate).
+    _print_failed_deid_headers(audit, subject_dir)
     if args.print_annot:
         _print_annotations(subject_dir,
                            sample_n=args.print_annot_sample_n,
@@ -392,6 +504,11 @@ def _run_one_subject(subject_dir: Path, args,
     # a scannable summary, but the JSON has every per-file detail and
     # the HTML render carries plots + inline docstrings.
     _print_full_results_footer(out_dir, notebook_rendered=notebook_rendered)
+
+    # Same banner as at the top, repeated at the BOTTOM so critical
+    # findings can't be missed after the middle of the audit scrolls
+    # off in a long tail-of-terminal view.
+    _print_critical_banner(audit, label="BOTTOM")
 
     return audit
 

@@ -6,6 +6,7 @@ returned dicts into ``edf_audit.json``.
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Iterable
@@ -75,6 +76,24 @@ def _parse_edf_startdate(startdate_str: str) -> date | None:
         return None
 
 
+# Extracts the year from a "Startdate DD-MMM-YYYY ..." recording_id
+# prefix. pyedflib emits this uppercase-month DD-MMM-YYYY format when
+# it serializes an EDF+ recording_id header, and our pipeline shifts
+# the underlying datetime to 1985-baseline before that serialization —
+# so a mismatch here means the header write path did not run.
+_RECORDING_ID_STARTDATE_RE = re.compile(
+    r"^\s*Startdate\s+\d{1,2}-[A-Z]{3}-(\d{4})\b"
+)
+
+
+def _extract_recording_id_year(recording_id: str) -> int | None:
+    """Return the 4-digit year from ``Startdate DD-MMM-YYYY ...`` prefix
+    of an EDF+ recording_id, or ``None`` if the format doesn't match.
+    """
+    m = _RECORDING_ID_STARTDATE_RE.match(recording_id)
+    return int(m.group(1)) if m else None
+
+
 def check_header_phi_residue(edf_paths: Iterable[str | Path],
                              *,
                              max_span_years: int = 2) -> dict:
@@ -84,15 +103,23 @@ def check_header_phi_residue(edf_paths: Iterable[str | Path],
       - ``patient_id`` subfields after the subject code are all in
         ``PATIENT_ID_SENTINEL_TOKENS``. Any other token is flagged as
         potential residue (e.g., a leaked name or real birthdate).
-      - ``startdate`` parses and its year is in
+      - ``startdate`` (main header 8-byte field, ``DD.MM.YY``) parses
+        and its year is in
         ``[BASE_START_DATE.year, BASE_START_DATE.year + max_span_years]``.
         A pre-clean year (e.g., 2024) fails loudly.
-    Additionally verifies the earliest startdate across all files equals
-    ``BASE_START_DATE`` (pipeline invariant).
+      - ``recording_id`` embeds ``Startdate DD-MMM-YYYY``. Its year
+        must fall in the same range. This catches files that had
+        ``patient_id`` scrubbed but were never routed through the
+        pipeline's header-shift path (real recording year survives in
+        both ``startdate`` and ``recording_id`` verbatim).
+    Additionally verifies the earliest startdate across all files
+    equals ``BASE_START_DATE`` (pipeline invariant).
     """
     per_file: dict[str, dict] = {}
     unexpected_tokens_by_file: dict[str, list[str]] = {}
     startdates_by_file: dict[str, str] = {}
+    recording_ids_by_file: dict[str, str] = {}
+    recording_id_years_by_file: dict[str, int | None] = {}
     parsed_startdates: dict[str, date] = {}
 
     for p in edf_paths:
@@ -111,7 +138,13 @@ def check_header_phi_residue(edf_paths: Iterable[str | Path],
         if sd is not None:
             parsed_startdates[p.name] = sd
 
-        per_file[p.name] = {"patient_id": pid, "startdate": sd_raw}
+        rid_raw = header.get("recording_id", "")
+        rid_raw = rid_raw if isinstance(rid_raw, str) else str(rid_raw)
+        recording_ids_by_file[p.name] = rid_raw
+        recording_id_years_by_file[p.name] = _extract_recording_id_year(rid_raw)
+
+        per_file[p.name] = {"patient_id": pid, "startdate": sd_raw,
+                             "recording_id": rid_raw}
 
     issues: list[str] = []
     year_lo = BASE_START_DATE.year
@@ -121,6 +154,10 @@ def check_header_phi_residue(edf_paths: Iterable[str | Path],
     unparseable = [name for name in startdates_by_file
                    if name not in parsed_startdates]
     residue_files = {name: toks for name, toks in unexpected_tokens_by_file.items() if toks}
+    recording_id_year_off = {
+        name: yr for name, yr in recording_id_years_by_file.items()
+        if yr is not None and not (year_lo <= yr <= year_hi)
+    }
 
     if not per_file:
         status = "fail"
@@ -140,6 +177,14 @@ def check_header_phi_residue(edf_paths: Iterable[str | Path],
                     f"{name}: startdate year {sd.year} outside expected "
                     f"[{year_lo}, {year_hi}]"
                 )
+        if recording_id_year_off:
+            status = "fail"
+            for name, yr in recording_id_year_off.items():
+                issues.append(
+                    f"{name}: recording_id embedded year {yr} outside expected "
+                    f"[{year_lo}, {year_hi}] — file likely bypassed the "
+                    f"pipeline's header-shift step"
+                )
         if unparseable:
             status = "fail"
             for name in unparseable:
@@ -158,6 +203,8 @@ def check_header_phi_residue(edf_paths: Iterable[str | Path],
         "expected_year_range": [year_lo, year_hi],
         "earliest_startdate": earliest.isoformat() if earliest else None,
         "startdates_by_file": startdates_by_file,
+        "recording_ids_by_file": recording_ids_by_file,
+        "recording_id_years_by_file": recording_id_years_by_file,
         "patient_ids_by_file": {name: v["patient_id"] for name, v in per_file.items()},
         "unexpected_patient_id_tokens_by_file": {
             name: toks for name, toks in unexpected_tokens_by_file.items() if toks
@@ -631,6 +678,71 @@ def check_signal_header_uniformity(edf_paths: Iterable[str | Path],
         "field_variability": field_variability,
         "varying_fields": varying_fields,
         "ignore_annotation_channel": ignore_annotation_channel,
+        "issues": issues,
+    }
+
+
+# Matches the timestamped filename our pipeline emits after cleaning:
+#   {original_stem}_{subject_code}_{MM.DD__HH.MM.SS}.edf
+# The suffix constrains subject_code to SUBJECT_CODE_PATTERN and the
+# clock components to the pipeline's strftime output. Both the main
+# EDF and the annotation sidecar (``..._annotations.edf``) match this
+# pattern — the sidecar suffix comes after the base name is renamed.
+_CLEAN_FILENAME_SUFFIX_RE = re.compile(
+    r"_" + SUBJECT_CODE_PATTERN.strip("^$")  # embed R1XXXY inline
+    + r"_\d{2}\.\d{2}__\d{2}\.\d{2}\.\d{2}"
+    + r"(?:_annotations)?\.edf$",
+    re.IGNORECASE,
+)
+
+
+def check_filename_convention(edf_paths: Iterable[str | Path]) -> dict:
+    """Verify every EDF filename matches the pipeline's rename scheme.
+
+    The cleaning pipeline emits filenames of the form
+    ``{original_stem}_{subject_code}_{MM.DD__HH.MM.SS}.edf`` (plus the
+    ``_annotations.edf`` sidecar variant). A file lacking that suffix
+    was almost certainly NOT written by the pipeline in the same run
+    that produced its siblings — the operator likely dropped it into
+    the output directory from a different source, or the pipeline hit
+    an error before the ``shutil.move`` rename step. Either way, the
+    file has bypassed the audited de-id path.
+
+    Status:
+      - ``pass``  — every filename matches
+      - ``fail``  — any filename lacks the timestamped subject-code
+                    suffix
+    """
+    per_file: dict[str, bool] = {}
+    unrenamed: list[str] = []
+    for p in edf_paths:
+        p = Path(p)
+        matches = bool(_CLEAN_FILENAME_SUFFIX_RE.search(p.name))
+        per_file[p.name] = matches
+        if not matches:
+            unrenamed.append(p.name)
+
+    issues: list[str] = []
+    if not per_file:
+        status = "fail"
+        issues.append("No EDF files were provided")
+    elif unrenamed:
+        status = "fail"
+        for name in unrenamed:
+            issues.append(
+                f"{name}: does not match pipeline rename pattern — file "
+                "likely bypassed the clean_subject_edf_files pipeline"
+            )
+    else:
+        status = "pass"
+
+    return {
+        "check": "filename_convention",
+        "status": status,
+        "n_files": len(per_file),
+        "pattern": _CLEAN_FILENAME_SUFFIX_RE.pattern,
+        "matches_by_file": per_file,
+        "unrenamed_files": sorted(unrenamed),
         "issues": issues,
     }
 
