@@ -101,8 +101,20 @@ def build_manifest(*,
                    n_files_failed: int,
                    n_files_quarantined: int,
                    review_events: Iterable[ReviewEvent] = (),
+                   failed_files: Iterable[dict] = (),
                    ) -> dict:
-    """Assemble the manifest dict. Pure — no I/O side effects other than
+    """
+    ``failed_files`` — one dict per file the pipeline could not clean
+    (load failure OR de-identification failure). Shape:
+        {"filename": str, "error_message": str, "stage": "load"|"deid",
+         "quarantined_paths": [str, ...]}
+    The transfer step consults this list and REFUSES to upload any
+    filename in it, printing an explicit skip warning per file so an
+    operator can spot the omission at glance. The audit tool likewise
+    surfaces it in its critical-findings banner and its optional
+    ``--delete-unclean`` mode targets exactly these files.
+
+    Assembles the manifest dict. Pure — no I/O side effects other than
     reading the EDF files (via fast-hash). Callers wrap this in
     :func:`write_manifest` to persist it.
     """
@@ -128,6 +140,7 @@ def build_manifest(*,
         "hash_mode_by_file": modes,
         "hash_details_by_file": details,
         "review_events": [e.to_dict() for e in review_events],
+        "failed_files": list(failed_files),
     }
 
 

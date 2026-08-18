@@ -339,13 +339,14 @@ def clean_subject_edf_files(
         return
 
     try:
-        EDF_meta_data = _load_edf_metadata(input_path=input_path,
-                                           verbosity=verbosity,
-                                           load_method=load_method,
-                                           raise_errors=raise_errors,
-                                           force_load_all=force_load_all,
-                                           bench=bench,
-                                           recursive=recursive)
+        EDF_meta_data, load_failed_files = _load_edf_metadata(
+            input_path=input_path,
+            verbosity=verbosity,
+            load_method=load_method,
+            raise_errors=raise_errors,
+            force_load_all=force_load_all,
+            bench=bench,
+            recursive=recursive)
     except ConsecutiveLoadFailureLimit as e:
         # Do NOT write a manifest and do NOT offer transfer — an
         # operator whose files won't load must not be handed an upload
@@ -604,6 +605,23 @@ def clean_subject_edf_files(
 
     _print_review_block(review_events)
 
+    # Unify the two failure lists (load-time and de-id-time) into the
+    # manifest under a single ``failed_files`` field. Structured so
+    # downstream tools -- the transfer script and audit -- can act on
+    # per-file basename, error text, and quarantine status without
+    # re-parsing log.out. Stage tag lets the audit distinguish which
+    # phase choked (informational -- both stages block transfer).
+    manifest_failed_files = [
+        {"filename": fname, "error_message": err,
+         "stage": "load", "quarantined_paths": []}
+        for fname, err in load_failed_files
+    ] + [
+        {"filename": fname, "error_message": err,
+         "stage": "deid",
+         "quarantined_paths": [str(p) for p in moved]}
+        for fname, err, moved in failed_files
+    ]
+
     manifest = build_manifest(
         subject_code=subject_code,
         site_code=site_code,
@@ -613,21 +631,34 @@ def clean_subject_edf_files(
         inplace=inplace,
         output_edf_paths=output_edf_paths,
         n_files_deidentified=len(output_edf_paths),
-        n_files_failed=len(failed_files),
+        n_files_failed=len(manifest_failed_files),
         n_files_quarantined=n_quarantined_files,
         review_events=review_events,
+        failed_files=manifest_failed_files,
     )
     write_manifest(output_path, manifest)
 
-    # Refuse to prompt for transfer if any file failed or was
-    # quarantined — the operator needs to resolve those first.
-    if failed_files:
+    if manifest_failed_files:
+        # The pipeline used to refuse to prompt for transfer at all when
+        # any file failed. That over-blocks: the operator can't ship the
+        # cleaned subset until they manually fix the broken files. New
+        # behavior: name the failed files loudly, remind the operator
+        # they won't be transferred, then offer the transfer for the
+        # rest. The transfer command itself re-checks the manifest and
+        # excludes these same names before running rsync.
         print(
-            "Refusing to offer transfer while failures/quarantine remain. "
-            "Investigate, then re-run `transfer-subject-eeg <output_dir>` "
-            "once resolved.\n"
+            f"\nWARNING: {len(manifest_failed_files)} file(s) failed cleaning "
+            "and WILL NOT be transferred to the CML server:")
+        for entry in manifest_failed_files:
+            print(f"  - {entry['filename']}  ({entry['stage']}: "
+                  f"{entry['error_message'][:100]})")
+        print(
+            "Cleaned files will be transferred as normal; the failed files "
+            "above are excluded by name in the transfer step. Investigate "
+            "the failures via log.out; if they can be fixed, re-run the "
+            "pipeline on the affected files before re-running "
+            "transfer-subject-eeg on this subject.\n"
         )
-        return
 
     _prompt_ready_to_transfer(output_path, auto_response=auto_transfer_response)
 
@@ -1055,7 +1086,12 @@ def _load_edf_metadata(input_path: str,
             "Please send the log file (log.out, in the EDF directory) to the "
             "data management team so these files can be investigated.\n"
         )
-    return EDF_meta_data
+        print(
+            "These files will NOT be transferred to the CML server. The "
+            "transfer step skips any file listed in deidentify.json's "
+            "'failed_files'.\n"
+        )
+    return EDF_meta_data, failed_files
 
 
 def _get_start_time_earliest_recording(EDF_meta_data: dict, verbosity: int = 0) -> datetime:

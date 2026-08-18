@@ -1279,6 +1279,91 @@ def _patch_patient_id(edf_path: Path, patient_id: str) -> None:
     edf_path.write_bytes(bytes(data))
 
 
+# ---------- --delete-unclean: positive + negative regression guards ----------
+
+
+def test_delete_unclean_removes_only_flagged_files(tmp_path, capsys):
+    """Positive + negative in one test: given a directory with BOTH
+    clean files (properly named) and unclean files (unrenamed), the
+    --delete-unclean primitive should delete ONLY the flagged ones
+    and leave clean files alone.
+    """
+    from clean_eeg.audit.cli import _delete_unclean_files
+
+    subject_dir = tmp_path / "R1755J"
+    subject_dir.mkdir()
+    # Clean file — properly renamed. MUST NOT be deleted.
+    clean = subject_dir / "a_R1755J_01.01__00.00.00.edf"
+    clean.write_bytes(b"clean payload")
+    # Unclean file — no rename. MUST be deleted.
+    unclean = subject_dir / "bypass.edf"
+    unclean.write_bytes(b"unclean payload")
+    # Its annotation sidecar — MUST also be deleted alongside.
+    unclean_sidecar = subject_dir / "bypass_annotations.edf"
+    unclean_sidecar.write_bytes(b"sidecar payload")
+    # Audit dict with only the unclean file flagged.
+    audit = {
+        "subject_dir": str(subject_dir),
+        "checks": {
+            "filename_convention": {"unrenamed_files": ["bypass.edf"]},
+            "log_file": {"failed_deid_files": []},
+            "header_phi_residue": {},
+        },
+    }
+    deleted, skipped = _delete_unclean_files(
+        audit, subject_dir, auto_confirm=True)
+    # Positive: unclean + sidecar are gone.
+    assert not unclean.exists()
+    assert not unclean_sidecar.exists()
+    assert unclean in deleted or unclean.resolve() in deleted
+    # Negative regression guard: the clean file is STILL present.
+    assert clean.exists(), (
+        "clean file must not be deleted by --delete-unclean"
+    )
+
+
+def test_delete_unclean_noop_when_no_flagged_files(tmp_path):
+    """Negative regression: no critical findings → no deletions.
+    Guards against the primitive walking the dir and deleting things
+    on its own initiative.
+    """
+    from clean_eeg.audit.cli import _delete_unclean_files
+    subject_dir = tmp_path / "R1755J"
+    subject_dir.mkdir()
+    clean_a = subject_dir / "a_R1755J_01.01__00.00.00.edf"
+    clean_b = subject_dir / "b_R1755J_01.01__00.01.00.edf"
+    clean_a.write_bytes(b"a"); clean_b.write_bytes(b"b")
+    audit = {"subject_dir": str(subject_dir), "checks": {}}
+    deleted, _ = _delete_unclean_files(audit, subject_dir, auto_confirm=True)
+    assert deleted == []
+    # Positive on absence: both files still on disk.
+    assert clean_a.exists() and clean_b.exists()
+
+
+def test_delete_unclean_requires_exact_confirmation_string(tmp_path,
+                                                            monkeypatch):
+    """Interactive mode must reject anything but the exact
+    ``DELETE N FILES`` string. Guards against typo / accidental yes.
+    """
+    from clean_eeg.audit.cli import _delete_unclean_files
+    subject_dir = tmp_path / "R1755J"
+    subject_dir.mkdir()
+    unclean = subject_dir / "bypass.edf"
+    unclean.write_bytes(b"unclean payload")
+    audit = {
+        "subject_dir": str(subject_dir),
+        "checks": {"filename_convention": {"unrenamed_files": ["bypass.edf"]}},
+    }
+    # Operator types the wrong confirmation string.
+    monkeypatch.setattr("builtins.input", lambda _: "yes")
+    deleted, _ = _delete_unclean_files(audit, subject_dir, auto_confirm=False)
+    assert deleted == []
+    # Negative regression: file is still there — no accidental deletion.
+    assert unclean.exists(), (
+        "wrong confirmation must not trigger deletion"
+    )
+
+
 def test_e2e_audit_pass_on_clean_subject(tmp_path):
     subject_dir = _build_clean_subject(tmp_path)
     audit = audit_subject(subject_dir, name_dictionary={"nonexistent"})

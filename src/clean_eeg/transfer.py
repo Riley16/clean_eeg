@@ -104,11 +104,31 @@ class TransferPlan:
     background_log: Path | None = None
 
 
-def _iter_edfs(output_path: Path) -> list[Path]:
+def _iter_edfs(output_path: Path,
+               excluded_names: set[str] | None = None) -> list[Path]:
     """All *.edf files directly in ``output_path`` (non-recursive —
-    quarantine/ subdir is skipped by construction)."""
+    quarantine/ subdir is skipped by construction).
+
+    ``excluded_names`` is a set of basenames that the caller wants to
+    skip (typically the ``failed_files`` roster from the manifest — see
+    :func:`_failed_names_from_manifest`). Excluding by basename lets the
+    caller both list the file and refuse to include it in the transfer
+    plan without extra filesystem trickery.
+    """
+    excluded = excluded_names or set()
     return sorted(p for p in output_path.iterdir()
-                  if p.is_file() and p.suffix.lower() == ".edf")
+                  if p.is_file() and p.suffix.lower() == ".edf"
+                  and p.name not in excluded)
+
+
+def _failed_names_from_manifest(manifest: dict) -> set[str]:
+    """Return the set of basenames the pipeline reported as failed
+    (either at load or de-id). These are the files transfer refuses to
+    upload -- they may still carry PHI or be structurally invalid.
+    """
+    entries = manifest.get("failed_files") or []
+    return {entry["filename"] for entry in entries
+            if isinstance(entry, dict) and entry.get("filename")}
 
 
 def _check_edf_headers(edf_paths: Iterable[Path], subject_code: str,
@@ -218,8 +238,20 @@ def preflight_deidentified_output(output_path: str | Path,
             f"upload to an unknown site. Known: {sorted(site_map)}"
         )
 
-    # 3. Naming pattern for every EDF in the output dir.
-    edfs = _iter_edfs(output_path)
+    # 3. Naming pattern for every EDF in the output dir. Files listed
+    #    in manifest.failed_files are EXCLUDED entirely -- the pipeline
+    #    already told us they can't be cleaned, so we treat them as
+    #    not-present-for-transfer and skip every downstream check on
+    #    them (they'd fail all of these anyway and drag the whole
+    #    preflight to fail-status).
+    excluded_names = _failed_names_from_manifest(manifest)
+    if excluded_names:
+        warnings.append(
+            f"SKIPPING {len(excluded_names)} file(s) that failed cleaning "
+            f"(from manifest.failed_files); they will NOT be transferred: "
+            f"{sorted(excluded_names)}"
+        )
+    edfs = _iter_edfs(output_path, excluded_names=excluded_names)
     if not edfs:
         failures.append(f"{output_path} contains no .edf files to upload")
     for p in edfs:
@@ -230,7 +262,7 @@ def preflight_deidentified_output(output_path: str | Path,
                 "— did this file skip the rename step?"
             )
 
-    # 4. Per-file header expectations.
+    # 4. Per-file header expectations (only for the transfer-eligible set).
     _check_edf_headers(edfs, subject_code, failures)
 
     # 5. Spot-check hash on one file.
@@ -248,7 +280,9 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
                          site_incoming_folder: str, ssh_user: str,
                          use_rsync: bool,
                          remote_dir_override: str | None = None,
-                         skip_perms: bool = False) -> TransferPlan:
+                         skip_perms: bool = False,
+                         excluded_names: set[str] | None = None,
+                         ) -> TransferPlan:
     if remote_dir_override is not None:
         # Test/scratch mode: caller supplies the full remote path
         # directly and (by default) opts out of the site-group perms
@@ -268,6 +302,7 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
         f'umask 007 && mkdir -p {remote_dir}',
     ]
 
+    excluded_names = excluded_names or set()
     if use_rsync:
         # --partial: keep partial destination file on interrupt so a
         # re-run resumes cheaply via rsync's delta algorithm (which
@@ -276,11 +311,15 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
         # --append and is rejected by macOS's shipped rsync-2.6.9).
         # --exclude='quarantine/': never ship quarantined files even
         # if a partial run left some behind.
+        # --exclude=<name> per failed file: the manifest-recorded
+        # failures never make it upstream even if they're sitting in
+        # output_path alongside the successfully-cleaned files.
         # Trailing slash on source path → copy directory contents
         # (incl. log.out and deidentify.json), not the directory itself.
         upload_argv = [
             "rsync", "-avzh", "--partial", "--progress",
             "--exclude=quarantine/",
+            *(f"--exclude={n}" for n in sorted(excluded_names)),
             f"{output_path}/",
             f"{ssh_user}@{SSH_HOST}:{remote_dir}/",
         ]
@@ -303,7 +342,8 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
         # against the pipeline-write time instead of the upload time.
         upload_argv = [
             "scp", "-p",
-            *sorted(str(p) for p in output_path.glob("*.edf")),
+            *sorted(str(p) for p in output_path.glob("*.edf")
+                    if p.name not in excluded_names),
             *existing_sidecars,
             f"{ssh_user}@{SSH_HOST}:{remote_dir}/",
         ]
@@ -341,7 +381,9 @@ def build_transfer_plan(output_path: str | Path, *, subject_code: str,
                         site_incoming_folder: str, ssh_user: str,
                         use_rsync: bool | None = None,
                         remote_dir_override: str | None = None,
-                        skip_perms: bool = False) -> TransferPlan:
+                        skip_perms: bool = False,
+                        excluded_names: set[str] | None = None,
+                        ) -> TransferPlan:
     """Public helper — resolves ``use_rsync`` from ``shutil.which`` if
     not supplied. Exposed so tests can inspect the composed commands
     without invoking them, and so the CLI can print the plan for the
@@ -351,6 +393,12 @@ def build_transfer_plan(output_path: str | Path, *, subject_code: str,
     is this path verbatim instead of being derived from the site map.
     Intended for integration tests that transfer to a scratch or
     ``edf_transfer_test/`` subdir — should not be used in production.
+
+    ``excluded_names``: basenames to omit from the upload. Usually the
+    ``manifest.failed_files`` set — files the pipeline reported as
+    unable to be cleaned. Encoded as ``--exclude=<name>`` in rsync
+    mode; filtered out of the glob in scp mode. When ``None``, no
+    filtering (identical to the pre-``failed_files`` behavior).
     """
     if use_rsync is None:
         use_rsync = shutil.which("rsync") is not None
@@ -362,6 +410,7 @@ def build_transfer_plan(output_path: str | Path, *, subject_code: str,
         use_rsync=use_rsync,
         remote_dir_override=remote_dir_override,
         skip_perms=skip_perms,
+        excluded_names=excluded_names,
     )
 
 

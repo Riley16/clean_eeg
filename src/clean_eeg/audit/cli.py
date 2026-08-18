@@ -325,6 +325,67 @@ def _collect_flagged_filenames(audit: dict) -> dict[str, list[str]]:
     return flagged
 
 
+def _delete_unclean_files(audit: dict, subject_dir: Path,
+                          *, auto_confirm: bool, out=None
+                          ) -> tuple[list[Path], list[Path]]:
+    """Delete every file the audit flagged as critical (pipeline-
+    failed / unrenamed / off-year recording_id). READ-ONLY-BY-DEFAULT
+    audit primitive; only invoked when the operator passes
+    ``--delete-unclean``.
+
+    Returns ``(deleted, skipped)`` — resolved absolute paths. ``skipped``
+    covers "file doesn't exist" cases (the flagged filename didn't map
+    to a real path). Every deletion is announced on ``out`` so the
+    scrollback carries the receipt.
+
+    Interactive confirmation: unless ``auto_confirm`` is True, prompts
+    with the exact list about to be deleted and requires an explicit
+    ``DELETE N FILES`` string match (N = the exact count). Cheap
+    ceremony that makes accidental invocation impossible under
+    autocomplete or typo.
+    """
+    out = out or sys.stdout
+    flagged = _collect_flagged_filenames(audit)
+    if not flagged:
+        return [], []
+
+    paths = sorted((subject_dir / n).resolve() for n in flagged)
+    n = len(paths)
+    print(f"\n[!] --delete-unclean requested. {n} file(s) queued for "
+          "PERMANENT deletion (also removes their _annotations.edf "
+          "sidecars if present):", file=out)
+    for p, name in zip(paths, sorted(flagged)):
+        reasons = flagged[name]
+        print(f"    - {p}", file=out)
+        for r in reasons:
+            print(f"        reason: {r}", file=out)
+
+    if not auto_confirm:
+        need = f"DELETE {n} FILES"
+        got = input(
+            f"\nType exactly {need!r} to confirm, anything else aborts: "
+        ).strip()
+        if got != need:
+            print("Aborted; no files deleted.", file=out)
+            return [], []
+
+    deleted: list[Path] = []
+    skipped: list[Path] = []
+    for p in paths:
+        # Delete both the main EDF and its _annotations.edf sidecar if
+        # one exists. Silent no-op on missing sidecar -- inline-mode
+        # cleaned files don't have sidecars.
+        for target in (p, Path(str(p).replace(".edf", "_annotations.edf"))):
+            if not target.exists():
+                if target == p:
+                    skipped.append(target)
+                continue
+            target.unlink()
+            deleted.append(target)
+            print(f"    deleted: {target}", file=out)
+    return deleted, skipped
+
+
 def _print_failed_deid_headers(audit: dict, subject_dir: Path,
                                *, redact_phi: bool = False,
                                out=None) -> None:
@@ -571,9 +632,19 @@ def _run_one_subject(subject_dir: Path, args,
     # the HTML render carries plots + inline docstrings.
     _print_full_results_footer(out_dir, notebook_rendered=notebook_rendered)
 
+    # Optional destructive action: PERMANENTLY delete the flagged
+    # files. Runs BEFORE the bottom banner so the banner still lists
+    # every critical finding for provenance -- the deleted-files log
+    # then documents which of those findings actually got wiped.
+    if args.delete_unclean:
+        _delete_unclean_files(audit, subject_dir,
+                              auto_confirm=args.yes_delete_unclean)
+
     # Same banner as at the top, repeated at the BOTTOM so critical
     # findings can't be missed after the middle of the audit scrolls
-    # off in a long tail-of-terminal view.
+    # off in a long tail-of-terminal view. Reflects the pre-delete
+    # audit state on purpose -- documents what was flagged, even for
+    # entries that just got deleted above.
     _print_critical_banner(audit, label="BOTTOM")
 
     return audit
@@ -629,6 +700,25 @@ def _build_parser() -> argparse.ArgumentParser:
                         "every annotation verbatim.")
     p.add_argument("--print-edf-header", action="store_true")
     p.add_argument("--print-edf-signal-header", action="store_true")
+    p.add_argument("--delete-unclean", "--delete_unclean",
+                   dest="delete_unclean", action="store_true",
+                   help="PERMANENTLY DELETE every file the audit flags in "
+                        "the critical banner (pipeline-failed, unrenamed, or "
+                        "off-year recording_id). Also removes matching "
+                        "_annotations.edf sidecars. Requires typing the "
+                        "exact confirmation string 'DELETE N FILES' unless "
+                        "--yes-delete-unclean is also passed. Use for "
+                        "cleaning up subjects where partially-cleaned files "
+                        "were transferred and now need to be removed from "
+                        "the server-side archive. NOT reversible — verify "
+                        "the banner list is what you want deleted BEFORE "
+                        "passing this flag.")
+    p.add_argument("--yes-delete-unclean", "--yes_delete_unclean",
+                   dest="yes_delete_unclean", action="store_true",
+                   help="Skip the interactive 'DELETE N FILES' confirmation "
+                        "for --delete-unclean. Intended for headless / SSH "
+                        "batch runs after the operator has verified the "
+                        "flagged list in an earlier interactive audit.")
     p.add_argument("--redact-header-dump", "--redact_header_dump",
                    dest="redact_header_dump", action="store_true",
                    help="Mask patient_id / recording_id / startdate / "

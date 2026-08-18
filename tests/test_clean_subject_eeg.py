@@ -1265,7 +1265,10 @@ def test_force_flag_bypasses_completion_marker(tmp_path, monkeypatch, capsys):
     # Stub out downstream so we don't have to worry about the second-run
     # signal-header divergence caused by annotation stubs in inplace mode.
     def stub_load(*_args, **_kwargs):
-        return {}  # empty EDF_meta_data → pipeline raises before de-id loop
+        # _load_edf_metadata now returns (EDF_meta_data, failed_files);
+        # returning an empty pair produces the "no files to process"
+        # branch that this test wants downstream.
+        return {}, []
     monkeypatch.setattr(_csm, "_load_edf_metadata", stub_load)
     try:
         clean_subject_edf_files(

@@ -172,6 +172,129 @@ def test_preflight_fails_when_filename_pattern_wrong(tmp_path):
                for f in result.failures)
 
 
+# ---------- manifest.failed_files: exclusion behaviour ----------
+
+def _add_failed_file_to_manifest(out: Path, failed_name: str,
+                                 err: str = "OSError: test-only") -> None:
+    """Append one failed-cleaning entry to the manifest at ``out``."""
+    m = json.loads((out / MANIFEST_FILENAME).read_text())
+    m.setdefault("failed_files", []).append({
+        "filename": failed_name, "error_message": err,
+        "stage": "load", "quarantined_paths": [],
+    })
+    (out / MANIFEST_FILENAME).write_text(json.dumps(m))
+
+
+def test_preflight_excludes_manifest_failed_files_from_checks(tmp_path):
+    """Positive: a file listed in manifest.failed_files should NOT be
+    checked by preflight (no rename check, no header check). Warning
+    is surfaced instead of a failure.
+    """
+    out = _make_subject_dir(tmp_path)
+    # Drop a wrong-name file in the dir and register it as failed. If
+    # preflight didn't respect the exclusion, its filename check would
+    # fail on the wrong-name file.
+    (out / "raw_but_failed.edf").write_bytes(b"not a real edf, doesnt matter")
+    _add_failed_file_to_manifest(out, "raw_but_failed.edf")
+    result = preflight_deidentified_output(out)
+    # NEGATIVE regression guard: the KNOWN-GOOD sibling still shows,
+    # preflight still passes overall.
+    assert result.passed, result.summary()
+    assert any("SKIPPING 1" in w and "raw_but_failed.edf" in w
+               for w in result.warnings), result.warnings
+
+
+def test_preflight_still_fails_when_unlisted_bad_file_present(tmp_path):
+    """Negative: a bad file that ISN'T listed in manifest.failed_files
+    still trips preflight. Guards against the exclusion path becoming
+    a security bypass — files must be explicitly acknowledged to be
+    skipped.
+    """
+    out = _make_subject_dir(tmp_path)
+    # Bad-name file, NOT registered as failed in manifest
+    _write_deidentified_edf(out / "sneaky_wrong_name.edf")
+    result = preflight_deidentified_output(out)
+    assert not result.passed
+    assert any("sneaky_wrong_name.edf" in f and "does not match" in f
+               for f in result.failures)
+
+
+def test_preflight_all_files_transferred_when_no_failed_files(tmp_path):
+    """Regression guard: baseline behavior with empty failed_files list
+    is unchanged — no warnings, no exclusions, everything passes.
+    """
+    out = _make_subject_dir(tmp_path)
+    result = preflight_deidentified_output(out)
+    assert result.passed, result.summary()
+    assert result.warnings == []
+
+
+def test_transfer_plan_rsync_excludes_failed_files(tmp_path):
+    """rsync mode must add --exclude=<name> for each failed file."""
+    plan = build_transfer_plan(
+        tmp_path / "out", subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER, ssh_user="alice",
+        use_rsync=True, remote_dir_override="/tmp/target",
+        excluded_names={"bad1.edf", "bad2.edf"},
+    )
+    assert "--exclude=bad1.edf" in plan.upload_argv
+    assert "--exclude=bad2.edf" in plan.upload_argv
+    assert "--exclude=quarantine/" in plan.upload_argv  # regression: unchanged
+
+
+def test_transfer_plan_rsync_no_exclusions_when_no_failed_files(tmp_path):
+    """Negative regression: empty excluded_names produces NO extra
+    --exclude=<name> flags. Guards against accidentally excluding
+    clean files.
+    """
+    plan = build_transfer_plan(
+        tmp_path / "out", subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER, ssh_user="alice",
+        use_rsync=True, remote_dir_override="/tmp/target",
+        excluded_names=None,
+    )
+    # Only the built-in quarantine exclusion; no per-file names
+    per_file = [a for a in plan.upload_argv
+                if a.startswith("--exclude=") and a != "--exclude=quarantine/"]
+    assert per_file == [], per_file
+
+
+def test_transfer_plan_scp_filters_glob_by_excluded_names(tmp_path):
+    """scp fallback mode must filter the *.edf glob by excluded_names."""
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "ok_R1755A_01.01__10.00.00.edf").write_bytes(b"x")
+    (out / "bad_file.edf").write_bytes(b"x")
+    plan = build_transfer_plan(
+        out, subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER, ssh_user="alice",
+        use_rsync=False, remote_dir_override="/tmp/target",
+        excluded_names={"bad_file.edf"},
+    )
+    argv_str = " ".join(plan.upload_argv)
+    assert "ok_R1755A_01.01__10.00.00.edf" in argv_str  # positive
+    assert "bad_file.edf" not in argv_str               # negative
+
+
+def test_transfer_plan_scp_no_filter_when_no_excluded(tmp_path):
+    """Negative regression: without excluded_names, ALL *.edf files
+    make it into the scp argv.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "a_R1755A_01.01__10.00.00.edf").write_bytes(b"x")
+    (out / "b_R1755A_01.01__11.00.00.edf").write_bytes(b"x")
+    plan = build_transfer_plan(
+        out, subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER, ssh_user="alice",
+        use_rsync=False, remote_dir_override="/tmp/target",
+        excluded_names=None,
+    )
+    argv_str = " ".join(plan.upload_argv)
+    assert "a_R1755A_01.01__10.00.00.edf" in argv_str
+    assert "b_R1755A_01.01__11.00.00.edf" in argv_str
+
+
 def test_preflight_accepts_annotations_stub_filename(tmp_path):
     """The inplace path writes both `..._R1XXXY_MM.DD__HH.MM.SS.edf`
     and `..._annotations.edf` sidecars. The naming regex must accept

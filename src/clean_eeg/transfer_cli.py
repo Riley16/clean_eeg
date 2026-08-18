@@ -78,13 +78,25 @@ def main(argv: list[str] | None = None) -> int:
     # execute. Uses the same rsync/scp resolution the transfer_subject
     # call will use downstream.
     assert result.manifest is not None
+    # Threading the manifest's failed_files roster into the plan so the
+    # rsync --exclude=<name> / scp glob filter drops them from the
+    # upload argv. preflight already surfaces the skip as a warning;
+    # this line is what actually enforces it in the composed command.
+    from clean_eeg.transfer import _failed_names_from_manifest
+    excluded_names = _failed_names_from_manifest(result.manifest)
     plan = build_transfer_plan(
         args.output_dir,
         subject_code=result.manifest["subject_code"],
         site_incoming_folder=result.manifest["site_incoming_folder"],
         ssh_user=args.user or _default_user(),
         use_rsync=shutil.which("rsync") is not None,
+        excluded_names=excluded_names,
     )
+    if excluded_names:
+        print(f"\n[!] {len(excluded_names)} file(s) excluded from transfer "
+              "(from manifest.failed_files):")
+        for n in sorted(excluded_names):
+            print(f"    - {n}")
     print()
     print(f"Transport: {plan.transport}")
     print(f"Remote:    {plan.remote_dir}")
