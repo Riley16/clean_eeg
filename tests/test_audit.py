@@ -1561,6 +1561,43 @@ def test_build_audit_notebook_has_expected_cells(tmp_path):
     assert nb["metadata"]["kernelspec"]["name"] == "python3"
 
 
+def test_cli_banner_prints_absolute_paths_for_flagged_files(tmp_path, capsys):
+    """Regression: the critical-findings banner (top+bottom) should print
+    absolute paths to the flagged files so operators can copy-paste the
+    output into a shell without reconstructing the parent directory.
+    Applies to all three critical categories: failed-deid, unrenamed,
+    off-year recording_id.
+    """
+    from clean_eeg.audit.cli import _critical_finding_lines
+    subject_dir = tmp_path / "R1755J"
+    subject_dir.mkdir()
+    audit = {
+        "subject_dir": str(subject_dir),
+        "checks": {
+            "log_file": {"failed_deid_files": [
+                {"filename": "SKIPPED.edf", "line_number": 10, "text": "..."},
+            ]},
+            "filename_convention": {"unrenamed_files": ["UNRENAMED.edf"]},
+            "header_phi_residue": {
+                "expected_year_range": [1985, 1987],
+                "recording_id_years_by_file": {
+                    "OFFYEAR.edf": 2024,
+                    "ok.edf": 1985,
+                },
+            },
+        },
+    }
+    lines = _critical_finding_lines(audit)
+    joined = "\n".join(lines)
+    # Positive: every flagged filename is prefixed with the resolved
+    # subject_dir path.
+    assert str(subject_dir.resolve() / "SKIPPED.edf") in joined
+    assert str(subject_dir.resolve() / "UNRENAMED.edf") in joined
+    assert str(subject_dir.resolve() / "OFFYEAR.edf") in joined
+    # Negative: an in-range file should not appear.
+    assert "ok.edf" not in joined
+
+
 def test_cli_always_prints_annotation_redactions(capsys):
     from clean_eeg.audit.cli import _always_print_warnings
     audit = {"checks": {

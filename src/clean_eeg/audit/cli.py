@@ -215,19 +215,29 @@ def _critical_finding_lines(audit: dict) -> list[str]:
     demand the banner at the very top and bottom of the audit output.
     Each returned string is one line inside the banner box.
 
+    File paths are printed as ABSOLUTE paths (resolved against the
+    audit's ``subject_dir``) so an operator scrolling scrollback or
+    copy-pasting into a shell can act on the output without having to
+    reconstruct the parent directory.
+
     Critical categories:
       - Files the pipeline explicitly failed to de-identify and skipped
         (from ``log_file.failed_deid_files``).
       - Files sitting in the transferred subject dir that don't match
         the pipeline's timestamped rename pattern (from
         ``filename_convention.unrenamed_files``).
-      - Files with a recording_id / startdate year outside the
-        expected de-identified range (from
-        ``header_phi_residue.recording_id_years_by_file`` +
-        ``startdates_by_file``) — signals the file bypassed the
-        header-shift step.
+      - Files with a recording_id year outside the expected
+        de-identified range (from
+        ``header_phi_residue.recording_id_years_by_file``) — signals
+        the file bypassed the header-shift step.
     """
     checks = audit.get("checks", {})
+    subject_dir_str = audit.get("subject_dir") or "."
+    subject_dir = Path(subject_dir_str).resolve()
+
+    def _abs(name: str) -> str:
+        return str((subject_dir / name).resolve())
+
     lines: list[str] = []
     log = checks.get("log_file", {})
     failed = log.get("failed_deid_files") or []
@@ -235,7 +245,7 @@ def _critical_finding_lines(audit: dict) -> list[str]:
         names = sorted({f["filename"] for f in failed})
         lines.append(f"{len(failed)} FILE(S) PIPELINE FAILED TO DE-IDENTIFY (SKIPPED):")
         for name in names:
-            lines.append(f"  - {name}")
+            lines.append(f"  - {_abs(name)}")
 
     fname_check = checks.get("filename_convention", {})
     unrenamed = fname_check.get("unrenamed_files") or []
@@ -244,7 +254,7 @@ def _critical_finding_lines(audit: dict) -> list[str]:
             f"{len(unrenamed)} FILE(S) DO NOT MATCH PIPELINE RENAME PATTERN "
             "(BYPASSED CLEANING):")
         for name in unrenamed:
-            lines.append(f"  - {name}")
+            lines.append(f"  - {_abs(name)}")
 
     residue = checks.get("header_phi_residue", {})
     year_range = residue.get("expected_year_range") or []
@@ -257,7 +267,7 @@ def _critical_finding_lines(audit: dict) -> list[str]:
                 f"{len(off_recid)} FILE(S) HAVE REAL RECORDING YEAR IN "
                 "recording_id (HEADER-SHIFT BYPASSED):")
             for name, yr in sorted(off_recid.items()):
-                lines.append(f"  - {name}: year {yr}")
+                lines.append(f"  - {_abs(name)}: year {yr}")
     return lines
 
 
@@ -301,8 +311,11 @@ def _print_failed_deid_headers(audit: dict, subject_dir: Path, out=None) -> None
     print(f"\n[!] Dumping headers for {len(names)} file(s) the pipeline "
           "failed to de-identify (no re-clean attempted):", file=out)
     for name in names:
-        path = subject_dir / name
-        print(f"\n--- header dump: {name} ---", file=out)
+        # Absolute path so an operator running the audit from an arbitrary
+        # cwd (or copy-pasting from a scrollback) can act on the output
+        # without having to reconstruct the parent directory.
+        path = (subject_dir / name).resolve()
+        print(f"\n--- header dump: {path} ---", file=out)
         if not path.exists():
             print(f"    (file not present at {path}; skipping)", file=out)
             continue
