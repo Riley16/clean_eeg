@@ -881,6 +881,37 @@ def test_log_pass_when_no_failed_deid_lines(tmp_path):
     assert result["failed_deid_files"] == []
 
 
+def test_log_failed_deid_captures_error_message(tmp_path):
+    """The exception the pipeline prints right after the ERROR line
+    should be captured into failed_deid_files[i]['error_message'] so
+    the audit's header-dump section can show it inline (spares the
+    operator a trip back to log.out for the actual failure reason).
+    """
+    log = tmp_path / "log.out"
+    log.write_text(
+        "Loading files ...\n"
+        "ERROR: Failed to load EDF file NA3621K6.edf:\n"
+        "\n"
+        "OSError: the file is not EDF(+) or BDF(+) compliant (Filesize)\n"
+        "\n"
+        "Stack trace (for the data team):\n"
+        "Traceback (most recent call last):\n"
+        "  File 'x.py', line 1, in <module>\n"
+        "    raise OSError(...)\n"
+        "\n"
+        "Check if the file is corrupted. Skipping this file...\n"
+    )
+    result = check_log_file(log)
+    assert result["n_failed_deid_files"] == 1
+    entry = result["failed_deid_files"][0]
+    assert entry["filename"] == "NA3621K6.edf"
+    assert "OSError" in entry["error_message"]
+    assert "not EDF" in entry["error_message"]
+    # Negative: the stack trace itself should NOT bleed into the message.
+    assert "Traceback" not in entry["error_message"]
+    assert "raise OSError" not in entry["error_message"]
+
+
 def test_log_failed_deid_survives_tqdm_carriage_returns(tmp_path):
     """Regression: tqdm writes progress-bar updates with \r-terminated
     lines when stderr isn't a TTY (headless / SSH), and the pipeline's

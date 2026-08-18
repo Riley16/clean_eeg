@@ -46,6 +46,37 @@ _FAILED_DEID_RE = re.compile(
 )
 
 
+# When we look ahead past a matched ERROR line to grab the exception
+# message, cap the search at this many lines. The pipeline prints:
+#     ERROR: Failed to load EDF file X:
+#     <blank>
+#     <exception message — usually 1 line, occasionally multi-line>
+#     <blank>
+#     Stack trace (for the data team):
+# We stop at "Stack trace" / "Skipping this file" or on the next
+# ERROR:/WARNING: line, whichever comes first — but the cap defends
+# against a runaway log where the delimiter is missing.
+_ERR_LOOKAHEAD_LINES = 30
+
+
+def _extract_error_message_after(lines: list[str], start_idx: int) -> str:
+    """After a matched ERROR line at ``lines[start_idx]``, return the
+    exception summary that the pipeline emits (blank, message, blank,
+    Stack trace ...). Empty string if the shape doesn't match.
+    """
+    msg_parts: list[str] = []
+    for line in lines[start_idx + 1 : start_idx + 1 + _ERR_LOOKAHEAD_LINES]:
+        s = line.rstrip()
+        if s.startswith("Stack trace") or s.startswith("Skipping this file") \
+                or s.startswith("Partially-processed"):
+            break
+        if _ERROR_RE.match(s) or _WARNING_RE.match(s):
+            break
+        if s.strip():
+            msg_parts.append(s.strip())
+    return " | ".join(msg_parts)
+
+
 def check_log_file(log_path: str | Path | None) -> dict:
     """Scan a pipeline ``log.out`` for warnings, errors, and
     annotation-redaction events.
@@ -86,7 +117,8 @@ def check_log_file(log_path: str | Path | None) -> dict:
     # captured stderr.
     text = Path(log_path).read_text(encoding="utf-8", errors="replace")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    for i, line in enumerate(text.split("\n"), start=1):
+    all_lines = text.split("\n")
+    for i, line in enumerate(all_lines, start=1):
         stripped = line.rstrip("\n")
         if _WARNING_RE.match(stripped):
             warnings.append({"line_number": i, "text": stripped})
@@ -98,6 +130,7 @@ def check_log_file(log_path: str | Path | None) -> dict:
                 "line_number": i,
                 "filename": m_fail.group(1),
                 "text": stripped,
+                "error_message": _extract_error_message_after(all_lines, i - 1),
             })
         m = _REDACTION_RE.search(stripped)
         if m:

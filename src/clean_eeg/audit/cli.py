@@ -294,13 +294,21 @@ def _collect_flagged_filenames(audit: dict) -> dict[str, list[str]]:
     flagged as critical (pipeline-failed, unrenamed, or off-year
     recording_id). The same file can be flagged by multiple categories
     — reasons are accumulated so the header dump can show all of them.
+
+    Log-derived reasons include the exception message the pipeline
+    emitted right after the ERROR: line — that's usually the exact
+    pyedflib / repair-pass error that made the file unloadable, and
+    seeing it inline saves the operator a trip back to log.out.
     """
     checks = audit.get("checks", {})
     flagged: dict[str, list[str]] = {}
 
     for f in checks.get("log_file", {}).get("failed_deid_files") or []:
-        flagged.setdefault(f["filename"], []).append(
-            "log.out reports pipeline failed to load/de-identify")
+        msg = f.get("error_message") or ""
+        reason = "log.out reports pipeline failed to load/de-identify"
+        if msg:
+            reason += f": {msg}"
+        flagged.setdefault(f["filename"], []).append(reason)
 
     for name in checks.get("filename_convention", {}).get("unrenamed_files") or []:
         flagged.setdefault(name, []).append(
