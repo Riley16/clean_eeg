@@ -70,7 +70,10 @@ class SubjectRow:
 
 @dataclass
 class SubjectOutcome:
-    """Per-subject outcome after cleaning is attempted."""
+    """Per-subject outcome after cleaning (and optional audit) is
+    attempted. ``audit_exit_code`` is None when audit was not requested;
+    otherwise 0=pass, nonzero=findings/error. Both must be non-failure
+    for :attr:`succeeded` to be True."""
     row_index: int
     subject_code: str
     input_path: str
@@ -78,10 +81,23 @@ class SubjectOutcome:
     exit_code: int
     elapsed_s: float
     error_message: str | None = None   # None on success
+    audit_exit_code: int | None = None
+    audit_elapsed_s: float | None = None
+    audit_error_message: str | None = None
+
+    @property
+    def clean_succeeded(self) -> bool:
+        return self.exit_code == 0
 
     @property
     def succeeded(self) -> bool:
-        return self.exit_code == 0
+        """Both clean and (if run) audit must succeed. If audit was
+        not requested, only the clean exit code matters."""
+        if not self.clean_succeeded:
+            return False
+        if self.audit_exit_code is None:
+            return True
+        return self.audit_exit_code == 0
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +201,62 @@ def clean_one_subject(row: SubjectRow, *, extra_argv: list[str] | None = None,
 
 
 # ---------------------------------------------------------------------------
+# Subject filter (--only-subjects)
+# ---------------------------------------------------------------------------
+
+def filter_rows_by_subject(rows: list[SubjectRow],
+                            only_subjects: list[str] | None,
+                            ) -> list[SubjectRow]:
+    """Return the subset of ``rows`` whose ``subject_code`` matches any
+    of ``only_subjects``. If ``only_subjects`` is None/empty, ``rows``
+    is returned unchanged. Prints a warning for any picker entry that
+    matched zero rows so the operator notices typos immediately."""
+    if not only_subjects:
+        return rows
+    picker = set(only_subjects)
+    kept = [r for r in rows if r.subject_code in picker]
+    unmatched = picker - {r.subject_code for r in kept}
+    if unmatched:
+        print(f"[warn] --only-subjects entries not found in CSV: "
+              f"{sorted(unmatched)}", file=sys.stderr)
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# Post-clean audit
+# ---------------------------------------------------------------------------
+
+def _default_audit_argv_prefix() -> list[str]:
+    return [sys.executable, "-m", "clean_eeg.audit.cli"]
+
+
+def audit_one_subject(output_path: str, *,
+                       argv_prefix: list[str] | None = None,
+                       stream_output: bool = True,
+                       ) -> tuple[int, float, str | None]:
+    """Shell out to ``audit-subject-eeg <output_path>``. Returns
+    ``(exit_code, elapsed_s, error_tail)``. The audit CLI exits 0 on
+    'pass' and nonzero on 'fail' or any exception -- see
+    :mod:`clean_eeg.audit.cli`.
+    """
+    argv = (argv_prefix or _default_audit_argv_prefix()) + [output_path]
+    start = time.perf_counter()
+    try:
+        if stream_output:
+            proc = subprocess.run(argv)
+            err_tail = None
+        else:
+            proc = subprocess.run(argv, capture_output=True, text=True)
+            err_tail = ((proc.stderr or proc.stdout or "").strip()[-1000:]
+                        if proc.returncode != 0 else None)
+        exit_code = proc.returncode
+    except (subprocess.SubprocessError, OSError) as e:
+        exit_code = 255
+        err_tail = f"{type(e).__name__}: {e}"
+    return exit_code, time.perf_counter() - start, err_tail
+
+
+# ---------------------------------------------------------------------------
 # Batch runner
 # ---------------------------------------------------------------------------
 
@@ -192,12 +264,15 @@ def run_batch(rows: list[SubjectRow], *,
               extra_argv: list[str] | None = None,
               argv_prefix: list[str] | None = None,
               stream_output: bool = True,
+              audit_after_clean: bool = False,
+              audit_argv_prefix: list[str] | None = None,
               ) -> list[SubjectOutcome]:
     """Iterate ``rows`` sequentially, calling :func:`clean_one_subject`
-    on each. Prints a header before each subject so an operator can
-    match streamed output to the row it belongs to. Continues past
-    per-subject failures; caller reads the returned list to detect
-    them and decide the process exit code.
+    on each. If ``audit_after_clean``, runs ``audit-subject-eeg`` on
+    the output_path after a successful clean; audit failures roll up
+    into the SubjectOutcome and count against the batch exit code.
+    Continues past per-subject failures; caller reads the returned
+    list to decide the process exit code.
     """
     outcomes: list[SubjectOutcome] = []
     total = len(rows)
@@ -209,27 +284,56 @@ def run_batch(rows: list[SubjectRow], *,
         outcome = clean_one_subject(
             row, extra_argv=extra_argv, argv_prefix=argv_prefix,
             stream_output=stream_output)
+
+        if audit_after_clean and outcome.clean_succeeded:
+            print(f"\n--- audit {row.subject_code} ---", flush=True)
+            code, elapsed, err = audit_one_subject(
+                row.output_path,
+                argv_prefix=audit_argv_prefix,
+                stream_output=stream_output)
+            outcome.audit_exit_code = code
+            outcome.audit_elapsed_s = elapsed
+            outcome.audit_error_message = err
+
         outcomes.append(outcome)
         status = "OK " if outcome.succeeded else "FAIL"
+        aud = ""
+        if outcome.audit_exit_code is not None:
+            aud = (f"  audit_exit={outcome.audit_exit_code} "
+                   f"({outcome.audit_elapsed_s:.1f} s)")
         print(f"[{row.row_index}/{total}] {status} {row.subject_code}  "
-              f"({outcome.elapsed_s:.1f} s, exit={outcome.exit_code})",
-              flush=True)
+              f"(clean {outcome.elapsed_s:.1f} s, "
+              f"exit={outcome.exit_code}){aud}", flush=True)
     return outcomes
 
 
 def _print_summary(outcomes: list[SubjectOutcome]) -> None:
     n_ok = sum(1 for o in outcomes if o.succeeded)
     n_fail = len(outcomes) - n_ok
-    total_s = sum(o.elapsed_s for o in outcomes)
+    clean_only_s = sum(o.elapsed_s for o in outcomes)
+    audit_s = sum(o.audit_elapsed_s or 0 for o in outcomes)
+    total_s = clean_only_s + audit_s
     print(f"\n=== CLEAN BATCH SUMMARY  ({total_s:.1f} s total wall time) ===")
     print(f"  attempted:  {len(outcomes)}")
     print(f"  succeeded:  {n_ok}")
     print(f"  failed:     {n_fail}")
+    if audit_s:
+        print(f"  clean time: {clean_only_s:.1f} s   "
+              f"audit time: {audit_s:.1f} s")
     for o in outcomes:
-        if not o.succeeded:
+        if o.succeeded:
+            continue
+        if not o.clean_succeeded:
             err_tail = (o.error_message or "").splitlines()[-1:]
-            print(f"  FAIL row {o.row_index} {o.subject_code}: "
-                  f"exit={o.exit_code} :: {err_tail[0] if err_tail else ''}")
+            print(f"  FAIL row {o.row_index} {o.subject_code} [clean]: "
+                  f"exit={o.exit_code} :: "
+                  f"{err_tail[0] if err_tail else ''}")
+        else:
+            # clean passed, audit failed
+            err_tail = (o.audit_error_message or "").splitlines()[-1:]
+            print(f"  FAIL row {o.row_index} {o.subject_code} [audit]: "
+                  f"exit={o.audit_exit_code} :: "
+                  f"{err_tail[0] if err_tail else ''}")
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +360,18 @@ def _build_parser() -> argparse.ArgumentParser:
                          "1000 chars of any failure appear. Useful for "
                          "unattended runs where the terminal is not being "
                          "watched."))
+    p.add_argument("--only-subjects", nargs="+", default=None,
+                   metavar="SUBJECT_CODE",
+                   help=("Run only the listed subject codes (matched "
+                         "against the CSV's subject_code column). Useful "
+                         "for smoke-testing one subject before releasing "
+                         "the whole batch. Warns if any listed code did "
+                         "not match a row."))
+    p.add_argument("--audit-after-clean", action="store_true",
+                   help=("After each successful clean, invoke "
+                         "audit-subject-eeg against the output_path. "
+                         "Audit failures roll up into the subject's "
+                         "outcome and count against the batch exit code."))
     return p
 
 
@@ -279,9 +395,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"No subject rows found in {args.subjects_csv}", file=sys.stderr)
         return 1
 
+    rows = filter_rows_by_subject(rows, args.only_subjects)
+    if not rows:
+        print(f"No rows match --only-subjects {args.only_subjects}",
+              file=sys.stderr)
+        return 1
+
     outcomes = run_batch(
         rows, extra_argv=extra,
-        stream_output=not args.quiet_child_output)
+        stream_output=not args.quiet_child_output,
+        audit_after_clean=args.audit_after_clean)
     _print_summary(outcomes)
     return 0 if all(o.succeeded for o in outcomes) else 1
 

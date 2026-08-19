@@ -425,6 +425,23 @@ def _default_log_path(subjects_file: Path | None) -> Path:
     return Path.cwd() / "bulk_transfer.jsonl"
 
 
+def _filter_plans_by_subject(plans: list[SubjectPlan],
+                              only_subjects: list[str] | None,
+                              ) -> list[SubjectPlan]:
+    """Return the subset of ``plans`` whose ``subject_code`` matches
+    any entry in ``only_subjects``. None/empty picker -> return
+    unchanged. Warns for picker entries that matched zero plans."""
+    if not only_subjects:
+        return plans
+    picker = set(only_subjects)
+    kept = [p for p in plans if p.subject_code in picker]
+    unmatched = picker - {p.subject_code for p in kept}
+    if unmatched:
+        print(f"[warn] --only-subjects entries not found: "
+              f"{sorted(unmatched)}", file=sys.stderr)
+    return kept
+
+
 def run_bulk_transfer(subject_dirs: list[Path],
                       *,
                       ssh_user: str,
@@ -437,15 +454,22 @@ def run_bulk_transfer(subject_dirs: list[Path],
                       remote_dir_override: str | None = None,
                       log_path: Path | None = None,
                       subjects_file: Path | None = None,
+                      only_subjects: list[str] | None = None,
                       ) -> tuple[list[SubjectResult], list[tuple[Path, str]]]:
     """Drive the whole batch. Returns
     ``(subject_results, preflight_hard_failures)``.
+
+    ``only_subjects``: if non-empty, only transfer plans whose
+    subject_code matches. Preflight still runs against every path so
+    invalid dirs stay visible in ``preflight_hard_failures``; the
+    picker only filters the eligible-for-transfer queue.
 
     Prints periodic progress (subjects done / bytes done / ETA) and
     writes structured JSONL log entries alongside.
     """
     log_path = log_path or _default_log_path(subjects_file)
     ready, hard_failures = build_subject_plans(subject_dirs)
+    ready = _filter_plans_by_subject(ready, only_subjects)
 
     with EventLog(log_path) as log:
         log.emit("batch_start",
@@ -641,6 +665,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         "nohup so the batch survives SSH disconnect / logout. "
                         "Stdout+stderr stream to a .stdout.log alongside the "
                         "JSONL event log; tail -f it to watch progress.")
+    p.add_argument("--only-subjects", nargs="+", default=None,
+                   metavar="SUBJECT_CODE",
+                   help="Transfer only these subject codes (matched against "
+                        "each subject's manifest.subject_code). Useful for "
+                        "smoke-testing one subject before releasing the whole "
+                        "batch. Warns for entries that don't match any "
+                        "successful preflight.")
     return p
 
 
@@ -690,7 +721,15 @@ def main(argv: list[str] | None = None) -> int:
         remote_dir_override=args.remote_dir_override,
         log_path=args.log_path,
         subjects_file=args.subjects_file,
+        only_subjects=args.only_subjects,
     )
+    if args.only_subjects and not results and not hard_failures:
+        # Picker matched nothing (--only-subjects entries all typos or
+        # missing manifests). Don't silently exit 0 -- that would mask
+        # a smoke-test typo. run_bulk_transfer already warned on stderr.
+        print("[error] --only-subjects picker matched zero subjects; "
+              "check for typos.", file=sys.stderr)
+        return 1
     # Exit nonzero on any failure so a wrapping script (cron, batch
     # scheduler) can detect a batch that needs operator attention.
     all_ok = (all(r.succeeded for r in results) and not hard_failures)

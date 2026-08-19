@@ -35,6 +35,7 @@ from clean_eeg.bulk_transfer import (  # noqa: E402
     BwlimitPolicy,
     EventLog,
     SubjectPlan,
+    _filter_plans_by_subject,
     _inject_rsync_flags,
     _load_subject_paths,
     build_subject_plans,
@@ -654,3 +655,98 @@ def test_background_launch_writes_script_and_strips_background_flag(
     # nohup + start_new_session
     assert launched["argv"][0] == "nohup"
     assert launched["kwargs"].get("start_new_session") is True
+
+
+# ---------------------------------------------------------------------------
+# --only-subjects: subject-picker filter
+# ---------------------------------------------------------------------------
+
+def _fake_plan(code: str) -> SubjectPlan:
+    return SubjectPlan(subject_dir=Path("/i") / code, subject_code=code,
+                       site_incoming_folder="CUDA",
+                       transferable_bytes=100)
+
+
+def test_filter_plans_returns_all_when_picker_none():
+    plans = [_fake_plan("R1"), _fake_plan("R2")]
+    assert _filter_plans_by_subject(plans, None) == plans
+    assert _filter_plans_by_subject(plans, []) == plans
+
+
+def test_filter_plans_picks_only_listed_codes():
+    plans = [_fake_plan("R1755J"), _fake_plan("R1702J_1"),
+             _fake_plan("R1042J")]
+    picked = _filter_plans_by_subject(plans, ["R1702J_1"])
+    assert [p.subject_code for p in picked] == ["R1702J_1"]
+
+
+def test_filter_plans_warns_on_unmatched_picker_entry(capsys):
+    """Typo in --only-subjects must warn -- otherwise the operator's
+    'transfer one subject' smoke test silently transfers nothing."""
+    plans = [_fake_plan("R1755J")]
+    picked = _filter_plans_by_subject(plans, ["R1755J", "R9999Z"])
+    assert [p.subject_code for p in picked] == ["R1755J"]
+    err = capsys.readouterr().err
+    assert "R9999Z" in err
+    assert "not found" in err.lower()
+
+
+def test_run_bulk_transfer_only_subjects_scopes_workers_to_picked_code(
+        tmp_path, monkeypatch):
+    """End-to-end at the run_bulk_transfer level: one preflight-passing
+    subject, --only-subjects matches its code -> that plan reaches
+    the worker. This is the positive-path smoke test. The filter's
+    exclusion semantics (unmatched codes don't reach the worker) are
+    covered by the direct unit tests on _filter_plans_by_subject.
+    """
+    out = _make_subject_dir(tmp_path)
+
+    seen: list[str] = []
+
+    def stub_rsync(plan, *a, **k):
+        seen.append(plan.subject_code)
+        return 0, "", False
+
+    monkeypatch.setattr("clean_eeg.bulk_transfer._run_subject_rsync",
+                        stub_rsync)
+
+    results, hard = run_bulk_transfer(
+        [out], ssh_user="alice",
+        bwlimit_policy=_policy(day=None, night=None),
+        parallel=1, max_retries=1, rsync_timeout_s=15,
+        backoff_base_s=0, progress_interval_s=9999,
+        remote_dir_override=str(tmp_path / "dest"),
+        log_path=tmp_path / "events.jsonl",
+        only_subjects=["R1755A"],
+    )
+    assert hard == []
+    assert len(results) == 1
+    assert results[0].subject_code == "R1755A"
+    assert seen == ["R1755A"]
+
+
+def test_main_only_subjects_returns_nonzero_when_no_match(tmp_path,
+                                                           monkeypatch):
+    """Negative regression: --only-subjects R_NOT_A_SUBJECT must NOT
+    silently transfer the whole batch. Exit nonzero so the operator's
+    smoke test surfaces the typo."""
+    out = _make_subject_dir(tmp_path)
+    subjects_file = tmp_path / "subjects.txt"
+    subjects_file.write_text(str(out) + "\n")
+
+    monkeypatch.setattr(
+        "clean_eeg.bulk_transfer._run_subject_rsync",
+        lambda *a, **k: (0, "", False))
+
+    rc = main([
+        "--subjects-file", str(subjects_file),
+        "--user", "alice", "--parallel", "1",
+        "--max-retries", "1", "--backoff-base", "0",
+        "--remote-dir-override", str(tmp_path / "dest"),
+        "--only-subjects", "R_NOT_IN_ANY_MANIFEST",
+    ])
+    # Design: an empty picker result set (all entries typo'd or
+    # missing from manifests) MUST exit nonzero. Otherwise the
+    # operator's 'transfer one subject' smoke test would silently
+    # "succeed" while transferring nothing.
+    assert rc == 1
