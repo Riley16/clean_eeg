@@ -32,6 +32,7 @@ test = ["pytest"]
 [project.scripts]
 print-edf-header = "clean_eeg.print_edf_header:main"
 audit-subject-eeg = "clean_eeg.audit.cli:main"
+bandwidth-test-cml = "clean_eeg.bandwidth_test:main"
 transfer-subject-eeg = "clean_eeg.transfer_cli:main"
 
 [tool.setuptools]
