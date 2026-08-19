@@ -15,6 +15,7 @@ binary. All other tests stub subprocess to avoid network flakiness.
 
 from __future__ import annotations
 
+import csv
 import json
 import subprocess
 import sys
@@ -34,7 +35,10 @@ from test_transfer import (  # type: ignore  # noqa: E402
 from clean_eeg.bulk_transfer import (  # noqa: E402
     BwlimitPolicy,
     EventLog,
+    FAILED_CSV_COLUMNS,
+    FAILED_CSV_FILENAME,
     SubjectPlan,
+    SubjectResult,
     _filter_plans_by_subject,
     _inject_rsync_flags,
     _load_subject_paths,
@@ -42,6 +46,7 @@ from clean_eeg.bulk_transfer import (  # noqa: E402
     main,
     run_bulk_transfer,
     transfer_one_subject_with_retry,
+    write_failed_subjects_csv,
 )
 
 
@@ -750,3 +755,152 @@ def test_main_only_subjects_returns_nonzero_when_no_match(tmp_path,
     # operator's 'transfer one subject' smoke test would silently
     # "succeed" while transferring nothing.
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Failed-subjects CSV: post-batch review artifact
+# ---------------------------------------------------------------------------
+
+def _result(code, succeeded, attempts=1, last_exit=None, last_err=None):
+    return SubjectResult(
+        subject_code=code, subject_dir=f"/data/{code}",
+        attempts=attempts, succeeded=succeeded, elapsed_s=1.0,
+        last_exit_code=last_exit, last_error=last_err)
+
+
+def test_failed_csv_columns_match_the_public_constant(tmp_path):
+    """The CSV header is a documented contract -- downstream tooling
+    reads by column name. Regression guard so a future rename doesn't
+    break consumers silently."""
+    results = [_result("R1FAIL", succeeded=False, attempts=5,
+                        last_exit=23, last_err="rsync partial")]
+    path = tmp_path / FAILED_CSV_FILENAME
+    write_failed_subjects_csv(results, [], path)
+    with open(path) as f:
+        header = f.readline().strip().split(",")
+    assert tuple(header) == FAILED_CSV_COLUMNS
+
+
+def test_failed_csv_includes_both_failure_types(tmp_path):
+    """POSITIVE integration test: transfer_failed and preflight_failed
+    subjects both land in the CSV, with the correct failure_type tag."""
+    results = [
+        _result("R1OK", succeeded=True),
+        _result("R1FAIL", succeeded=False, attempts=5, last_exit=23,
+                last_err="all retries exhausted"),
+    ]
+    hard_failures = [
+        (Path("/data/R1BADPREFLIGHT"), "no manifest present"),
+    ]
+    path = tmp_path / FAILED_CSV_FILENAME
+    assert write_failed_subjects_csv(results, hard_failures, path) is True
+
+    with open(path) as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 2
+    by_type = {r["failure_type"]: r for r in rows}
+    assert "transfer_failed" in by_type
+    assert "preflight_failed" in by_type
+    # Successful subject R1OK MUST NOT appear (regression: a bug
+    # where a clean subject leaks into the failure list would waste
+    # the operator's review time and undermine trust in the CSV).
+    assert not any(r["subject_code"] == "R1OK" for r in rows)
+
+
+def test_failed_csv_transfer_fail_row_has_attempts_and_exit_code(tmp_path):
+    """transfer_failed rows carry attempts + last_exit_code so an
+    operator can distinguish 'network flake, retry-able' (exit 23)
+    from 'permission denied' (exit 11) at a glance."""
+    results = [_result("R1FAIL", succeeded=False, attempts=5,
+                        last_exit=23, last_err="rsync partial transfer")]
+    path = tmp_path / FAILED_CSV_FILENAME
+    write_failed_subjects_csv(results, [], path)
+    row = next(csv.DictReader(open(path)))
+    assert row["subject_code"] == "R1FAIL"
+    assert row["attempts"] == "5"
+    assert row["last_exit_code"] == "23"
+    assert "rsync partial transfer" in row["reason"]
+
+
+def test_failed_csv_preflight_row_leaves_attempts_and_exit_blank(tmp_path):
+    """Preflight failures never got to run rsync, so attempts and
+    last_exit_code MUST be blank (not '0', not 'None'). A '0' there
+    would falsely suggest the transfer ran and succeeded."""
+    hard_failures = [(Path("/data/R1BAD"), "manifest missing")]
+    path = tmp_path / FAILED_CSV_FILENAME
+    write_failed_subjects_csv([], hard_failures, path)
+    row = next(csv.DictReader(open(path)))
+    assert row["failure_type"] == "preflight_failed"
+    assert row["attempts"] == ""
+    assert row["last_exit_code"] == ""
+    assert "manifest missing" in row["reason"]
+
+
+def test_failed_csv_not_written_when_batch_fully_clean(tmp_path):
+    """NEGATIVE regression: no failures -> no CSV. An empty CSV would
+    be an ambiguous artifact ('did the batch fail with an empty error?
+    Or did it just succeed?'). The correct answer is: no file at all,
+    absence = success."""
+    results = [_result("R1OK1", succeeded=True),
+               _result("R1OK2", succeeded=True)]
+    path = tmp_path / FAILED_CSV_FILENAME
+    assert write_failed_subjects_csv(results, [], path) is False
+    assert not path.exists()
+
+
+def test_run_bulk_transfer_writes_failed_csv_alongside_log(tmp_path,
+                                                            monkeypatch):
+    """End-to-end at run_bulk_transfer level: a subject whose rsync
+    fails must produce failed_subject_transfer.csv in the same dir
+    as the JSONL event log."""
+    out = _make_subject_dir(tmp_path)
+
+    monkeypatch.setattr("clean_eeg.bulk_transfer._run_subject_rsync",
+                        lambda *a, **k: (23, "simulated failure", False))
+
+    log_path = tmp_path / "events.jsonl"
+    results, hard = run_bulk_transfer(
+        [out], ssh_user="alice",
+        bwlimit_policy=_policy(day=None, night=None),
+        parallel=1, max_retries=1, rsync_timeout_s=15,
+        backoff_base_s=0, progress_interval_s=9999,
+        remote_dir_override=str(tmp_path / "dest"),
+        log_path=log_path,
+    )
+    assert hard == []
+    assert not results[0].succeeded
+
+    csv_path = log_path.parent / FAILED_CSV_FILENAME
+    assert csv_path.exists(), (
+        "failed-subjects CSV must be written when there are failures")
+    rows = list(csv.DictReader(open(csv_path)))
+    assert len(rows) == 1
+    assert rows[0]["subject_code"] == "R1755A"
+    assert rows[0]["failure_type"] == "transfer_failed"
+
+
+def test_run_bulk_transfer_omits_failed_csv_on_clean_run(tmp_path,
+                                                          monkeypatch):
+    """End-to-end negative regression: fully-successful batch produces
+    NO failed-subjects CSV. Regression guard against a bug where the
+    CSV would always be created (an empty CSV in a green batch would
+    be a misleading artifact)."""
+    out = _make_subject_dir(tmp_path)
+
+    monkeypatch.setattr("clean_eeg.bulk_transfer._run_subject_rsync",
+                        lambda *a, **k: (0, "", False))
+
+    log_path = tmp_path / "events.jsonl"
+    results, hard = run_bulk_transfer(
+        [out], ssh_user="alice",
+        bwlimit_policy=_policy(day=None, night=None),
+        parallel=1, max_retries=1, rsync_timeout_s=15,
+        backoff_base_s=0, progress_interval_s=9999,
+        remote_dir_override=str(tmp_path / "dest"),
+        log_path=log_path,
+    )
+    assert hard == []
+    assert results[0].succeeded
+
+    csv_path = log_path.parent / FAILED_CSV_FILENAME
+    assert not csv_path.exists()

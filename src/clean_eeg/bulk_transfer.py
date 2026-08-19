@@ -27,6 +27,7 @@ needs to redo work already on the wire.
 from __future__ import annotations
 
 import argparse
+import csv
 import getpass
 import json
 import shlex
@@ -542,7 +543,15 @@ def run_bulk_transfer(subject_dirs: list[Path],
                  n_failed=len(results) - n_success,
                  n_preflight_failed=len(hard_failures),
                  elapsed_s=round(elapsed, 2))
-    _print_summary(results, hard_failures, elapsed)
+
+    # Write the review-friendly failed-subjects CSV alongside the
+    # JSONL log. Only created when there ARE failures -- an empty CSV
+    # in a fully-successful batch would be a misleading artifact.
+    failed_csv_path = log_path.parent / FAILED_CSV_FILENAME
+    csv_written = write_failed_subjects_csv(
+        results, hard_failures, failed_csv_path)
+    _print_summary(results, hard_failures, elapsed,
+                   failed_csv_path=failed_csv_path if csv_written else None)
     return results, hard_failures
 
 
@@ -562,7 +571,61 @@ def _print_progress(results, completed_bytes, *, total_bytes, n_total,
     )
 
 
-def _print_summary(results, hard_failures, elapsed) -> None:
+FAILED_CSV_FILENAME = "failed_subject_transfer.csv"
+
+FAILED_CSV_COLUMNS = ("subject_code", "subject_dir", "failure_type",
+                       "attempts", "last_exit_code", "reason")
+
+
+def write_failed_subjects_csv(results: list[SubjectResult],
+                               hard_failures: list[tuple[Path, str]],
+                               path: Path) -> bool:
+    """Write a review-friendly CSV of every subject the batch did NOT
+    successfully transfer. Two failure types are recorded:
+
+      * ``transfer_failed``: preflight passed but rsync exhausted all
+        retries. ``attempts`` / ``last_exit_code`` populated.
+      * ``preflight_failed``: never got scheduled (bad manifest,
+        unlisted PHI file, header mismatch, ...). ``attempts`` /
+        ``last_exit_code`` are blank; the reason string carries the
+        preflight diagnostic.
+
+    Returns True if the CSV was written (there were any failures),
+    False if the batch was fully clean (nothing written -- an empty
+    CSV would be misleading).
+    """
+    failed_transfers = [r for r in results if not r.succeeded]
+    if not failed_transfers and not hard_failures:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(FAILED_CSV_COLUMNS))
+        w.writeheader()
+        for r in failed_transfers:
+            w.writerow({
+                "subject_code": r.subject_code,
+                "subject_dir": r.subject_dir,
+                "failure_type": "transfer_failed",
+                "attempts": r.attempts,
+                "last_exit_code": (r.last_exit_code
+                                    if r.last_exit_code is not None else ""),
+                "reason": (r.last_error or "").strip(),
+            })
+        for subject_dir, reason in hard_failures:
+            w.writerow({
+                "subject_code": "",   # unknown -- preflight never got
+                                       # to read the manifest
+                "subject_dir": str(subject_dir),
+                "failure_type": "preflight_failed",
+                "attempts": "",
+                "last_exit_code": "",
+                "reason": reason.strip(),
+            })
+    return True
+
+
+def _print_summary(results, hard_failures, elapsed,
+                   failed_csv_path: Path | None = None) -> None:
     print(f"\n=== BULK TRANSFER SUMMARY ({_format_hms(elapsed)} elapsed) ===")
     n_success = sum(1 for r in results if r.succeeded)
     n_failed = len(results) - n_success
@@ -575,6 +638,8 @@ def _print_summary(results, hard_failures, elapsed) -> None:
                   f"last_exit={r.last_exit_code}, err={r.last_error}")
     for path, reason in hard_failures:
         print(f"  PREFLIGHT_FAIL {path}: {reason}")
+    if failed_csv_path is not None and (n_failed or hard_failures):
+        print(f"\n  Full failed-subjects CSV for review: {failed_csv_path}")
 
 
 def _format_hms(seconds: float) -> str:
