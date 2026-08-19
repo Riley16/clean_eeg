@@ -134,14 +134,32 @@ def update_edf_header_inplace(edf_path: str,
 
 
 def validate_header_roundtrip(header: dict, signal_headers: list = None) -> list[str]:
-    """Check for pyedflib truncation by doing a dry-run header write.
+    """Check the redacted header round-trips cleanly through pyedflib.
 
-    Returns a list of warning strings for any fields that would be truncated.
-    pyedflib packs multiple fields into the 80-byte patient_id and recording_id
-    EDF fields, so per-field byte limits can't be checked in isolation.
+    Two-step validation:
+      1. Dry-run WRITE: emit a temp EDF+ using pyedflib.EdfWriter with
+         the given header + signal_headers. Warnings raised during
+         write (typically field truncation — pyedflib packs multiple
+         subfields into the 80-byte patient_id / recording_id slots)
+         are captured and returned.
+      2. Dry-run READ-BACK: open the same temp file with
+         pyedflib.EdfReader. Catches the case where pyedflib accepts
+         the header on write but its own read-side strict validator
+         rejects it -- rare but real, and the whole point of catching
+         these BEFORE overwriting the real data.
+
+    The read-back requires at least one data record to satisfy
+    pyedflib's ``EDFLIB_FILE_ERRORS_NUMBER_DATARECORDS`` check, so we
+    write exactly one record of zeros per channel. For a 178-channel
+    NK export at ~150 spr that's ~53 KB / file — cost < 1 s.
+
+    Returns a list of warning / error strings. Empty list = clean.
     """
     import tempfile
     import warnings as warnings_module
+
+    import numpy as np
+
     result = []
     n_channels = len(signal_headers) if signal_headers else 0
     with tempfile.NamedTemporaryFile(suffix='.edf', delete=False) as tmp:
@@ -153,11 +171,50 @@ def validate_header_roundtrip(header: dict, signal_headers: list = None) -> list
                 w.setHeader(header)
                 if signal_headers:
                     w.setSignalHeaders(signal_headers)
+                    # One record of zeros per channel. Length =
+                    # sample_frequency (pyedflib defaults record
+                    # duration to 1 s, so spr == sample_frequency).
+                    # ``digital=True`` skips the phys<->dig scaling
+                    # step, keeping the write bounded to the sample
+                    # count alone.
+                    dummy = [np.zeros(int(round(sh["sample_frequency"])),
+                                       dtype=np.int16)
+                             for sh in signal_headers]
+                    w.writeSamples(dummy, digital=True)
         for w in caught:
             result.append(str(w.message))
+        # READ-BACK: any OSError here means pyedflib refuses to open
+        # what pyedflib just wrote. Best diagnosable pre-overwrite.
+        try:
+            with pyedflib.EdfReader(tmp_path):
+                pass
+        except OSError as e:
+            result.append(
+                "pyedflib refused to open its own dry-run write of "
+                f"the redacted header: {e}"
+            )
     finally:
         os.remove(tmp_path)
     return result
+
+
+def verify_output_edf_loadable(path: str) -> str | None:
+    """Post-write validation: open the just-written cleaned file with
+    pyedflib.EdfReader. Returns ``None`` on success, or a diagnostic
+    string on failure (never raises).
+
+    Catches the case where in-place header patches + annotation-channel
+    clearing produce a file that our own dry-run couldn't foresee --
+    e.g., the sidecar operations touched something in a way pyedflib's
+    strict validator now rejects. Cost = one header parse + filesize
+    check, typically < 50 ms per file even on multi-GB NK recordings
+    (pyedflib does NOT read the signal data on open).
+    """
+    try:
+        with pyedflib.EdfReader(path):
+            return None
+    except OSError as e:
+        return str(e)
 
 
 def create_annotations_only_edf(path: str,

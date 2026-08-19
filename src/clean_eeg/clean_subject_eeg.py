@@ -26,6 +26,7 @@ from clean_eeg.modify_edf_inplace import (
     clear_edf_annotations_inplace,
     create_annotations_only_edf,
     validate_header_roundtrip,
+    verify_output_edf_loadable,
 )
 from clean_eeg.paths import ANNOTATION_BOILERPLATE_WHITELIST_PATH
 
@@ -519,6 +520,24 @@ def clean_subject_edf_files(
             # (redactions/quarantined counters) — dropping the old
             # scrolling 'Cleaned EDF file at:' line keeps the terminal
             # legible on multi-file subjects.
+
+            # POST-WRITE VALIDATION: confirm pyedflib can re-open the
+            # just-written cleaned file. Closes the gap where the
+            # pre-write dry-run passed but the actual in-place patches
+            # (update_edf_header_inplace + clear_edf_annotations_inplace)
+            # produced a file that pyedflib's strict validator rejects.
+            # Cost is a single header parse + filesize check (~50 ms).
+            # Failure raises so the outer try/except quarantines the
+            # broken output and records it in failed_files -- exactly
+            # what happens for any other per-file cleaning failure.
+            with bench.step("verify_output_loadable", file=filename):
+                verify_err = verify_output_edf_loadable(clean_full_path)
+            if verify_err is not None:
+                raise RuntimeError(
+                    f"post-write validation failed: pyedflib refuses to "
+                    f"open the cleaned output ({verify_err}). The file "
+                    "was written but is not EDF+-compliant; quarantining."
+                )
 
             # Audit signal integrity immediately after write
             if filename in audit_filenames:

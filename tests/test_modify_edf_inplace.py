@@ -361,6 +361,42 @@ def test_validate_header_roundtrip_truncation_warning(base_edf):
     assert any('80 chars' in w for w in result)
 
 
+def test_validate_header_roundtrip_read_back_succeeds(base_edf):
+    """New in the read-back check: with signal_headers passed, the
+    helper writes a one-record dummy EDF+ and confirms pyedflib can
+    RE-OPEN it. On a clean fixture this yields no warnings and no
+    read-side complaints.
+    """
+    with pyedflib.EdfReader(base_edf) as f:
+        header = f.getHeader()
+        signal_headers = [f.getSignalHeader(i) for i in range(f.signals_in_file)]
+    result = validate_header_roundtrip(header, signal_headers)
+    assert result == [], f"Unexpected warnings/errors: {result}"
+    # Negative regression: none of the returned strings mention read-back
+    # failure (the string the read-back path would emit).
+    assert not any("refused to open" in r for r in result)
+
+
+def test_verify_output_edf_loadable_positive(base_edf):
+    """Positive: a valid EDF file returns ``None`` from
+    ``verify_output_edf_loadable`` (pyedflib opens it cleanly)."""
+    from clean_eeg.modify_edf_inplace import verify_output_edf_loadable
+    assert verify_output_edf_loadable(base_edf) is None
+
+
+def test_verify_output_edf_loadable_negative(tmp_path):
+    """Negative: a non-EDF byte blob at the same path returns a
+    diagnostic string. Never raises -- the pipeline's outer try/except
+    turns the returned message into a quarantine + failed_files entry.
+    """
+    from clean_eeg.modify_edf_inplace import verify_output_edf_loadable
+    bad = tmp_path / "not_edf.edf"
+    bad.write_bytes(b"this is not an EDF file at all" * 20)  # >256 bytes so it clears the min-size check
+    err = verify_output_edf_loadable(str(bad))
+    assert err is not None
+    assert "EDF" in err or "compliant" in err or "format" in err.lower(), err
+
+
 # ======================
 # Test 8: merge annotation stub roundtrip
 # ======================
