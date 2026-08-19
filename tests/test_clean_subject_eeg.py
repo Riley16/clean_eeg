@@ -1288,6 +1288,80 @@ def test_force_flag_bypasses_completion_marker(tmp_path, monkeypatch, capsys):
     )
 
 
+def test_fail_on_name_mismatch_raises_without_prompt(tmp_path, monkeypatch):
+    """HARD REQUIREMENT: with --fail-on-name-mismatch, a subject whose
+    EDF patientname doesn't match the CLI-supplied name must abort
+    the pipeline with RuntimeError -- NO interactive prompt, no
+    'yes' escape hatch.
+
+    Guards against the batch-run failure mode where an unattended
+    run would either hang on input() or (worse) an operator at the
+    terminal accidentally types 'yes' and lets a mismatched subject
+    through the de-identification pipeline.
+    """
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    _write_minimal_edfplus_with_annotations(str(input_dir / "f.edf"),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+
+    # If input() ever gets called under --fail-on-name-mismatch, this
+    # stub explodes loudly. That's the whole point of the flag.
+    def _explode(_):
+        raise AssertionError(
+            "fail-on-name-mismatch must NOT call the interactive prompt")
+    monkeypatch.setattr("builtins.input", _explode)
+
+    # Deliberate mismatch: EDF fixture has patientname='Jane Ann Doe'
+    # (from tests/test_clean_subject_eeg.py::PATIENT_NAME); we pass a
+    # different name via CLI.
+    wrong_name = PersonalName(first_name="Wrong",
+                                middle_names=[""],
+                                last_name="Person")
+
+    with pytest.raises(RuntimeError,
+                        match=r"--fail-on-name-mismatch"):
+        clean_subject_edf_files(
+            input_path=str(input_dir),
+            output_path=str(input_dir),
+            subject_code=SUBJECT_CODE,
+            subject_name=wrong_name,
+            inplace=True,
+            raise_errors=True,
+            fail_on_name_mismatch=True,
+        )
+
+
+def test_fail_on_name_mismatch_still_allows_matching_names(tmp_path,
+                                                            monkeypatch):
+    """Negative regression: the flag must NOT reject subjects whose
+    names DO match. Otherwise it'd nuke the whole batch instead of
+    just the mismatched entries."""
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    _write_minimal_edfplus_with_annotations(str(input_dir / "f.edf"),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+
+    responses = iter([])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+
+    # Matches PATIENT_NAME used by the fixture builder.
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=True,
+        fail_on_name_mismatch=True,
+        auto_transfer_response="n",
+    )
+    # If we got here, the flag correctly did not reject the matching name.
+
+
 def test_skip_if_already_cleaned_bypasses_prompt(tmp_path, monkeypatch,
                                                   capsys):
     """--skip-if-already-cleaned must exit cleanly WITHOUT calling the

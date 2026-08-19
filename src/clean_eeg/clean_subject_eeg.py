@@ -323,6 +323,7 @@ def clean_subject_edf_files(
     approve_confirmations: Union[set, None] = None,
     quiet_gap_check: bool = False,
     skip_if_already_cleaned: bool = False,
+    fail_on_name_mismatch: bool = False,
 ):
     if approve_confirmations is None:
         approve_confirmations = set()
@@ -372,7 +373,8 @@ def clean_subject_edf_files(
     _validate_EDF_meta_data(EDF_meta_data, subject_name=subject_name, verbosity=verbosity,
                             skip_header_name_check=skip_header_name_check,
                             approve_confirmations=approve_confirmations,
-                            quiet_gap_check=quiet_gap_check)
+                            quiet_gap_check=quiet_gap_check,
+                            fail_on_name_mismatch=fail_on_name_mismatch)
     min_start_time = _get_start_time_earliest_recording(EDF_meta_data, verbosity=verbosity)
 
     # Select files for signal integrity audit. When skip_audit is True,
@@ -1136,7 +1138,8 @@ def _get_start_time_earliest_recording(EDF_meta_data: dict, verbosity: int = 0) 
 def _validate_EDF_meta_data(EDF_meta_data: dict, subject_name: Union[PersonalName, None],
                             verbosity: int = 0, skip_header_name_check: bool = False,
                             approve_confirmations: Union[set, None] = None,
-                            quiet_gap_check: bool = False):
+                            quiet_gap_check: bool = False,
+                            fail_on_name_mismatch: bool = False):
     if approve_confirmations is None:
         approve_confirmations = set()
     _check_recording_gaps(EDF_meta_data,
@@ -1148,7 +1151,8 @@ def _validate_EDF_meta_data(EDF_meta_data: dict, subject_name: Union[PersonalNam
               "(--skip_header_name_check). Name redaction will still run against all header fields.")
     else:
         _check_subject_name_consistency(EDF_meta_data, command_line_subject_name=subject_name,
-                                        verbosity=verbosity)
+                                        verbosity=verbosity,
+                                        fail_on_name_mismatch=fail_on_name_mismatch)
     _check_signal_header_consistency(EDF_meta_data, verbosity=verbosity)
 
 
@@ -1232,7 +1236,23 @@ def is_all_X_with_spaces(s: str) -> bool:
 
 
 def _check_subject_name_consistency(EDF_meta_data: dict, command_line_subject_name: Union[PersonalName, None],
-                                    verbosity: int = 0):
+                                    verbosity: int = 0,
+                                    fail_on_name_mismatch: bool = False):
+    """Two checks:
+      (1) all EDF files in the folder share the same patientname
+      (2) that shared patientname matches the CLI-supplied name
+
+    Default behavior on either mismatch is an interactive
+    ``yes/no`` prompt to let the operator confirm-and-continue --
+    useful when the two names differ only in punctuation / order.
+
+    When ``fail_on_name_mismatch=True`` both mismatches turn into
+    hard ``RuntimeError`` with no prompt. Intended for headless
+    batch runs where an interactive prompt would hang OR let a
+    real mismatch slip through if the operator accidentally types
+    'yes'. ``clean-batch-eeg`` forwards this via ``--`` for its
+    unattended-safe mode.
+    """
     subject_names = dict()
     for filename, edf in EDF_meta_data.items():
         data = edf['data']
@@ -1246,24 +1266,46 @@ def _check_subject_name_consistency(EDF_meta_data: dict, command_line_subject_na
             files_with_name = [fname for fname, sname in subject_names.items() if sname == name]
             print(f'Subject name "{name}" found in files: {files_with_name}')
         print("This may indicate multiple subjects are included in the same EDF data folder, which should not be the case.")
+        if fail_on_name_mismatch:
+            raise RuntimeError(
+                "Aborting EDF de-identification: multiple unique "
+                "patientname values across the subject's EDF files "
+                "and --fail-on-name-mismatch is set.")
         continue_input = logged_input("Continue? (only continue if names are indeed from the same subject for data integrity) yes/no: ")
         if continue_input.lower() not in ['yes', 'y']:
             raise RuntimeError("Aborting EDF de-identification conversion due to inconsistent subject names.")
     elif len(unique_names) < 1:
         raise RuntimeError("No subject names found in EDF files.")
-    
+
     if command_line_subject_name is not None:
         command_line_subject_name_str = command_line_subject_name.get_full_name()
         continue_input = 'yes'
+        mismatch = False
         if len(unique_names) == 1:
             subject_name = unique_names.pop()
             if (not is_all_X_with_spaces(subject_name)) and (subject_name != command_line_subject_name_str):
+                mismatch = True
+                if fail_on_name_mismatch:
+                    raise RuntimeError(
+                        f"Aborting EDF de-identification: EDF "
+                        f"patientname ({subject_name!r}) does not "
+                        f"match CLI-supplied name "
+                        f"({command_line_subject_name_str!r}) and "
+                        f"--fail-on-name-mismatch is set.")
                 continue_input = logged_input(f'Confirm that subject name in EDF files ("{subject_name}") matches '
                                        f'subject name specified by command line ("{command_line_subject_name_str}"): yes/no: ')
         elif (len(unique_names) > 1) and not all(is_all_X_with_spaces(subject_name) for subject_name in unique_names):
+            mismatch = True
+            if fail_on_name_mismatch:
+                raise RuntimeError(
+                    f"Aborting EDF de-identification: EDF "
+                    f"patientnames ({unique_names}) do not match "
+                    f"CLI-supplied name "
+                    f"({command_line_subject_name_str!r}) and "
+                    f"--fail-on-name-mismatch is set.")
             continue_input = logged_input(f'Confirm that subject names in EDF files ({unique_names}) match '
                                    f'subject name specified by command line ("{command_line_subject_name_str}"): yes/no: ')
-        if continue_input.lower() not in ['yes', 'y']:
+        if mismatch and continue_input.lower() not in ['yes', 'y']:
             raise RuntimeError("Aborting EDF de-identification conversion due to inconsistent subject names.")
 
 
@@ -1421,6 +1463,17 @@ def get_clean_eeg_cli_arguments():
                              "New confirmation types must be added to `choices` explicitly, "
                              "forcing per-type opt-in. Available: 'wipe-annotations', "
                              "'recording-gaps'.")
+    parser.add_argument("--fail-on-name-mismatch",
+                        "--fail_on_name_mismatch",
+                        dest="fail_on_name_mismatch", action="store_true",
+                        help="Turn the EDF-patientname vs CLI-name "
+                             "consistency check into a hard failure "
+                             "with no interactive prompt. Recommended "
+                             "for headless batch runs where the "
+                             "default prompt would either hang or let "
+                             "a real mismatch slip through if the "
+                             "operator accidentally types 'yes'. "
+                             "clean-batch-eeg forwards this via '--'.")
     parser.add_argument("--skip-if-already-cleaned",
                         "--skip_if_already_cleaned",
                         dest="skip_if_already_cleaned", action="store_true",
@@ -1587,6 +1640,7 @@ if __name__ == "__main__":
             approve_confirmations=set(args.approve_confirmations),
             quiet_gap_check=args.quiet_gap_check,
             skip_if_already_cleaned=args.skip_if_already_cleaned,
+            fail_on_name_mismatch=args.fail_on_name_mismatch,
         )
 
     except Exception:

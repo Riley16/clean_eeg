@@ -594,6 +594,46 @@ def test_audit_skipped_when_clean_fails(tmp_path, monkeypatch):
         "audit must NOT run when clean fails")
 
 
+def test_batch_flags_name_mismatch_subject_as_fail(tmp_path, monkeypatch):
+    """HARD REQUIREMENT: if a subject's EDF patientname doesn't match
+    the CSV-supplied name, that subject MUST be flagged as FAIL in
+    the batch summary and the batch exit code MUST be nonzero.
+
+    Simulated via a stub clean_subject_eeg that exits nonzero when
+    the --first_name arg doesn't match a known-good value -- the
+    real check lives in clean_subject_eeg.py and is proven separately
+    by test_fail_on_name_mismatch_raises_without_prompt. This test
+    proves the exit code propagates through the batch wrapper to
+    become a per-subject FAIL, so the batch operator can never
+    accidentally transfer a name-mismatched subject.
+    """
+    csv_path = tmp_path / "s.csv"
+    _write_csv(csv_path, [_valid_row("R1", middle="")])
+    # The row's first_name is 'John' (from _valid_row). We simulate
+    # clean_subject_eeg's name-mismatch failure by making the stub
+    # exit nonzero only when it sees 'John'.
+    stub = tmp_path / "namefail.py"
+    stub.write_text(
+        "import sys\n"
+        "argv = sys.argv[1:]\n"
+        "i = argv.index('--first_name') + 1\n"
+        "if argv[i] == 'John':\n"
+        "    sys.stderr.write('name-mismatch: EDF says X, CLI says John\\n')\n"
+        "    sys.exit(2)  # simulate --fail-on-name-mismatch RuntimeError\n"
+        "sys.exit(0)\n"
+    )
+    argv_prefix = [sys.executable, str(stub)]
+    monkeypatch.setattr(
+        "clean_eeg.clean_batch._default_clean_argv_prefix",
+        lambda: argv_prefix)
+
+    rc = main(["--subjects-csv", str(csv_path), "--quiet-child-output"])
+
+    assert rc == 1, (
+        "batch exit code must be nonzero when a subject fails "
+        "(would otherwise let a name-mismatched subject through)")
+
+
 def test_audit_flag_off_by_default_skips_audit(tmp_path, monkeypatch):
     """Negative regression: without --audit-after-clean, audit MUST
     NOT run even if the audit stub is trivially available. Guards
