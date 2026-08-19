@@ -35,6 +35,7 @@ audit-subject-eeg = "clean_eeg.audit.cli:main"
 bandwidth-test-cml = "clean_eeg.bandwidth_test:main"
 transfer-subject-eeg = "clean_eeg.transfer_cli:main"
 bulk-transfer-eeg = "clean_eeg.bulk_transfer:main"
+clean-batch-eeg = "clean_eeg.clean_batch:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
