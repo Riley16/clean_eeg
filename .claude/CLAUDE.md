@@ -56,6 +56,8 @@ data/                   # Whitelists, name datasets (gitignored)
 4. For each file: redact header fields, redact annotations, write output
 5. Optional in-place mode: modify headers in original file + create separate annotation stub
 
+**Idempotence.** The pipeline writes `deidentify.json` (the manifest) only at successful completion. Re-invoking on the same output directory detects that marker and short-circuits: the default interactive path prompts "Skip to transfer? [Y/n]", `--force` re-runs from scratch, `--skip-if-already-cleaned` exits 0 with one info line (the headless-safe option — `clean-batch-eeg` forwards this via `--` so batch re-runs after fixing failed subjects don't re-clean successful ones). A pipeline crash mid-run leaves no manifest, so the next invocation starts fresh.
+
 ### Name Redaction (anonymize.py)
 Three-layer approach using Presidio:
 1. **Exact match** — deny-list with punctuation/possessive variants

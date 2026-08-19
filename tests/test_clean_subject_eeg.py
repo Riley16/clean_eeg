@@ -1288,6 +1288,103 @@ def test_force_flag_bypasses_completion_marker(tmp_path, monkeypatch, capsys):
     )
 
 
+def test_skip_if_already_cleaned_bypasses_prompt(tmp_path, monkeypatch,
+                                                  capsys):
+    """--skip-if-already-cleaned must exit cleanly WITHOUT calling the
+    interactive skip-to-transfer prompt. This is what makes the
+    completion fast-path safe under headless batch runs (clean-batch-eeg
+    forwards this flag via `--`); the default prompt would hang on
+    stdin=/dev/null.
+    """
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    _write_minimal_edfplus_with_annotations(str(input_dir / "f.edf"),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+
+    # Prime with one clean run so the manifest exists.
+    responses = iter([])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=True,
+        auto_transfer_response="n",
+    )
+
+    # Second invocation with --skip-if-already-cleaned must NOT reach
+    # _maybe_skip_to_transfer (which would prompt) AND must NOT reach
+    # _invoke_transfer (which would upload without operator consent).
+    import clean_eeg.clean_subject_eeg as _csm
+    prompt_calls = []
+    transfer_calls = []
+    monkeypatch.setattr(_csm, "_maybe_skip_to_transfer",
+                        lambda path, auto_response=None: prompt_calls.append(path))
+    monkeypatch.setattr(_csm, "_invoke_transfer",
+                        lambda path: transfer_calls.append(path))
+    # If the prompt path ever fires, this input stub blows up loudly.
+    def _explode(_):
+        raise AssertionError("skip-if-already-cleaned must not prompt")
+    monkeypatch.setattr("builtins.input", _explode)
+
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=True,
+        skip_if_already_cleaned=True,
+    )
+    assert prompt_calls == [], (
+        "--skip-if-already-cleaned must not call the interactive "
+        "skip-to-transfer prompt")
+    assert transfer_calls == [], (
+        "--skip-if-already-cleaned must not auto-invoke transfer; "
+        "that's the batch operator's responsibility")
+    out = capsys.readouterr().out
+    assert "skip-if-already-cleaned" in out, (
+        "output must announce the skip so the operator can see it "
+        f"in the batch log; got: {out!r}")
+
+
+def test_skip_if_already_cleaned_still_runs_when_no_manifest(tmp_path,
+                                                              monkeypatch):
+    """Negative regression: --skip-if-already-cleaned must NOT become
+    a global no-op. When no manifest exists (fresh subject), the flag
+    is silent and the pipeline proceeds normally. Otherwise an operator
+    who batches with the flag would inadvertently skip subjects that
+    have never been cleaned."""
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    _write_minimal_edfplus_with_annotations(str(input_dir / "f.edf"),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+    responses = iter([])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+
+    from clean_eeg.deidentify_manifest import manifest_exists
+    assert not manifest_exists(input_dir)
+
+    clean_subject_edf_files(
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        subject_code=SUBJECT_CODE,
+        subject_name=PATIENT_NAME,
+        inplace=True,
+        raise_errors=True,
+        skip_if_already_cleaned=True,
+        auto_transfer_response="n",
+    )
+    # Full pipeline ran, so a manifest now exists.
+    assert manifest_exists(input_dir)
+
+
 def test_interrupted_run_leaves_no_manifest(tmp_path, monkeypatch, capsys):
     """If the pipeline raises mid-loop, no deidentify.json is written —
     so a subsequent re-invocation starts fresh rather than false-positive

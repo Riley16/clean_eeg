@@ -322,6 +322,7 @@ def clean_subject_edf_files(
     recursive: bool = False,
     approve_confirmations: Union[set, None] = None,
     quiet_gap_check: bool = False,
+    skip_if_already_cleaned: bool = False,
 ):
     if approve_confirmations is None:
         approve_confirmations = set()
@@ -335,6 +336,10 @@ def clean_subject_edf_files(
     # deidentify.json to output_path. Presence == de-id done. Offer to
     # skip straight to transfer unless --force says re-run from scratch.
     if not force and manifest_exists(output_path):
+        if skip_if_already_cleaned:
+            print(f"[skip-if-already-cleaned] {output_path}: "
+                  f"deidentify.json present, treating as done.")
+            return
         _maybe_skip_to_transfer(output_path,
                                 auto_response=auto_transfer_response)
         return
@@ -1416,6 +1421,16 @@ def get_clean_eeg_cli_arguments():
                              "New confirmation types must be added to `choices` explicitly, "
                              "forcing per-type opt-in. Available: 'wipe-annotations', "
                              "'recording-gaps'.")
+    parser.add_argument("--skip-if-already-cleaned",
+                        "--skip_if_already_cleaned",
+                        dest="skip_if_already_cleaned", action="store_true",
+                        help="If deidentify.json already exists in the "
+                             "output directory, print one info line and "
+                             "exit 0 without prompting or transferring. "
+                             "Intended for headless batch runs where the "
+                             "interactive 'Skip to transfer?' prompt would "
+                             "hang. Complementary to --force (which is "
+                             "'re-run from scratch even if manifest exists').")
     parser.add_argument("--quiet-gap-check", "--quiet_gap_check",
                         dest="quiet_gap_check", action="store_true",
                         help="Silence AND auto-approve the recording-gap check. "
@@ -1571,6 +1586,7 @@ if __name__ == "__main__":
             recursive=args.recursive,
             approve_confirmations=set(args.approve_confirmations),
             quiet_gap_check=args.quiet_gap_check,
+            skip_if_already_cleaned=args.skip_if_already_cleaned,
         )
 
     except Exception:
