@@ -260,6 +260,127 @@ def execute_plan(plan: RenamePlan, from_code: str, to_code: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic mode: report pyedflib compatibility per file without mutating
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DiagnosticRow:
+    """Per-file result of the read-only diagnostic pass."""
+    path: Path
+    size_bytes: int
+    byte_patientcode: str | None       # None means byte-read failed
+    byte_error: str | None             # populated iff byte-read failed
+    pyedflib_ok: bool
+    pyedflib_error: str | None         # populated iff pyedflib failed
+    pyedflib_patientcode: str | None   # populated iff pyedflib OK
+
+
+def diagnose_edf_file(edf_path: Path) -> DiagnosticRow:
+    """Read-only probe: try both the byte-level primitive AND
+    pyedflib.EdfReader on ``edf_path``. Neither raises; failures are
+    captured into the returned row. Enables the operator to see
+    exactly what pyedflib complains about before committing to any
+    byte-level mutation.
+    """
+    try:
+        size = edf_path.stat().st_size
+    except OSError as e:
+        return DiagnosticRow(
+            path=edf_path, size_bytes=-1,
+            byte_patientcode=None, byte_error=f"{type(e).__name__}: {e}",
+            pyedflib_ok=False,
+            pyedflib_error=f"{type(e).__name__}: {e}",
+            pyedflib_patientcode=None)
+
+    byte_code: str | None = None
+    byte_err: str | None = None
+    try:
+        byte_code = _read_patientcode_from_bytes(edf_path)
+    except (OSError, ValueError, KeyError, IndexError) as e:
+        byte_err = f"{type(e).__name__}: {e}"
+
+    import pyedflib
+    py_ok = False
+    py_err: str | None = None
+    py_code: str | None = None
+    try:
+        with pyedflib.EdfReader(str(edf_path)) as f:
+            py_ok = True
+            py_code = f.getHeader().get("patientcode", "") or ""
+    except (OSError, ValueError, RuntimeError) as e:
+        py_err = f"{type(e).__name__}: {e}"
+
+    return DiagnosticRow(
+        path=edf_path, size_bytes=size,
+        byte_patientcode=byte_code, byte_error=byte_err,
+        pyedflib_ok=py_ok, pyedflib_error=py_err,
+        pyedflib_patientcode=py_code)
+
+
+def diagnose_subject_dir(subject_dir: Path) -> list[DiagnosticRow]:
+    """Run :func:`diagnose_edf_file` on every ``.edf`` under
+    ``subject_dir`` (recursive). Returns rows in sorted-path order."""
+    if not subject_dir.exists():
+        raise FileNotFoundError(f"{subject_dir} does not exist")
+    edfs = sorted(subject_dir.rglob("*.edf"))
+    return [diagnose_edf_file(p) for p in edfs]
+
+
+def _print_diagnostic_report(rows: list[DiagnosticRow],
+                              subject_dir: Path) -> None:
+    """Human-readable table + summary. If ALL files fail pyedflib with
+    the same exception message, that's almost always a systemic issue
+    (bad header field, format non-compliance) and worth calling out at
+    the top so an operator triaging hundreds of files sees it immediately.
+    """
+    print(f"\n=== Diagnostic report for {subject_dir} "
+          f"({len(rows)} .edf file(s)) ===\n")
+    if not rows:
+        print("  (no .edf files found)")
+        return
+
+    n_py_ok = sum(1 for r in rows if r.pyedflib_ok)
+    n_py_fail = len(rows) - n_py_ok
+    n_byte_ok = sum(1 for r in rows if r.byte_patientcode is not None)
+    n_byte_fail = len(rows) - n_byte_ok
+
+    print(f"pyedflib.EdfReader: {n_py_ok} ok / {n_py_fail} failed")
+    print(f"byte-level read:    {n_byte_ok} ok / {n_byte_fail} failed")
+
+    # Distinct pyedflib error signatures -- systemic failures cluster
+    unique_py_errors = sorted({r.pyedflib_error for r in rows
+                                if r.pyedflib_error})
+    if unique_py_errors:
+        print(f"\nDistinct pyedflib error signatures ({len(unique_py_errors)}):")
+        for err in unique_py_errors:
+            n = sum(1 for r in rows if r.pyedflib_error == err)
+            print(f"  ({n}x) {err}")
+
+    print(f"\n{'file':<40s}  {'size':>10s}  "
+          f"{'py':<3s}  {'byte_code':<15s}  py_error/note")
+    print("-" * 100)
+    for r in rows:
+        name = r.path.name
+        if len(name) > 40:
+            name = "..." + name[-37:]
+        code = (r.byte_patientcode if r.byte_patientcode is not None
+                else f"<{r.byte_error}>")
+        if len(code) > 15:
+            code = code[:12] + "..."
+        py_tag = "ok" if r.pyedflib_ok else "!!"
+        note = ""
+        if r.pyedflib_error:
+            note = r.pyedflib_error
+        elif r.pyedflib_ok and r.pyedflib_patientcode != r.byte_patientcode:
+            note = (f"disagreement: pyedflib="
+                    f"{r.pyedflib_patientcode!r}")
+        if len(note) > 60:
+            note = note[:57] + "..."
+        print(f"{name:<40s}  {r.size_bytes:>10d}  "
+              f"{py_tag:<3s}  {code:<15s}  {note}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -291,14 +412,40 @@ def main(argv=None) -> int:
                     "to commit.")
     p.add_argument("--subject-root", type=Path, required=True,
                    help="Parent dir containing per-subject folders")
-    p.add_argument("--from", dest="from_code", type=str, required=True,
-                   help="Old R-code, e.g. R1655J")
-    p.add_argument("--to", dest="to_code", type=str, required=True,
-                   help="New R-code, e.g. R1665J")
+    p.add_argument("--from", dest="from_code", type=str, default=None,
+                   help="Old R-code, e.g. R1655J. Not required for "
+                        "--diagnose (which inspects an entire subject dir).")
+    p.add_argument("--to", dest="to_code", type=str, default=None,
+                   help="New R-code, e.g. R1665J. Not required for "
+                        "--diagnose.")
     p.add_argument("--apply", action="store_true",
                    help="Execute the plan. Without this the script "
                         "prints the plan and exits.")
+    p.add_argument("--diagnose", type=str, default=None,
+                   metavar="SUBJECT_CODE",
+                   help="Read-only diagnostic mode: walk every .edf "
+                        "under <subject-root>/<SUBJECT_CODE>/ and report "
+                        "pyedflib.EdfReader outcome side-by-side with "
+                        "byte-level patientcode read. No files mutated. "
+                        "Use before committing to a rename to see what "
+                        "pyedflib actually complains about.")
     args = p.parse_args(argv)
+
+    if args.diagnose:
+        subject_dir = args.subject_root / args.diagnose
+        try:
+            rows = diagnose_subject_dir(subject_dir)
+        except FileNotFoundError as e:
+            print(f"[error] {e}", file=sys.stderr)
+            return 2
+        _print_diagnostic_report(rows, subject_dir)
+        return 0
+
+    if not args.from_code or not args.to_code:
+        print("[error] --from and --to are required for a rename "
+              "(use --diagnose alone for read-only inspection)",
+              file=sys.stderr)
+        return 2
 
     try:
         plan = build_plan(args.subject_root, args.from_code, args.to_code)

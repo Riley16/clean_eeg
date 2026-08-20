@@ -497,6 +497,152 @@ def test_find_edf_files_surfaces_actual_exception_on_unreadable_file(
         f"expected an exception class name in stderr, got: {err}")
 
 
+# ---------------------------------------------------------------------------
+# --diagnose: read-only pyedflib vs byte-level comparison
+# ---------------------------------------------------------------------------
+
+def test_diagnose_valid_edf_reports_both_reads_ok(tmp_path):
+    """Positive baseline: on a pyedflib-written EDF both primitives
+    succeed AND agree on the patientcode."""
+    edf = tmp_path / f"{FROM_CODE}_file.edf"
+    _write_test_edf(edf, patientcode=FROM_CODE)
+
+    row = rename_module.diagnose_edf_file(edf)
+
+    assert row.pyedflib_ok is True
+    assert row.pyedflib_error is None
+    assert row.pyedflib_patientcode == FROM_CODE
+    assert row.byte_patientcode == FROM_CODE
+    assert row.byte_error is None
+    assert row.size_bytes > 256
+
+
+def test_diagnose_truncated_edf_shows_pyedflib_error_but_byte_read_works(
+        tmp_path):
+    """SIMULATES THE USER'S SCENARIO: a file where pyedflib fails but
+    the byte-level primitive still reads patientcode. The diagnostic
+    row must capture the specific pyedflib exception message so the
+    operator can see WHAT pyedflib complains about before committing
+    to any byte-level mutation."""
+    edf = tmp_path / f"{FROM_CODE}_truncated.edf"
+    _write_edf_then_truncate_signal_region(edf, FROM_CODE)
+
+    row = rename_module.diagnose_edf_file(edf)
+
+    # pyedflib failed with SOME specific error -- not swallowed
+    assert row.pyedflib_ok is False
+    assert row.pyedflib_error is not None
+    assert row.pyedflib_error.strip() != ""
+    # An exception class name is included so the operator has a
+    # searchable term for the failure mode
+    assert any(cls in row.pyedflib_error for cls in
+               ("OSError", "ValueError", "RuntimeError"))
+    # Byte-level primitive still worked
+    assert row.byte_patientcode == FROM_CODE
+    assert row.byte_error is None
+
+
+def test_diagnose_garbage_file_reports_failures_on_both_primitives(tmp_path):
+    """When both primitives fail (file is too small / not an EDF at
+    all), BOTH errors must be captured -- not just one -- so the
+    operator sees the full picture."""
+    edf = tmp_path / "not_an_edf.edf"
+    edf.write_bytes(b"garbage bytes, not an EDF file at all")
+
+    row = rename_module.diagnose_edf_file(edf)
+
+    assert row.pyedflib_ok is False
+    assert row.pyedflib_error is not None
+    assert row.byte_patientcode is None
+    assert row.byte_error is not None
+    # Byte error mentions the size problem specifically (from the
+    # 256-byte minimum check added earlier)
+    assert "256" in row.byte_error or "shorter" in row.byte_error.lower()
+
+
+def test_diagnose_walks_whole_subject_dir(tmp_path):
+    """Recursive walk: all .edf files under the subject dir end up
+    in the returned list."""
+    subj = tmp_path / FROM_CODE
+    inner = subj / "clinical_eeg"
+    inner.mkdir(parents=True)
+    _write_test_edf(inner / f"{FROM_CODE}_a.edf", patientcode=FROM_CODE)
+    _write_test_edf(inner / f"{FROM_CODE}_b.edf", patientcode=FROM_CODE)
+    # Nested subfolder too -- rglob should find it
+    (inner / "sub").mkdir()
+    _write_test_edf(inner / "sub" / f"{FROM_CODE}_c.edf",
+                     patientcode=FROM_CODE)
+
+    rows = rename_module.diagnose_subject_dir(subj)
+    assert len(rows) == 3
+    assert all(r.pyedflib_ok for r in rows)
+
+
+def test_cli_diagnose_mode_does_not_mutate_anything(tmp_path):
+    """HARD REQUIREMENT: --diagnose is READ-ONLY. Snapshot the tree
+    (path + size + sha256), run --diagnose, snapshot again -- must
+    be bit-identical. Regression guard against a future refactor
+    that accidentally moves a mutating call into the diagnostic
+    codepath."""
+    root = tmp_path / "subjects"
+    subj = _make_subject_tree(root, FROM_CODE, n_edfs=2)
+
+    before_hashes = {p: _sha256(p) for p in subj.rglob("*")
+                     if p.is_file()}
+    before_sizes = {p: p.stat().st_size for p in subj.rglob("*")
+                    if p.is_file()}
+
+    rc = main([
+        "--subject-root", str(root),
+        "--diagnose", FROM_CODE,
+    ])
+    assert rc == 0
+
+    after_hashes = {p: _sha256(p) for p in subj.rglob("*")
+                    if p.is_file()}
+    after_sizes = {p: p.stat().st_size for p in subj.rglob("*")
+                   if p.is_file()}
+    assert after_hashes == before_hashes, (
+        "--diagnose modified file contents")
+    assert after_sizes == before_sizes, (
+        "--diagnose modified file sizes")
+
+
+def test_cli_diagnose_prints_pyedflib_error_for_broken_file(tmp_path,
+                                                              capsys):
+    """The whole point of --diagnose: when a file breaks pyedflib,
+    the operator must SEE the specific error message in stdout so
+    they can decide whether the byte-level mutation is safe."""
+    subj = tmp_path / FROM_CODE
+    inner = subj / "clinical_eeg"
+    inner.mkdir(parents=True)
+    _write_edf_then_truncate_signal_region(
+        inner / f"{FROM_CODE}_broken.edf", FROM_CODE)
+
+    rc = main([
+        "--subject-root", str(tmp_path),
+        "--diagnose", FROM_CODE,
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Some pyedflib exception surface
+    assert any(cls in out for cls in
+               ("OSError", "ValueError", "RuntimeError"))
+    # The distinct-error-signatures section should list the error
+    assert "Distinct pyedflib error signatures" in out
+
+
+def test_cli_diagnose_returns_nonzero_when_subject_missing(tmp_path,
+                                                             capsys):
+    rc = main([
+        "--subject-root", str(tmp_path),
+        "--diagnose", "R9999Z",
+    ])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "R9999Z" in err or "does not exist" in err
+
+
 def test_cli_returns_nonzero_when_source_missing(tmp_path, capsys):
     """Operator typo in --from: helpful message + exit code 2."""
     rc = main([
