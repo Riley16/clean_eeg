@@ -84,24 +84,57 @@ def plan_path_renames(subject_root: Path, from_code: str, to_code: str
     return renames
 
 
+def _read_patientcode_from_bytes(edf_path: Path) -> str:
+    """Read the patientcode from the raw ``patient_id`` header field
+    (bytes 8..88 of the EDF main header), matching the primitive used
+    by ``print-edf-header``. This works on Nihon Kohden raw exports
+    that pyedflib.EdfReader refuses to open due to strict EDF+
+    compliance checks (the whole reason ``clean_eeg`` exists).
+
+    EDF+ packs patient_id as
+    ``"<patientcode> <sex> <birthdate> <patientname>"``. Non-EDF+
+    files (raw NK often falls back) put just the patientcode /
+    hospital MRN in the whole field. Splitting on whitespace and
+    taking the first token handles both.
+
+    Raises ValueError if the file is shorter than the EDF main-header
+    minimum (256 bytes) -- avoids silently returning empty for a
+    non-EDF file that the operator would otherwise never notice.
+    """
+    from clean_eeg.modify_edf_inplace import get_header_field
+    size = edf_path.stat().st_size
+    if size < 256:
+        raise ValueError(
+            f"file is {size} bytes -- shorter than the 256-byte EDF "
+            f"main header. Not a valid EDF.")
+    raw = get_header_field(str(edf_path), "patient_id")
+    if not raw:
+        return ""
+    return str(raw).split(None, 1)[0] if str(raw).strip() else ""
+
+
 def find_edf_files_needing_header_update(subject_dir: Path, from_code: str
                                           ) -> list[Path]:
-    """Every .edf under subject_dir whose patientcode header field is
-    literally equal to ``from_code``. Raw pre-clean EDFs whose
-    patientcode is the hospital MRN return an empty list -- nothing
-    to update there."""
-    import pyedflib
+    """Every .edf under subject_dir whose patientcode header field
+    equals ``from_code``. Reads patientcode via raw bytes, so raw NK
+    exports that pyedflib refuses to open still get inspected -- and
+    the operator gets a clear diagnostic (exception message + path)
+    if even the byte-level read fails.
+
+    For raw pre-clean data the patientcode is the hospital MRN, so
+    NOTHING matches ``from_code`` and this returns an empty list --
+    correct, no header rewrite is needed for raw data.
+    """
     hits: list[Path] = []
     for edf_path in sorted(subject_dir.rglob("*.edf")):
         try:
-            with pyedflib.EdfReader(str(edf_path)) as f:
-                if f.getHeader().get("patientcode", "") == from_code:
-                    hits.append(edf_path)
-        except (OSError, ValueError):
-            # Unreadable EDF is out of scope for this tool. Log the
-            # skip so the operator sees it in the plan.
-            print(f"  [skip-read] {edf_path.name}: cannot open header",
-                  file=sys.stderr)
+            code = _read_patientcode_from_bytes(edf_path)
+        except (OSError, ValueError, KeyError) as e:
+            print(f"  [skip-read] {edf_path}: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            continue
+        if code == from_code:
+            hits.append(edf_path)
     return hits
 
 
@@ -139,22 +172,25 @@ def build_plan(subject_root: Path, from_code: str, to_code: str
 # ---------------------------------------------------------------------------
 
 def _verify_edf_header_updated(edf_path: Path, expected_code: str) -> None:
-    """Post-write check: reopen the file, verify patientcode is now
-    ``expected_code`` AND the file loads cleanly end-to-end. Raises
-    RuntimeError on any inconsistency -- caller restores from backup."""
-    import pyedflib
+    """Post-write check: byte-level read of patientcode confirms the
+    field is now ``expected_code``. Byte-level reading matches
+    ``print-edf-header``'s primitive, so this works on files
+    pyedflib.EdfReader would refuse (raw NK exports).
+
+    ``update_edf_header_inplace(confirm_signals_unchanged=True)``
+    already asserted byte-identity of the signal data during the
+    write itself, so we don't re-check signals here (would require
+    a pyedflib read that may fail on raw exports).
+
+    Raises RuntimeError on any inconsistency -- caller restores
+    from backup.
+    """
     try:
-        with pyedflib.EdfReader(str(edf_path)) as f:
-            actual = f.getHeader().get("patientcode", "")
-            # Force a read of the first signal to catch corruption
-            # that shows up on data-record boundaries, not just header
-            # parsing.
-            if f.signals_in_file > 0:
-                f.readSignal(0)
-    except (OSError, ValueError) as e:
+        actual = _read_patientcode_from_bytes(edf_path)
+    except (OSError, ValueError, KeyError) as e:
         raise RuntimeError(
-            f"post-write verification failed: {edf_path} won't open "
-            f"cleanly: {e}") from e
+            f"post-write verification failed: {edf_path} patientcode "
+            f"bytes are not readable: {type(e).__name__}: {e}") from e
     if actual != expected_code:
         raise RuntimeError(
             f"post-write verification failed: {edf_path} patientcode "

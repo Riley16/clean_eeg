@@ -398,6 +398,105 @@ def test_cli_apply_actually_renames(tmp_path):
     assert (root / TO_CODE).exists()
 
 
+# ---------------------------------------------------------------------------
+# Raw-NK regression: pyedflib.EdfReader failure must NOT hide files
+# whose byte-level patient_id is still readable
+# ---------------------------------------------------------------------------
+
+def _write_edf_then_truncate_signal_region(path: Path, patientcode: str
+                                            ) -> None:
+    """Write a valid EDF via pyedflib, then truncate the file so only
+    the main-header 256 bytes survive. The patient_id field lives at
+    bytes 8..88 of that header, so byte-level reads still work; but
+    pyedflib.EdfReader will refuse the truncated file (declared
+    num_data_records don't match the physically-present bytes).
+
+    Simulates the class of files that made
+    'find_edf_files_needing_header_update' spuriously skip everything
+    in the original bug report.
+    """
+    _write_test_edf(path, patientcode=patientcode)
+    full = path.read_bytes()
+    assert len(full) > 256, "test fixture too small to truncate"
+    # Keep the main header only. pyedflib.EdfReader will now fail
+    # on the signal-region reads.
+    path.write_bytes(full[:256])
+
+
+def test_find_edf_files_needing_header_update_reads_via_bytes(tmp_path,
+                                                                capsys):
+    """REGRESSION: raw NK exports that pyedflib.EdfReader refuses
+    (declared record count doesn't match on-disk bytes, non-EDF+
+    reserved field, etc.) MUST still have their patient_id inspected
+    via byte-level reading. Missing this class of file was the
+    original 'cannot open header' bug -- the operator would see every
+    EDF spuriously skipped.
+    """
+    subj = tmp_path / FROM_CODE
+    inner = subj / "clinical_eeg"
+    inner.mkdir(parents=True)
+
+    # File 1: patient_id contains FROM_CODE, pyedflib-unreadable
+    match_path = inner / f"{FROM_CODE}_match.edf"
+    _write_edf_then_truncate_signal_region(match_path, FROM_CODE)
+
+    # File 2: patient_id is a hospital MRN (simulating raw NK data),
+    # also pyedflib-unreadable. MUST NOT be picked up for header
+    # update -- raw NK data shouldn't be touched.
+    mrn_path = inner / "MRN12345.edf"
+    _write_edf_then_truncate_signal_region(mrn_path, "MRN12345")
+
+    # Confirm the test premise: pyedflib.EdfReader really does fail
+    # on these. If pyedflib gets more lenient in a future version,
+    # this assertion will let us know to rebuild the fixture.
+    with pytest.raises((OSError, ValueError)):
+        with pyedflib.EdfReader(str(match_path)):
+            pass
+
+    hits = rename_module.find_edf_files_needing_header_update(
+        subj, FROM_CODE)
+
+    assert hits == [match_path], (
+        f"expected only {match_path.name} to match (bytes contain "
+        f"{FROM_CODE}), got: {[p.name for p in hits]}")
+    # No spurious skip warnings for either file -- both had readable
+    # patient_id bytes.
+    err = capsys.readouterr().err
+    assert "skip-read" not in err, (
+        f"byte-level read should succeed on both fixtures; got: {err}")
+
+
+def test_find_edf_files_surfaces_actual_exception_on_unreadable_file(
+        tmp_path, capsys):
+    """REGRESSION (UX): when the byte-level read itself fails (file
+    too short to contain the patient_id field, permission denied,
+    etc.), the operator must see WHY -- not a generic 'cannot open
+    header' with no diagnostic. That was the second half of the
+    original bug: silent failure with no way to debug.
+    """
+    subj = tmp_path / FROM_CODE
+    inner = subj / "clinical_eeg"
+    inner.mkdir(parents=True)
+
+    # File shorter than the patient_id field's end (byte 88)
+    tiny = inner / "corrupt.edf"
+    tiny.write_bytes(b"garbage")
+
+    hits = rename_module.find_edf_files_needing_header_update(
+        subj, FROM_CODE)
+    assert hits == []
+    err = capsys.readouterr().err
+    # Diagnostic must include: the full path, an exception class,
+    # and something interpretable about what went wrong. The path
+    # matters because in a batch of hundreds of files the operator
+    # needs to pinpoint the offender.
+    assert str(tiny) in err
+    # Exception CLASS surfaced, not just an opaque generic message
+    assert any(cls in err for cls in
+               ("KeyError", "ValueError", "OSError", "IndexError")), (
+        f"expected an exception class name in stderr, got: {err}")
+
+
 def test_cli_returns_nonzero_when_source_missing(tmp_path, capsys):
     """Operator typo in --from: helpful message + exit code 2."""
     rc = main([
