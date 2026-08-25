@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pyedflib
+import pytest
 
 
 _SCRIPT = (Path(__file__).parent.parent
@@ -273,3 +274,47 @@ def test_all_annotations_off_by_default(tmp_path, capsys):
     ])
     out = capsys.readouterr().out
     assert "All annotations" not in out
+
+
+# ---------------------------------------------------------------------------
+# Permission-aware filtering: only readable files reach the sampler
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(__import__("os").geteuid() == 0,
+                     reason="root bypasses chmod-based permission checks")
+def test_parent_dir_skips_unreadable_subject_and_continues(tmp_path,
+                                                            capsys):
+    """HARD REQUIREMENT: a chmod-000 subject dir MUST NOT make it
+    into the sampled set. Otherwise --random-sample N could pick a
+    file that fails at read time, wasting the sample budget. Warn
+    the operator that coverage is incomplete."""
+    import os
+    import stat
+    # Good subject
+    good = tmp_path / "R1755A" / "clinical_eeg"
+    good.mkdir(parents=True)
+    _write_edf(good / "R1755A.edf", [(0.5, "good_text")])
+    # Bad subject: readable but its clinical_eeg is chmod 000
+    bad = tmp_path / "R1666A" / "clinical_eeg"
+    bad.mkdir(parents=True)
+    _write_edf(bad / "R1666A.edf", [(0.5, "cant_read_this")])
+    original_mode = bad.stat().st_mode
+    os.chmod(bad, 0)
+    try:
+        rc = sample_mod.main([
+            "--parent-dir", str(tmp_path),
+            "--top-n", "10",
+            "--sample-n", "0",
+        ])
+    finally:
+        os.chmod(bad, original_mode | stat.S_IRWXU)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    err = capsys.readouterr().err
+    # Good subject counted
+    assert "good_text" in out
+    # Bad subject's annotation NEVER appeared
+    assert "cant_read_this" not in out
+    # Would-be read-fail message also absent (pre-filter caught it)
+    assert "[skip-read] R1666A.edf" not in err

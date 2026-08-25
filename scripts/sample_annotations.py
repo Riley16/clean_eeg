@@ -32,7 +32,13 @@ from clean_eeg.annotation_reader import iter_annotations
 def collect_annotation_texts(edf_paths: list[Path]) -> list[tuple[Path, str]]:
     """Return every (file, text) pair across the given EDFs. Empty
     or whitespace-only texts are dropped. Order preserved so
-    --sample-n's ``random.sample`` gets a uniform draw."""
+    --sample-n's ``random.sample`` gets a uniform draw.
+
+    File-level permission errors during read (rare -- _resolve_edfs
+    pre-filters via os.access) are surfaced with the exception class
+    so the operator can distinguish 'not readable' from 'corrupt
+    EDF'.
+    """
     from tqdm import tqdm
     out: list[tuple[Path, str]] = []
     for p in tqdm(edf_paths, desc="loading annotations", unit="file"):
@@ -40,42 +46,104 @@ def collect_annotation_texts(edf_paths: list[Path]) -> list[tuple[Path, str]]:
             for a in iter_annotations(p):
                 if a.text.strip():
                     out.append((p, a.text))
+        except PermissionError as e:
+            print(f"[skip-perm] {p}: {e}", file=sys.stderr)
         except Exception as e:
             print(f"[skip-read] {p.name}: {type(e).__name__}: {e}",
                   file=sys.stderr)
     return out
 
 
+def _list_edfs_in_subfolder(inner: Path) -> list[Path]:
+    """Return all EDFs under ``inner``, filtering out unreadable
+    files and sidecars. Silently drops the whole subfolder if it's
+    not readable (chmod-000 or similar) -- ``os.listdir`` DOES raise
+    on that (unlike ``rglob``, which silently returns []).
+    """
+    import os as _os
+    try:
+        _os.listdir(inner)          # readability probe
+    except (PermissionError, OSError):
+        return []
+    return [
+        p for p in sorted(inner.rglob("*.edf"))
+        if not p.name.endswith("_annotations.edf")
+        and _os.access(p, _os.R_OK)]
+
+
 def _resolve_edfs(args: argparse.Namespace) -> list[Path]:
     """Resolve the EDF source. Exactly one of --edf-file /
     --subject-dir / --parent-dir. Sidecar '*_annotations.edf' files
-    are excluded so we don't double-count."""
+    are excluded so we don't double-count.
+
+    Only includes files the operator can actually READ. Unreadable
+    subjects / files are silently skipped BEFORE sampling so
+    --random-sample N doesn't waste picks on files that would fail
+    at read time. The count of skipped files is printed to stderr
+    so the operator knows coverage is incomplete.
+    """
+    import os as _os
     edfs: list[Path] = []
+    skipped_perm_files = 0
+    skipped_perm_dirs = 0
     if args.edf_file:
-        edfs.extend(args.edf_file)
+        for p in args.edf_file:
+            if _os.access(p, _os.R_OK):
+                edfs.append(p)
+            else:
+                skipped_perm_files += 1
     elif args.subject_dir:
         inner = args.subject_dir / args.subfolder
         target = inner if inner.exists() else args.subject_dir
-        edfs.extend(
-            p for p in sorted(target.rglob("*.edf"))
-            if not p.name.endswith("_annotations.edf"))
+        found = _list_edfs_in_subfolder(target)
+        if not found:
+            # Only warn if the target actually exists -- an empty
+            # readable dir returns [] cleanly.
+            try:
+                _os.listdir(target)
+            except (PermissionError, OSError):
+                skipped_perm_dirs += 1
+        edfs.extend(found)
     elif args.parent_dir:
-        # Multi-subject: <parent>/<subject>/<subfolder>/*.edf across
-        # every subject folder. Silent-drop subjects with no
-        # subfolder or no EDFs (same rule as count_annotations).
-        for subj_dir in sorted(args.parent_dir.iterdir()):
-            if not subj_dir.is_dir():
+        try:
+            subject_dirs = sorted(args.parent_dir.iterdir())
+        except (PermissionError, OSError) as e:
+            print(f"[error] cannot list {args.parent_dir}: {e}",
+                  file=sys.stderr)
+            return []
+        for subj_dir in subject_dirs:
+            try:
+                if not subj_dir.is_dir():
+                    continue
+            except (PermissionError, OSError):
+                skipped_perm_dirs += 1
                 continue
             inner = subj_dir / args.subfolder
-            if not inner.exists():
+            try:
+                if not inner.exists():
+                    continue
+            except (PermissionError, OSError):
+                skipped_perm_dirs += 1
                 continue
-            edfs.extend(
-                p for p in sorted(inner.rglob("*.edf"))
-                if not p.name.endswith("_annotations.edf"))
+            found = _list_edfs_in_subfolder(inner)
+            if not found:
+                try:
+                    _os.listdir(inner)
+                except (PermissionError, OSError):
+                    skipped_perm_dirs += 1
+            edfs.extend(found)
 
-    # --random-sample N: pick N at random from the resolved set.
-    # Applied BEFORE --max-files so the operator can combine them
-    # (e.g. random-sample 100 then max-files 10 for a fast peek).
+    if skipped_perm_files or skipped_perm_dirs:
+        parts = []
+        if skipped_perm_dirs:
+            parts.append(f"{skipped_perm_dirs} unreadable subject dir(s)")
+        if skipped_perm_files:
+            parts.append(f"{skipped_perm_files} unreadable file(s)")
+        print(f"[warn] skipped {', '.join(parts)} (permission denied)",
+              file=sys.stderr)
+
+    # --random-sample N: pick N at random from the ACCESSIBLE set.
+    # Applied BEFORE --max-files so the operator can combine them.
     if args.random_sample and len(edfs) > args.random_sample:
         edfs = random.sample(edfs, args.random_sample)
         edfs.sort()   # readable output order
