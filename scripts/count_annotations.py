@@ -222,17 +222,37 @@ def scan_parent(parent_dir: Path,
     # Running totals across the whole scan.
     running_ann = running_words = running_files_ok = running_wl = 0
 
+    def _update_bar_postfix(current_subject: str) -> None:
+        """Refresh the tqdm postfix with the always-visible running
+        mean + extrapolation-to-total. Called after every file so the
+        operator sees the number growing / stabilizing in real time,
+        without needing per-file tqdm.write spam.
+        """
+        if not hasattr(file_iter, "set_postfix_str"):
+            return
+        if running_files_ok > 0:
+            mean_ann = running_ann / running_files_ok
+            extrap_total_ann = mean_ann * total_files
+            file_iter.set_postfix_str(
+                f"{current_subject}  "
+                f"μ={mean_ann:.0f} ann/file  "
+                f"extrap≈{extrap_total_ann:,.0f} ann across "
+                f"{total_files:,} files",
+                refresh=False)
+        else:
+            file_iter.set_postfix_str(current_subject, refresh=False)
+
     for meta in subject_metas:
         # Per-subject accumulators; flushed to per_subject +
         # incremental summary print at end of each subject.
         n_ann = n_words = n_ok = n_skipped = n_reviewed = n_whitelisted = 0
-        if hasattr(file_iter, "set_postfix_str"):
-            file_iter.set_postfix_str(meta.subj_dir.name, refresh=False)
+        _update_bar_postfix(meta.subj_dir.name)
 
         for edf in meta.edfs:
             if str(edf) in meta.reviewed_paths:
                 n_reviewed += 1
                 file_iter.update(1)
+                _update_bar_postfix(meta.subj_dir.name)
                 continue
             try:
                 a, w, wl = count_edf_annotations(
@@ -240,24 +260,32 @@ def scan_parent(parent_dir: Path,
             except PermissionError:
                 n_skipped += 1
                 file_iter.update(1)
+                _update_bar_postfix(meta.subj_dir.name)
                 continue
             except Exception:
                 n_skipped += 1
                 file_iter.update(1)
+                _update_bar_postfix(meta.subj_dir.name)
                 continue
             n_ann += a
             n_words += w
             n_whitelisted += wl
             n_ok += 1
+            # Bump running totals BEFORE the postfix update so the
+            # mean reflects the file that just completed.
+            running_ann += a
+            running_words += w
+            running_files_ok += 1
+            running_wl += wl
             file_iter.update(1)
+            _update_bar_postfix(meta.subj_dir.name)
 
         per_subject[meta.subj_dir.name] = (n_ann, n_words, n_ok, n_skipped,
                                             n_reviewed, n_whitelisted)
-        # ---- incremental per-subject line + running totals ----
-        running_ann += n_ann
-        running_words += n_words
-        running_files_ok += n_ok
-        running_wl += n_whitelisted
+        # Running totals were already bumped inside the per-file
+        # loop above (so postfix updates every file reflect the
+        # latest data). Nothing to add here -- just print the
+        # per-subject summary line.
         if show_progress and running_files_ok > 0:
             mean_ann_per_file = running_ann / running_files_ok
             mean_wd_per_file = running_words / running_files_ok
