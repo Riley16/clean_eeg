@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -111,50 +112,88 @@ def scan_parent(parent_dir: Path,
         raise FileNotFoundError(f"{parent_dir} does not exist")
 
     try:
-        subject_dirs = sorted(parent_dir.iterdir())
+        raw_subject_dirs = sorted(parent_dir.iterdir())
     except PermissionError as e:
         raise PermissionError(
             f"{parent_dir}: cannot list children: {e}") from e
 
-    # Progress bar: writes to stderr so the final report on stdout
-    # stays a clean, greppable block. disable=True gives silent
-    # scan for programmatic callers / tests.
-    from tqdm import tqdm
-    iterator = tqdm(subject_dirs, desc="scanning subjects",
-                    unit="subj", disable=not show_progress,
-                    dynamic_ncols=True)
-
-    for subj_dir in iterator:
-        if hasattr(iterator, "set_postfix_str"):
-            iterator.set_postfix_str(subj_dir.name, refresh=False)
+    # PRE-FILTER: drop subjects that lack the expected subfolder AND
+    # subjects whose subfolder contains zero EDFs. Both are 'just
+    # empty' from this tool's perspective; including them in the
+    # tqdm total makes the bar 'jump' as we skip past them and
+    # obscures the true remaining work.
+    subject_dirs = []
+    for subj_dir in raw_subject_dirs:
         try:
             if not subj_dir.is_dir():
                 continue
-        except PermissionError as e:
-            skipped_subjects.append(
-                (subj_dir.name, f"permission denied: {e}"))
+        except PermissionError:
+            # Preserve permission-denied dirs so they surface in the
+            # skipped list below rather than being silently dropped.
+            subject_dirs.append(subj_dir)
             continue
-
         inner = subj_dir / subfolder
-        # Explicit: no fallback to the subject dir itself. If the
-        # expected subfolder is missing, the subject is not laid out
-        # the way this tool expects and gets skipped with a clear
-        # reason.
         try:
-            inner_exists = inner.exists()
+            if not inner.exists():
+                continue                       # no subfolder -> silent skip
+        except PermissionError:
+            subject_dirs.append(subj_dir)      # surface as permission error
+            continue
+        # Existence probe. os.listdir raises PermissionError on
+        # chmod-000 dirs (unlike rglob, which silently returns []).
+        # We only need to see ONE .edf so a top-level listing beats
+        # rglob when EDFs are direct children. If EDFs live in
+        # further subdirs, fall through to a rglob probe.
+        import os as _os
+        try:
+            entries = _os.listdir(inner)
+        except PermissionError:
+            subject_dirs.append(subj_dir)      # surface as permission err
+            continue
+        has_edf = any(e.endswith(".edf")
+                       and not e.endswith("_annotations.edf")
+                       for e in entries)
+        if not has_edf:
+            # Deeper: nested layouts. rglob-any on a readable dir is
+            # safe (permission errors won't be swallowed since we
+            # already confirmed inner is readable).
+            has_edf = any(
+                p.name.endswith(".edf")
+                and not p.name.endswith("_annotations.edf")
+                for p in inner.rglob("*.edf"))
+        if not has_edf:
+            continue                           # empty subfolder -> silent skip
+        subject_dirs.append(subj_dir)
+
+    # ---- Second pass: enumerate all EDFs across all subjects so
+    # the tqdm bar can track FILES (uniform load time) rather than
+    # SUBJECTS (highly variable file counts). Also computes per-
+    # subject scan metadata once so the per-file inner loop is
+    # cheap. ----
+    from tqdm import tqdm
+
+    @dataclass
+    class _SubjectScanMeta:
+        subj_dir: Path
+        site_code: str | None
+        reviewed_paths: set[str]
+        edfs: list[Path]
+
+    subject_metas: list[_SubjectScanMeta] = []
+    import os as _os
+    for subj_dir in subject_dirs:
+        inner = subj_dir / subfolder
+        # Explicit permission check: rglob silently swallows
+        # PermissionError, so a chmod-000 subject would appear to have
+        # 0 EDFs and pollute per_subject with (0,0,...). listdir DOES
+        # raise, which is what we want to surface in skipped_subjects.
+        try:
+            _os.listdir(inner)
         except PermissionError as e:
             skipped_subjects.append(
-                (subj_dir.name, f"permission denied: {e}"))
+                (subj_dir.name,
+                 f"permission denied while listing EDFs: {e}"))
             continue
-        if not inner_exists:
-            # Silently drop: a folder without the expected subfolder
-            # is 'just empty' from this tool's perspective (subject
-            # not ingested yet, wrong layout, or stray dir). NOT
-            # counted toward totals and NOT surfaced in the skipped
-            # list -- would be pure noise across a large parent dir.
-            continue
-
-        site_code = _derive_site_code(subj_dir.name)
         try:
             reviewed_paths = (_reviewed_paths_for(subj_dir)
                               if respect_reviewed_tracker else set())
@@ -162,50 +201,81 @@ def scan_parent(parent_dir: Path,
             skipped_subjects.append(
                 (subj_dir.name, f"permission denied on tracker: {e}"))
             continue
-
-        n_ann = n_words = n_ok = n_skipped = n_reviewed = n_whitelisted = 0
-        # Force an explicit permission check -- pathlib.Path.rglob
-        # silently returns [] on a chmod-000 directory instead of
-        # raising, which would leave the subject in the results with
-        # 0 counts and mask the coverage gap. os.listdir DOES raise.
-        try:
-            import os as _os
-            _os.listdir(inner)
-        except PermissionError as e:
-            skipped_subjects.append(
-                (subj_dir.name,
-                 f"permission denied while listing EDFs: {e}"))
-            continue
         edfs = [e for e in sorted(inner.rglob("*.edf"))
                 if not e.name.endswith("_annotations.edf")]
+        if not edfs:
+            # Slipped past the pre-filter (which checks 'any' -- can
+            # race with concurrent deletes), or the subject genuinely
+            # has zero EDFs by the time we look. Silent skip.
+            continue
+        subject_metas.append(_SubjectScanMeta(
+            subj_dir=subj_dir,
+            site_code=_derive_site_code(subj_dir.name),
+            reviewed_paths=reviewed_paths,
+            edfs=edfs))
 
-        # Inner bar: per-file within this subject. leave=False so it
-        # disappears at end-of-subject and the outer bar stays clean.
-        inner_iter = tqdm(edfs, desc=f"  {subj_dir.name}", unit="file",
-                          leave=False, disable=not show_progress,
-                          dynamic_ncols=True, position=1)
-        for edf in inner_iter:
-            if str(edf) in reviewed_paths:
+    total_files = sum(len(m.edfs) for m in subject_metas)
+    file_iter = tqdm(total=total_files, desc="scanning EDFs",
+                     unit="file", disable=not show_progress,
+                     dynamic_ncols=True)
+
+    # Running totals across the whole scan.
+    running_ann = running_words = running_files_ok = running_wl = 0
+
+    for meta in subject_metas:
+        # Per-subject accumulators; flushed to per_subject +
+        # incremental summary print at end of each subject.
+        n_ann = n_words = n_ok = n_skipped = n_reviewed = n_whitelisted = 0
+        if hasattr(file_iter, "set_postfix_str"):
+            file_iter.set_postfix_str(meta.subj_dir.name, refresh=False)
+
+        for edf in meta.edfs:
+            if str(edf) in meta.reviewed_paths:
                 n_reviewed += 1
+                file_iter.update(1)
                 continue
             try:
                 a, w, wl = count_edf_annotations(
-                    edf, whitelist=whitelist, site_code=site_code)
+                    edf, whitelist=whitelist, site_code=meta.site_code)
             except PermissionError:
-                # Per-file permission problem -- report as skipped so
-                # the operator knows coverage is incomplete for this
-                # subject.
                 n_skipped += 1
+                file_iter.update(1)
                 continue
             except Exception:
                 n_skipped += 1
+                file_iter.update(1)
                 continue
             n_ann += a
             n_words += w
             n_whitelisted += wl
             n_ok += 1
-        per_subject[subj_dir.name] = (n_ann, n_words, n_ok, n_skipped,
-                                       n_reviewed, n_whitelisted)
+            file_iter.update(1)
+
+        per_subject[meta.subj_dir.name] = (n_ann, n_words, n_ok, n_skipped,
+                                            n_reviewed, n_whitelisted)
+        # ---- incremental per-subject line + running totals ----
+        running_ann += n_ann
+        running_words += n_words
+        running_files_ok += n_ok
+        running_wl += n_whitelisted
+        if show_progress and running_files_ok > 0:
+            mean_ann_per_file = running_ann / running_files_ok
+            mean_wd_per_file = running_words / running_files_ok
+            n_subj_done = len(per_subject)
+            mean_ann_per_subj = running_ann / n_subj_done
+            mean_wd_per_subj = running_words / n_subj_done
+            tqdm.write(
+                f"  [{meta.subj_dir.name}] this subj: "
+                f"{n_ann:,} ann, {n_words:,} wd, {n_whitelisted:,} wl, "
+                f"{n_ok} file(s)  ||  "
+                f"running: {running_ann:,} ann, {running_words:,} wd "
+                f"across {n_subj_done} subj / {running_files_ok} file(s) "
+                f"(mean {mean_ann_per_file:.0f} ann/file, "
+                f"{mean_ann_per_subj:.0f} ann/subj, "
+                f"{mean_wd_per_file:.0f} wd/file, "
+                f"{mean_wd_per_subj:.0f} wd/subj)")
+
+    file_iter.close()
     return per_subject, skipped_subjects
 
 
@@ -229,10 +299,17 @@ def print_report(per_subject: dict[str, tuple[int, int, int, int, int, int]],
         print(f"Whitelisted (excluded): {total_whitelisted:,} annotations")
     if total_reviewed:
         print(f"Files already reviewed: {total_reviewed}  (skipped)")
+    total_files_ok = sum(f_ok for _, _, f_ok, _, _, _
+                          in per_subject.values())
     if with_data:
         print(f"Mean / subject:         "
               f"{total_ann / len(with_data):,.0f} annotations, "
               f"{total_words / len(with_data):,.0f} words")
+        if total_files_ok:
+            print(f"Mean / file:            "
+                  f"{total_ann / total_files_ok:,.0f} annotations, "
+                  f"{total_words / total_files_ok:,.0f} words  "
+                  f"(across {total_files_ok:,} readable file(s))")
         est_total_min = total_words / wpm
         est_per_min = total_words / len(with_data) / wpm
         print(f"Estimated review @ {wpm} wpm:")

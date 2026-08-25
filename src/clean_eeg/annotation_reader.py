@@ -33,11 +33,11 @@ from pathlib import Path
 import numpy as np
 
 from clean_eeg.modify_edf_inplace import (
+    EDF_HEADER_FIELD_OFFSETS_LENGTHS,
+    EDF_SIGNAL_HEADER_FIELD_OFFSETS_LENGTHS,
     SIGNAL_HEADER_BYTES,
     TOTAL_HEADER_BYTES,
-    get_annotation_signal_header_index,
-    get_header_field,
-    get_signal_header_fields,
+    format_field_from_bytes,
 )
 
 
@@ -114,6 +114,72 @@ def _parse_tal_bytes(record_ann_bytes: bytes,
     return out
 
 
+@dataclass
+class _EDFGeometry:
+    """All fields we need to locate the annotation channel bytes,
+    read from ONE ``open()`` on the file. Consolidates what used to
+    be 5+ separate opens across get_annotation_signal_header_index /
+    get_signal_header_fields / get_header_field -- ~5-6x fewer
+    network round-trips per file on slow mounts (NFS, Box FS,
+    /oceanus)."""
+    ann_idx: int
+    lens_samples: list[int]
+    n_records: int
+    file_size: int
+
+
+def _load_geometry_single_open(edf_path: Path) -> _EDFGeometry:
+    """One ``open()`` per file. Reads main-header fields + all signal-
+    header fields we need (label to find annotation channel, num_samples
+    per channel). Rewrites what the modify_edf_inplace helpers do
+    field-by-field with a separate open each.
+    """
+    _num_signals_off, _num_signals_len, _ = \
+        EDF_HEADER_FIELD_OFFSETS_LENGTHS['num_signals']
+    _num_records_off, _num_records_len, _ = \
+        EDF_HEADER_FIELD_OFFSETS_LENGTHS['num_data_records']
+    _label_off, _label_len, _ = \
+        EDF_SIGNAL_HEADER_FIELD_OFFSETS_LENGTHS['label']
+    _spr_off, _spr_len, _ = \
+        EDF_SIGNAL_HEADER_FIELD_OFFSETS_LENGTHS['num_samples']
+
+    file_size = edf_path.stat().st_size
+    with open(edf_path, "rb") as f:
+        f.seek(_num_signals_off)
+        n_signals = int(format_field_from_bytes(
+            f.read(_num_signals_len), int))
+        f.seek(_num_records_off)
+        n_records = int(format_field_from_bytes(
+            f.read(_num_records_len), int))
+
+        # Signal headers: fields are grouped by field-type across all
+        # signals (label bytes for all N, then transducer bytes for
+        # all N, ...). Seek to each group and slice out per-channel
+        # values.
+        labels: list[str] = []
+        f.seek(TOTAL_HEADER_BYTES + n_signals * _label_off)
+        raw = f.read(n_signals * _label_len)
+        for i in range(n_signals):
+            labels.append(format_field_from_bytes(
+                raw[i * _label_len:(i + 1) * _label_len], str))
+
+        lens_samples: list[int] = []
+        f.seek(TOTAL_HEADER_BYTES + n_signals * _spr_off)
+        raw = f.read(n_signals * _spr_len)
+        for i in range(n_signals):
+            lens_samples.append(int(format_field_from_bytes(
+                raw[i * _spr_len:(i + 1) * _spr_len], int)))
+
+    ann_idx = next(
+        (i for i, lab in enumerate(labels)
+         if lab.strip() == "EDF Annotations"), -1)
+    if ann_idx < 0:
+        raise ValueError(
+            f"{edf_path}: no 'EDF Annotations' channel found")
+    return _EDFGeometry(ann_idx=ann_idx, lens_samples=lens_samples,
+                         n_records=n_records, file_size=file_size)
+
+
 def iter_annotations(edf_path: Path | str) -> list[Annotation]:
     """Read every non-timekeeping annotation from ``edf_path``. Signal
     data is never touched by the parser -- the annotation channel is
@@ -140,17 +206,16 @@ def iter_annotations(edf_path: Path | str) -> list[Annotation]:
         Python-level parsing on the common case.
     """
     path = Path(edf_path)
-    ann_idx = get_annotation_signal_header_index(str(path))
-    lens_samples = get_signal_header_fields(str(path), field="num_samples")
-    ann_samples_per_record = lens_samples[ann_idx]
-    ann_sample_offset_in_record = sum(lens_samples[:ann_idx])
-    record_samples = sum(lens_samples)
-    n_signals = len(lens_samples)
-    n_records = int(get_header_field(str(path), "num_data_records"))
+    geo = _load_geometry_single_open(path)
+    ann_samples_per_record = geo.lens_samples[geo.ann_idx]
+    ann_sample_offset_in_record = sum(geo.lens_samples[:geo.ann_idx])
+    record_samples = sum(geo.lens_samples)
+    n_signals = len(geo.lens_samples)
+    n_records = geo.n_records
+    file_size = geo.file_size
     data_start = TOTAL_HEADER_BYTES + SIGNAL_HEADER_BYTES * n_signals
 
     out: list[Annotation] = []
-    file_size = path.stat().st_size
     if (file_size <= data_start or n_records == 0
             or record_samples == 0 or ann_samples_per_record == 0):
         return out
