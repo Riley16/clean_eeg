@@ -47,18 +47,39 @@ def collect_annotation_texts(edf_paths: list[Path]) -> list[tuple[Path, str]]:
 
 
 def _resolve_edfs(args: argparse.Namespace) -> list[Path]:
-    """Union of --edf-file (single) and --subject-dir (all EDFs
-    under it). Sidecar '*_annotations.edf' files are excluded so we
-    don't double-count."""
+    """Resolve the EDF source. Exactly one of --edf-file /
+    --subject-dir / --parent-dir. Sidecar '*_annotations.edf' files
+    are excluded so we don't double-count."""
     edfs: list[Path] = []
     if args.edf_file:
         edfs.extend(args.edf_file)
-    if args.subject_dir:
+    elif args.subject_dir:
         inner = args.subject_dir / args.subfolder
         target = inner if inner.exists() else args.subject_dir
         edfs.extend(
             p for p in sorted(target.rglob("*.edf"))
             if not p.name.endswith("_annotations.edf"))
+    elif args.parent_dir:
+        # Multi-subject: <parent>/<subject>/<subfolder>/*.edf across
+        # every subject folder. Silent-drop subjects with no
+        # subfolder or no EDFs (same rule as count_annotations).
+        for subj_dir in sorted(args.parent_dir.iterdir()):
+            if not subj_dir.is_dir():
+                continue
+            inner = subj_dir / args.subfolder
+            if not inner.exists():
+                continue
+            edfs.extend(
+                p for p in sorted(inner.rglob("*.edf"))
+                if not p.name.endswith("_annotations.edf"))
+
+    # --random-sample N: pick N at random from the resolved set.
+    # Applied BEFORE --max-files so the operator can combine them
+    # (e.g. random-sample 100 then max-files 10 for a fast peek).
+    if args.random_sample and len(edfs) > args.random_sample:
+        edfs = random.sample(edfs, args.random_sample)
+        edfs.sort()   # readable output order
+
     if args.max_files and len(edfs) > args.max_files:
         edfs = edfs[:args.max_files]
     return edfs
@@ -88,6 +109,26 @@ def _print_sample(pairs: list[tuple[Path, str]], sample_n: int) -> None:
         print(f"  [{path.name}]  {text!r}")
 
 
+def _print_all_annotations(pairs: list[tuple[Path, str]]) -> None:
+    """Full dump grouped by file, chronological within each file.
+    For eyeballing near-duplicates and one-off annotations that
+    frequency counting doesn't catch. Loud on large scans -- pair
+    with --random-sample N to keep it tractable."""
+    if not pairs:
+        return
+    by_file: dict[Path, list[str]] = {}
+    for path, text in pairs:
+        by_file.setdefault(path, []).append(text)
+    total = len(pairs)
+    print(f"\n=== All annotations ({total:,} across "
+          f"{len(by_file)} file(s)) ===")
+    for path in sorted(by_file):
+        anns = by_file[path]
+        print(f"\n--- {path}  ({len(anns)} annotation(s)) ---")
+        for text in anns:
+            print(f"  {text!r}")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="Print annotation texts sorted by frequency + "
@@ -98,21 +139,37 @@ def main(argv: list[str] | None = None) -> int:
                      help="Per-subject dir. Scans all EDFs under "
                           "<subject>/<subfolder>/ (default subfolder: "
                           "clinical_eeg).")
+    src.add_argument("--parent-dir", type=Path,
+                     help="Parent dir containing many subjects. Scans "
+                          "every <subject>/<subfolder>/*.edf across "
+                          "all subjects. Combine with --random-sample "
+                          "N to peek at N random files across the "
+                          "whole cohort.")
     src.add_argument("--edf-file", type=Path, nargs="+",
                      help="One or more explicit .edf files. Skips "
                           "the --subfolder lookup.")
     p.add_argument("--subfolder", type=str, default="clinical_eeg")
+    p.add_argument("--random-sample", type=int, default=0,
+                   metavar="N",
+                   help="Pick N random EDFs from the resolved set "
+                        "(useful with --parent-dir for a cross-cohort "
+                        "peek). 0 = no sampling.")
     p.add_argument("--max-files", type=int, default=0,
-                   help="Cap the number of files inspected (in sorted "
-                        "order). Useful for a fast first pass on a "
-                        "many-file subject. 0 = no cap.")
+                   help="Cap the number of files inspected (applied "
+                        "AFTER --random-sample). 0 = no cap.")
     p.add_argument("--top-n", type=int, default=30)
     p.add_argument("--sample-n", type=int, default=10,
                    help="Random samples in addition to top-N. Set 0 "
                         "to skip the sample block.")
+    p.add_argument("--all-annotations", action="store_true",
+                   help="ALSO print every annotation grouped by file "
+                        "(chronological within each file). Best paired "
+                        "with --random-sample N to keep the output "
+                        "tractable. Catches near-duplicate patterns "
+                        "that frequency counting misses.")
     p.add_argument("--seed", type=int, default=0,
-                   help="Random seed for --sample-n (default 0 -> "
-                        "reproducible).")
+                   help="Random seed for --sample-n / --random-sample "
+                        "(default 0 -> reproducible).")
     args = p.parse_args(argv)
 
     random.seed(args.seed)
@@ -124,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
     pairs = collect_annotation_texts(edfs)
     _print_top_n(pairs, args.top_n)
     _print_sample(pairs, args.sample_n)
+    if args.all_annotations:
+        _print_all_annotations(pairs)
     return 0
 
 
