@@ -262,20 +262,20 @@ def test_scan_parent_include_reviewed_disables_tracker_filter(tmp_path):
 # Skip subjects without the expected subfolder / with permission errors
 # ---------------------------------------------------------------------------
 
-def test_scan_parent_skips_subject_missing_expected_subfolder(tmp_path):
-    """A subject folder without <subfolder>/ (e.g. subject wasn't
-    ingested yet, or has a different layout) MUST be skipped -- NOT
-    fall back to walking the subject root. Falling back would pick
-    up unrelated files (raw exports, notes) and inflate the count
-    with garbage. Reported in the skipped list so the operator can
-    see which subjects need attention.
+def test_scan_parent_silently_drops_subjects_without_subfolder(tmp_path):
+    """A folder without <subfolder>/ is 'just empty' from this tool's
+    perspective -- subject not ingested yet, wrong layout, or stray
+    dir. MUST be silently dropped: not counted in per_subject (would
+    fabricate a 0-annotation row and inflate the subject count) and
+    not surfaced in the skipped list (would be pure noise across a
+    large parent dir where most folders don't yet have data).
     """
     # Layout A: expected -- gets counted
     (tmp_path / "R1755A" / "clinical_eeg").mkdir(parents=True)
     _write_edf_with_annotations(
         tmp_path / "R1755A" / "clinical_eeg" / "R1755A.edf",
         ["one two"])
-    # Layout B: no clinical_eeg subdir -- gets skipped
+    # Layout B: no clinical_eeg subdir -- silently dropped
     (tmp_path / "R1000Z").mkdir()
     _write_edf_with_annotations(
         tmp_path / "R1000Z" / "loose.edf", ["should not count"])
@@ -283,8 +283,8 @@ def test_scan_parent_skips_subject_missing_expected_subfolder(tmp_path):
     result, skipped = count_annotations.scan_parent(tmp_path)
     assert "R1755A" in result
     assert "R1000Z" not in result
-    assert any(name == "R1000Z" and "clinical_eeg" in reason
-               for name, reason in skipped)
+    # NEGATIVE: R1000Z is NOT in the skipped list (silent drop)
+    assert not any(name == "R1000Z" for name, _ in skipped)
 
 
 @pytest.mark.skipif(os.geteuid() == 0,

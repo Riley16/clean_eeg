@@ -147,8 +147,11 @@ def scan_parent(parent_dir: Path,
                 (subj_dir.name, f"permission denied: {e}"))
             continue
         if not inner_exists:
-            skipped_subjects.append(
-                (subj_dir.name, f"no {subfolder}/ subdir"))
+            # Silently drop: a folder without the expected subfolder
+            # is 'just empty' from this tool's perspective (subject
+            # not ingested yet, wrong layout, or stray dir). NOT
+            # counted toward totals and NOT surfaced in the skipped
+            # list -- would be pure noise across a large parent dir.
             continue
 
         site_code = _derive_site_code(subj_dir.name)
@@ -173,11 +176,15 @@ def scan_parent(parent_dir: Path,
                 (subj_dir.name,
                  f"permission denied while listing EDFs: {e}"))
             continue
-        edfs = sorted(inner.rglob("*.edf"))
+        edfs = [e for e in sorted(inner.rglob("*.edf"))
+                if not e.name.endswith("_annotations.edf")]
 
-        for edf in edfs:
-            if edf.name.endswith("_annotations.edf"):
-                continue
+        # Inner bar: per-file within this subject. leave=False so it
+        # disappears at end-of-subject and the outer bar stays clean.
+        inner_iter = tqdm(edfs, desc=f"  {subj_dir.name}", unit="file",
+                          leave=False, disable=not show_progress,
+                          dynamic_ncols=True, position=1)
+        for edf in inner_iter:
             if str(edf) in reviewed_paths:
                 n_reviewed += 1
                 continue

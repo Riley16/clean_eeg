@@ -30,6 +30,8 @@ import mmap
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from clean_eeg.modify_edf_inplace import (
     SIGNAL_HEADER_BYTES,
     TOTAL_HEADER_BYTES,
@@ -113,48 +115,98 @@ def _parse_tal_bytes(record_ann_bytes: bytes,
 
 
 def iter_annotations(edf_path: Path | str) -> list[Annotation]:
-    """Read every non-timekeeping annotation from ``edf_path`` via
-    mmap + direct annotation-channel seeks. Signal data is never
-    touched.
+    """Read every non-timekeeping annotation from ``edf_path``. Signal
+    data is never touched by the parser -- the annotation channel is
+    extracted via a numpy view into an mmap.
 
     Works on files pyedflib.EdfReader would refuse (raw NK exports,
     EDF+D not yet split) as long as the main header + signal headers
     are parseable via byte offsets.
+
+    Perf notes for clinical EDFs on networked storage:
+      * The old implementation seeked per-record inside the mmap,
+        triggering N_records small random 4KB page faults across the
+        whole file. On network mounts (NFS, SMB, Box FS, etc.) this
+        is dramatically slower than a single sequential scan.
+      * The current implementation asks the kernel for a SEQUENTIAL
+        access hint (madvise), materializes the whole data region as
+        an int16 numpy view once, and slices out the annotation
+        channel columns in one contiguous copy. The kernel is then
+        free to prefetch large blocks instead of chasing small
+        random reads.
+      * Skips records whose annotation slice is all-zero padding
+        (very common: most records have only the timekeeping TAL,
+        which is short; the rest is padding). Avoids per-record
+        Python-level parsing on the common case.
     """
     path = Path(edf_path)
     ann_idx = get_annotation_signal_header_index(str(path))
     lens_samples = get_signal_header_fields(str(path), field="num_samples")
-    # 2 bytes per sample in raw EDF signal + annotation channels
-    lens_bytes = [n * 2 for n in lens_samples]
-    ann_bytes_per_record = lens_bytes[ann_idx]
-    ann_offset_in_record = sum(lens_bytes[:ann_idx])
-    record_bytes = sum(lens_bytes)
-    n_signals = len(lens_bytes)
+    ann_samples_per_record = lens_samples[ann_idx]
+    ann_sample_offset_in_record = sum(lens_samples[:ann_idx])
+    record_samples = sum(lens_samples)
+    n_signals = len(lens_samples)
     n_records = int(get_header_field(str(path), "num_data_records"))
     data_start = TOTAL_HEADER_BYTES + SIGNAL_HEADER_BYTES * n_signals
 
     out: list[Annotation] = []
     file_size = path.stat().st_size
-    if file_size <= data_start or n_records == 0 or record_bytes == 0:
+    if (file_size <= data_start or n_records == 0
+            or record_samples == 0 or ann_samples_per_record == 0):
         return out
 
-    # Cap the loop at what PHYSICALLY fits in the file. Some raw NK
-    # exports lie about num_data_records (they'll write it as the
-    # nominal maximum instead of the actual on-disk count). Trusting
-    # the header verbatim would seek past EOF and either explode on
-    # mmap slicing or, worse, silently read garbage. This is also
-    # what makes the fast reader survive files that pyedflib refuses
-    # on that exact filesize / num_data_records inconsistency.
+    # Cap loop at what PHYSICALLY fits (raw NK often lies about
+    # num_data_records). Also what makes the reader survive files
+    # pyedflib refuses on the num_data_records / filesize check.
+    record_bytes = record_samples * 2
     max_records_that_fit = (file_size - data_start) // record_bytes
     effective_records = min(n_records, max_records_that_fit)
 
     with open(path, "rb") as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            for rec_i in range(effective_records):
-                offset = data_start + record_bytes * rec_i \
-                    + ann_offset_in_record
-                slice_ = mm[offset : offset + ann_bytes_per_record]
-                out.extend(_parse_tal_bytes(bytes(slice_), rec_i))
+            # Hint: we're about to touch the file in file-order. The
+            # kernel prefetches large blocks instead of chasing
+            # per-record random reads. Load-bearing on network mounts.
+            try:
+                mm.madvise(mmap.MADV_SEQUENTIAL)
+            except (AttributeError, OSError):
+                # madvise unavailable on some platforms; correctness
+                # unaffected, only perf.
+                pass
+
+            # numpy view into the mmap: (n_records, record_samples)
+            # int16. No copy, no per-record Python object churn.
+            # Slice the annotation columns and materialize them into
+            # a single contiguous bytes buffer (one C-level copy,
+            # not N Python-level slices).
+            #
+            # try/finally guarantees the mmap-backed views drop
+            # BEFORE mm.__exit__ runs -- otherwise mm.close() raises
+            # BufferError. Same pattern as the audit's
+            # _audit_signal_integrity_clean_side_stream.
+            try:
+                data = np.frombuffer(
+                    mm, dtype=np.int16,
+                    count=effective_records * record_samples,
+                    offset=data_start)
+                data = data.reshape(effective_records, record_samples)
+                ann_cols = data[:,
+                                 ann_sample_offset_in_record:
+                                 ann_sample_offset_in_record
+                                 + ann_samples_per_record]
+                # np.ascontiguousarray drops the stride from the parent
+                # array so .tobytes() is a straight memcpy.
+                ann_bytes_all = np.ascontiguousarray(ann_cols).tobytes()
+            finally:
+                # Drop every reference into the mmap so mm.close()
+                # (implicit at with-exit) doesn't hit BufferError.
+                data = ann_cols = None  # type: ignore[assignment]
+
+    ann_len = ann_samples_per_record * 2
+    for rec_i in range(effective_records):
+        offset = rec_i * ann_len
+        slice_ = ann_bytes_all[offset : offset + ann_len]
+        out.extend(_parse_tal_bytes(slice_, rec_i))
     return out
 
 
