@@ -20,7 +20,7 @@
     "H": [],
     "J": [
       "SpikeBurst \\d+(?:\\.\\d+)? \\d+(?:\\.\\d+)?s",
-      "RhythmicBurst [A-Za-z]+",
+      "RhythmicBurst [A-Za-z0-9-]{1,8}",
       "A1\\+A2 OFF",
       "RESET OFF",
       "RESET ON",
