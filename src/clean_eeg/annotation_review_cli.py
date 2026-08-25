@@ -103,6 +103,15 @@ def main(argv: list[str] | None = None) -> int:
                         "review and apply pending edits automatically. "
                         "For scripted / unattended runs -- interactive "
                         "operators should leave this off.")
+    p.add_argument("--preload-all", action="store_true",
+                   help="Eagerly load every reviewable file's "
+                        "annotations at startup with a tqdm progress "
+                        "bar (one-time cost), then auto-skip files "
+                        "whose annotations are entirely matched by "
+                        "the whitelist or delete bucket. Best when "
+                        "the operator reads faster than files load "
+                        "lazily -- turns per-file wait into one "
+                        "up-front pause.")
     args = p.parse_args(argv)
 
     try:
@@ -110,7 +119,8 @@ def main(argv: list[str] | None = None) -> int:
             args.subject_dir,
             subfolder=args.subfolder,
             whitelist_path=args.whitelist_path,
-            respect_reviewed_tracker=not args.include_reviewed)
+            respect_reviewed_tracker=not args.include_reviewed,
+            preload_all=args.preload_all)
     except PreflightFailure as e:
         print(f"[error] {e}", file=sys.stderr)
         return 2

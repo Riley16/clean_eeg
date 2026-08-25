@@ -145,12 +145,23 @@ class AnnotationReviewController:
                  subfolder: str = "clinical_eeg",
                  whitelist_path: Path | None = None,
                  respect_reviewed_tracker: bool = True,
-                 external_prefetch_paths: list[Path] | None = None):
+                 external_prefetch_paths: list[Path] | None = None,
+                 preload_all: bool = False):
         """``external_prefetch_paths``: optional additional EDF paths
         (e.g. the FIRST N files of the NEXT subject) to warm the
         prefetch queue after this subject's own files are exhausted.
         Lets a caller iterating parent-dir subjects avoid the
         subject-transition pause. None -> intra-subject prefetch only.
+
+        ``preload_all``: when True, load EVERY reviewable file's
+        annotations at __init__ time with a tqdm progress bar (one-
+        time startup cost). Files whose annotations are entirely
+        matched by the whitelist or delete bucket are auto-marked
+        reviewed and dropped from the reviewable list -- the
+        operator never scrolls into a file with nothing to look at.
+        Default (False) uses the lazy per-file load + 2-worker
+        prefetch pattern, which is better when startup latency
+        matters more than steady-state throughput.
         """
         self.subject_dir = Path(subject_dir)
         self.subfolder = subfolder
@@ -222,6 +233,12 @@ class AnnotationReviewController:
             if key is not None:
                 self._pending[key] = e
 
+        # Preload-all path: eagerly load every reviewable file
+        # (with tqdm progress) so subsequent navigation is instant
+        # AND we can auto-drop files with nothing left to review.
+        if preload_all:
+            self._preload_all_and_drop_empty()
+
         # Warm the prefetch queue for the initial cursor position.
         self._schedule_prefetch()
 
@@ -292,6 +309,60 @@ class AnnotationReviewController:
         self._annotations_cache[file_index] = anns
         self._schedule_prefetch()
         return anns
+
+    # ---- eager preload with tqdm + auto-drop empty files ----
+
+    def _preload_all_and_drop_empty(self) -> None:
+        """Eagerly load every reviewable file's annotations with a
+        tqdm progress bar. Files whose annotations are entirely
+        matched by the whitelist or delete bucket are auto-marked
+        reviewed and dropped from ``self._file_indices`` so the
+        operator never scrolls into a file with nothing to look at.
+        """
+        from tqdm import tqdm
+
+        to_load = list(self._file_indices)
+        # Load each file synchronously; the pool would only add
+        # scheduling overhead here since we're going to wait for
+        # everything anyway.
+        for fi in tqdm(to_load, desc=f"preloading {self.subject_dir.name}",
+                        unit="file", leave=False):
+            if fi in self._annotations_cache:
+                continue
+            self._annotations_cache[fi] = _prefetch_one(self._edfs[fi])
+
+        # After all loaded, drop files whose EVERY annotation is
+        # whitelisted or delete-marked. Empty files also drop.
+        keep: list[int] = []
+        dropped_paths: list[Path] = []
+        for fi in self._file_indices:
+            anns = self._annotations_cache.get(fi, [])
+            non_boilerplate = [
+                a for a in anns
+                if a.text.strip()
+                and not self._whitelist.matches(
+                    a.text, site_code=self.site_code)
+                and not self._whitelist.matches_delete(
+                    a.text, site_code=self.site_code)]
+            if non_boilerplate:
+                keep.append(fi)
+            else:
+                # Auto-record as reviewed. n_edited=0 because we're
+                # skipping without visiting.
+                self._tracker.mark_reviewed(ReviewedFile.new(
+                    file_path=self._edfs[fi],
+                    n_annotations=len(anns),
+                    n_edited=0))
+                dropped_paths.append(self._edfs[fi])
+        self._file_indices = keep
+        if self._file_indices:
+            self.file_cursor = self._file_indices[0]
+        self.annotation_cursor = 0
+
+        if dropped_paths:
+            print(f"[review] auto-skipped {len(dropped_paths)} file(s) "
+                  f"with no non-boilerplate annotations "
+                  f"(marked reviewed).")
 
     def _schedule_prefetch(self) -> None:
         """Ensure the next PREFETCH_LOOKAHEAD unreviewed files after

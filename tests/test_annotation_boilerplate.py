@@ -268,29 +268,78 @@ def test_asterisk_prefix_does_not_over_match(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_case_insensitive_substring_matches_various_casings(tmp_path):
-    """HARD REQUIREMENT: patterns like the built-in 'asleep/awake/
-    spikes/review' family match ANY casing of the base word.
-    Verified with the actual regex from the whitelist file."""
+    """HARD REQUIREMENT: patterns like the built-in
+    'artifact/asleep/awake/spikes/review' family match ANY casing of
+    the base word.
+
+    Slop semantics: 'up to 5 chars separated by space' -- meaning up
+    to a 5-char space-delimited TOKEN on either side, NOT arbitrary
+    5-char slop that could include whitespace. That's what makes
+    'muscle artifact' (6-char leading token) NOT match while
+    'musle artifact' (5-char leading token) DOES.
+    """
     path = tmp_path / "wl.json"
     path.write_text(json.dumps({
         "shared": [
-            r"(?i).{0,5}(?:asleep|awake|spikes|review).{0,5}"],
+            r"(?i)(?:\S{1,5} )?"
+            r"(?:artifact|asleep|awake|spikes|review)"
+            r"(?: \S{1,5})?"],
         "per_site": {},
     }))
     wl = load_whitelist(path)
-    # All-lower / all-upper / mixed
+    # Bare base word, any casing
     assert wl.matches("asleep") is True
     assert wl.matches("ASLEEP") is True
     assert wl.matches("aWaKe") is True
     assert wl.matches("Spikes") is True
     assert wl.matches("REVIEW") is True
-    # With slop on either side (up to 5 chars): "  asleep!" is
-    # 2 chars before + core + 1 char after = matches.
-    assert wl.matches("  asleep!") is True
-    # 5 exactly on each side -> matches.
-    assert wl.matches("XXXXXasleepYYYYY") is True
-    # 6+ on either side -> does NOT match (slop capped at 5).
-    assert wl.matches("XXXXXXasleep") is False           # 6 before
-    assert wl.matches("asleepYYYYYY") is False           # 6 after
+    assert wl.matches("artifact") is True
+    # 5-char leading token (separated by space) matches
+    assert wl.matches("musle artifact") is True
+    # 6-char leading token does NOT match
+    assert wl.matches("muscle artifact") is False
+    # 5-char trailing token matches
+    assert wl.matches("artifact 12345") is True
+    # 6-char trailing token does NOT
+    assert wl.matches("artifact abcdef") is False
+    # Both slots filled with 5 chars each -> matches
+    assert wl.matches("ABCDE artifact 12345") is True
+    # Slop with no space separator -> does NOT match
+    # (the 'separated by space' rule is what makes this fail)
+    assert wl.matches("XXXXXartifact") is False
+    # Multi-token trailing does NOT match
+    assert wl.matches("artifact foo bar") is False
     # Words not in the pattern -> NOT matched
     assert wl.matches("bedtime") is False
+
+
+def test_mark_pattern_trailing_slop(tmp_path):
+    """New pattern: '(?i)Mark(?: \\S{1,5})?' -- Mark (any casing)
+    optionally followed by a space + up-to-5-char token. Combined
+    with the global asterisk-strip rule, catches '*Mark', '* Mark',
+    'mark 123', 'MARK abcde', etc."""
+    path = tmp_path / "wl.json"
+    path.write_text(json.dumps({
+        "shared": [r"(?i)Mark(?: \S{1,5})?"],
+        "per_site": {},
+    }))
+    wl = load_whitelist(path)
+    # Bare word, any casing (bare 'Mark' is 4 chars -- would also
+    # match the .{1,5} shared rule elsewhere, but here we test THIS
+    # pattern in isolation).
+    assert wl.matches("Mark") is True
+    assert wl.matches("MARK") is True
+    assert wl.matches("mark") is True
+    # With a 1-5 char trailing token
+    assert wl.matches("Mark 123") is True
+    assert wl.matches("MARK abcde") is True
+    # Beyond 5 -> does NOT match
+    assert wl.matches("Mark abcdef") is False
+    # Multi-token trailing -> NOT
+    assert wl.matches("Mark foo bar") is False
+    # Global asterisk-strip: '*Mark' / '* Mark' / '*mark' via the
+    # matches() prefix rule
+    assert wl.matches("*Mark") is True
+    assert wl.matches("* Mark") is True
+    assert wl.matches("*mark") is True
+    assert wl.matches("* mark") is True

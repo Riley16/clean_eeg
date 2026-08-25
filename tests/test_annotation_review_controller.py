@@ -459,6 +459,56 @@ def test_prefetched_file_returns_from_cache_on_next_file(tmp_path):
     c.close()
 
 
+def test_preload_all_drops_files_with_only_whitelisted_annotations(tmp_path):
+    """POSITIVE: with preload_all=True + a whitelist that silences
+    every annotation in a file, that file is auto-marked reviewed
+    AND removed from the reviewable list. The operator only ever
+    sees files with real content."""
+    import json as _json
+    subj = _make_subject(tmp_path, "R1755A", {
+        "all_boilerplate.edf": ["PAT REF EEG", "PAT REF EEG"],
+        "has_real.edf": ["seizure onset", "eyes closed"],
+    })
+    # Whitelist silences everything in all_boilerplate.edf
+    wl_path = tmp_path / "wl.json"
+    wl_path.write_text(_json.dumps({
+        "shared": [], "per_site": {"A": [r"PAT REF EEG"]}}))
+
+    c = AnnotationReviewController(subj, whitelist_path=wl_path,
+                                     preload_all=True)
+    reviewable_names = [
+        c._edfs[i].name for i in c._file_indices]
+    assert "all_boilerplate.edf" not in reviewable_names
+    assert "has_real.edf" in reviewable_names
+
+    # The dropped file was silently marked reviewed on disk
+    from clean_eeg.annotation_review.journal import ReviewedTracker
+    reviewed = {r.file_path for r in ReviewedTracker(subj).read_all()}
+    assert any(p.endswith("all_boilerplate.edf") for p in reviewed)
+    c.close()
+
+
+def test_preload_all_keeps_files_with_partial_boilerplate(tmp_path):
+    """NEGATIVE regression: a file with SOME whitelisted content and
+    SOME real content stays in the reviewable list. Guards against
+    an over-eager drop that would hide files where the operator
+    still needs to look at 1-2 real annotations."""
+    import json as _json
+    subj = _make_subject(tmp_path, "R1755A", {
+        "mixed.edf": ["PAT REF EEG", "real event", "PAT REF EEG"],
+    })
+    wl_path = tmp_path / "wl.json"
+    wl_path.write_text(_json.dumps({
+        "shared": [], "per_site": {"A": [r"PAT REF EEG"]}}))
+
+    c = AnnotationReviewController(subj, whitelist_path=wl_path,
+                                     preload_all=True)
+    reviewable_names = [
+        c._edfs[i].name for i in c._file_indices]
+    assert "mixed.edf" in reviewable_names
+    c.close()
+
+
 def test_controller_close_shuts_down_prefetch_pool(tmp_path):
     """Regression: close() must shutdown the ThreadPoolExecutor so
     hanging daemon threads don't outlive the process. Verified by

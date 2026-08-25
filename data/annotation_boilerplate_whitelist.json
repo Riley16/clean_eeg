@@ -1,7 +1,8 @@
 {
   "shared": [
     ".{1,5}",
-    "(?i).{0,5}(?:asleep|awake|spikes|review).{0,5}"
+    "(?i)(?:\\S{1,5} )?(?:artifact|asleep|awake|spikes|review)(?: \\S{1,5})?",
+    "(?i)Mark(?: \\S{1,5})?"
   ],
   "per_site": {
     "S": [],
