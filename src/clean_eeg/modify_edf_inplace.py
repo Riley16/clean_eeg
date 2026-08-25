@@ -528,17 +528,25 @@ def get_header_field(edf_path, field: str, return_raw_bytes: bool = False):
 
 
 def get_signal_header_fields(edf_path, field: str):
-    # load all signal header fields by raw bytes, including annotation signal
-    with pyedflib.EdfReader(edf_path) as reader:
-        n_signals = reader.signals_in_file
+    """Load ALL signal header fields (including the annotation channel)
+    for ``field`` via raw byte reads. No pyedflib dependency, so this
+    also works on files pyedflib refuses to open (raw NK exports whose
+    ``num_data_records`` disagrees with the physical file size).
 
-    field_attributes = EDF_SIGNAL_HEADER_FIELD_OFFSETS_LENGTHS[field]
-    field_offset, field_bytes_length, field_type = field_attributes
+    num_signals is read from the main header at bytes 252..256; this
+    value already INCLUDES the annotation channel (pyedflib's
+    ``signals_in_file`` excludes it and the previous implementation
+    used ``+ 1`` to compensate). Same end-to-end behavior.
+    """
+    n_signals = int(get_header_field(edf_path, 'num_signals'))
+    field_offset, field_bytes_length, field_type = \
+        EDF_SIGNAL_HEADER_FIELD_OFFSETS_LENGTHS[field]
 
     record_num_samples = list()
     with open(edf_path, "rb") as f:
-        for i in range(n_signals + 1):
-            f.seek(TOTAL_HEADER_BYTES + (n_signals + 1) * field_offset + i * field_bytes_length)
+        for i in range(n_signals):
+            f.seek(TOTAL_HEADER_BYTES + n_signals * field_offset
+                   + i * field_bytes_length)
             field_bytes = f.read(field_bytes_length)
             value = format_field_from_bytes(field_bytes, field_type)
             record_num_samples.append(value)

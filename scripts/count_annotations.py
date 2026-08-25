@@ -27,13 +27,21 @@ def count_edf_annotations(edf_path: Path) -> tuple[int, int]:
     annotations in ``edf_path``. Whitespace-only entries excluded
     (they'd inflate the annotation count without carrying anything
     to read). Word count is whitespace-tokenized on each annotation
-    text -- close enough for a review-time estimate."""
-    import pyedflib
-    with pyedflib.EdfReader(str(edf_path)) as f:
-        _onsets, _durations, texts = f.readAnnotations()
-    kept = [t for t in texts if t and t.strip()]
-    n_words = sum(len(t.split()) for t in kept)
-    return len(kept), n_words
+    text -- close enough for a review-time estimate.
+
+    Uses the mmap-based reader in ``clean_eeg.annotation_reader``,
+    which skips signal-data reads entirely -- multi-GB files count
+    in seconds instead of minutes. Also works on files pyedflib
+    refuses (raw EDF+D not yet split), so PRE-clean and POST-clean
+    counts use the same code path.
+    """
+    from clean_eeg.annotation_reader import (
+        count_words_in_annotations,
+        iter_annotations,
+    )
+    anns = iter_annotations(edf_path)
+    kept = [a for a in anns if a.text.strip()]
+    return len(kept), count_words_in_annotations(kept)
 
 
 def scan_parent(parent_dir: Path,
