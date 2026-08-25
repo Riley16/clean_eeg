@@ -51,20 +51,36 @@ class BoilerplateWhitelist:
     def matches(self, text: str, site_code: str | None = None) -> bool:
         """True if ``text`` matches (via ``re.fullmatch``) any shared
         or per-site WHITELIST regex. Full-match semantics -- the
-        regex must match the ENTIRE text, not a substring."""
-        return self._matches_in(text, site_code,
-                                 self.shared, self.per_site)
+        regex must match the ENTIRE text, not a substring.
+
+        Also matches after stripping an optional leading ``*`` or
+        ``*<space>`` prefix. Clinical annotation exports routinely
+        prepend a literal asterisk to boilerplate ('*Mark',
+        '* RESET OFF') so requiring patterns to explicitly cover
+        that prefix would double every JSON entry. Handling it here
+        keeps the JSON clean.
+        """
+        return (self._matches_in(text, site_code,
+                                  self.shared, self.per_site)
+                or self._matches_in(
+                    _strip_asterisk_prefix(text), site_code,
+                    self.shared, self.per_site))
 
     def matches_delete(self, text: str,
                         site_code: str | None = None) -> bool:
         """True if ``text`` matches (via ``re.fullmatch``) any shared
-        or per-site DELETE regex. Callers that only want to exclude
+        or per-site DELETE regex. Same asterisk-prefix handling as
+        :meth:`matches`. Callers that only want to exclude
         annotations from a review count should use
         ``matches`` OR ``matches_delete``. Callers that will actually
         mutate the EDF (delete these annotations) should use
         ``matches_delete`` alone."""
-        return self._matches_in(text, site_code,
-                                 self.delete_shared, self.delete_per_site)
+        return (self._matches_in(text, site_code,
+                                  self.delete_shared,
+                                  self.delete_per_site)
+                or self._matches_in(
+                    _strip_asterisk_prefix(text), site_code,
+                    self.delete_shared, self.delete_per_site))
 
     def _matches_in(self, text: str, site_code: str | None,
                      shared: list[re.Pattern],
@@ -77,6 +93,21 @@ class BoilerplateWhitelist:
                 if pat.fullmatch(text):
                     return True
         return False
+
+
+def _strip_asterisk_prefix(text: str) -> str:
+    """Strip a leading ``*`` or ``*<whitespace>`` from ``text``.
+    Returns the original text unchanged if no such prefix exists.
+    Used by :class:`BoilerplateWhitelist` to make the ``*`` prefix
+    that clinical exports routinely prepend to boilerplate
+    ('*Mark', '* RESET OFF') an implicit optional prefix on every
+    whitelist / delete pattern -- so operators don't have to
+    duplicate every entry with a ``\\*\\s?`` variant."""
+    if text.startswith("* "):
+        return text[2:]
+    if text.startswith("*"):
+        return text[1:]
+    return text
 
 
 class BoilerplateWhitelistError(ValueError):

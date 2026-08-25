@@ -206,3 +206,91 @@ def test_delete_bucket_malformed_type_raises(tmp_path):
     with pytest.raises(BoilerplateWhitelistError,
                         match="delete_shared"):
         load_whitelist(path)
+
+
+# ---------------------------------------------------------------------------
+# Optional leading '*' or '* ' prefix: implicit on every pattern
+# ---------------------------------------------------------------------------
+
+def test_asterisk_prefix_matches_via_whitelist(tmp_path):
+    """Global rule: a whitelist pattern silences '*<pattern>' and
+    '* <pattern>' too, without the operator having to duplicate every
+    entry with a leading '\\*\\s?'. Clinical exports routinely prepend
+    a literal asterisk to boilerplate."""
+    path = tmp_path / "wl.json"
+    path.write_text(json.dumps({
+        "shared": [], "per_site": {"J": [r"RESET OFF"]},
+    }))
+    wl = load_whitelist(path)
+    assert wl.matches("RESET OFF", site_code="J") is True
+    assert wl.matches("*RESET OFF", site_code="J") is True
+    assert wl.matches("* RESET OFF", site_code="J") is True
+    # Wrong-site still fails
+    assert wl.matches("*RESET OFF", site_code="A") is False
+
+
+def test_asterisk_prefix_matches_via_delete_bucket(tmp_path):
+    """The same asterisk-prefix rule applies to the DELETE bucket
+    so an operator marking 'Segment: REC START ...' for deletion
+    also catches '*Segment: REC START ...' automatically."""
+    path = tmp_path / "wl.json"
+    path.write_text(json.dumps({
+        "shared": [], "per_site": {},
+        "delete_shared": [], "delete_per_site": {
+            "J": [r"Segment: REC START.*"]},
+    }))
+    wl = load_whitelist(path)
+    assert wl.matches_delete("Segment: REC START at 10:00",
+                              site_code="J") is True
+    assert wl.matches_delete("*Segment: REC START at 10:00",
+                              site_code="J") is True
+    assert wl.matches_delete("* Segment: REC START at 10:00",
+                              site_code="J") is True
+
+
+def test_asterisk_prefix_does_not_over_match(tmp_path):
+    """NEGATIVE regression: the asterisk-strip is a PREFIX-only rule.
+    An asterisk NOT at the start of the string is left alone --
+    otherwise we'd silence real PHI like 'note: * urgent contact
+    smith'."""
+    path = tmp_path / "wl.json"
+    path.write_text(json.dumps({
+        "shared": [], "per_site": {"J": [r"urgent contact smith"]},
+    }))
+    wl = load_whitelist(path)
+    # Different text (asterisk in the middle) -> NOT matched
+    assert wl.matches("note: * urgent contact smith",
+                       site_code="J") is False
+
+
+# ---------------------------------------------------------------------------
+# Case-insensitive substring pattern (asleep / awake / spikes / review)
+# ---------------------------------------------------------------------------
+
+def test_case_insensitive_substring_matches_various_casings(tmp_path):
+    """HARD REQUIREMENT: patterns like the built-in 'asleep/awake/
+    spikes/review' family match ANY casing of the base word.
+    Verified with the actual regex from the whitelist file."""
+    path = tmp_path / "wl.json"
+    path.write_text(json.dumps({
+        "shared": [
+            r"(?i).{0,5}(?:asleep|awake|spikes|review).{0,5}"],
+        "per_site": {},
+    }))
+    wl = load_whitelist(path)
+    # All-lower / all-upper / mixed
+    assert wl.matches("asleep") is True
+    assert wl.matches("ASLEEP") is True
+    assert wl.matches("aWaKe") is True
+    assert wl.matches("Spikes") is True
+    assert wl.matches("REVIEW") is True
+    # With slop on either side (up to 5 chars): "  asleep!" is
+    # 2 chars before + core + 1 char after = matches.
+    assert wl.matches("  asleep!") is True
+    # 5 exactly on each side -> matches.
+    assert wl.matches("XXXXXasleepYYYYY") is True
+    # 6+ on either side -> does NOT match (slop capped at 5).
+    assert wl.matches("XXXXXXasleep") is False           # 6 before
+    assert wl.matches("asleepYYYYYY") is False           # 6 after
+    # Words not in the pattern -> NOT matched
+    assert wl.matches("bedtime") is False
