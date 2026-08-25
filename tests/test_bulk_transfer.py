@@ -757,6 +757,88 @@ def test_main_only_subjects_returns_nonzero_when_no_match(tmp_path,
     assert rc == 1
 
 
+def test_main_only_subjects_file_scopes_transfer_to_listed_codes(
+        tmp_path, monkeypatch):
+    """POSITIVE integration for --only-subjects-file at the bulk
+    transfer CLI: file with one subject code selects it exactly,
+    matching the behavior of the inline --only-subjects flag but
+    driven from disk so the same file can be shared with
+    clean-batch-eeg."""
+    out = _make_subject_dir(tmp_path)
+    subjects_file = tmp_path / "subjects.txt"
+    subjects_file.write_text(str(out) + "\n")
+    filter_path = tmp_path / "filter.txt"
+    filter_path.write_text("# batch file\nR1755A\n")
+
+    seen: list[str] = []
+
+    def stub_rsync(plan, *a, **k):
+        seen.append(plan.subject_code)
+        return 0, "", False
+
+    monkeypatch.setattr("clean_eeg.bulk_transfer._run_subject_rsync",
+                        stub_rsync)
+
+    rc = main([
+        "--subjects-file", str(subjects_file),
+        "--user", "alice", "--parallel", "1",
+        "--max-retries", "1", "--backoff-base", "0",
+        "--remote-dir-override", str(tmp_path / "dest"),
+        "--only-subjects-file", str(filter_path),
+    ])
+    assert rc == 0
+    assert seen == ["R1755A"]
+
+
+def test_main_only_subjects_file_returns_2_when_file_missing(tmp_path):
+    """Distinct exit code (2) for input-validation vs 1 for
+    'ran and something failed' -- same convention as clean-batch-eeg."""
+    subjects_file = tmp_path / "subjects.txt"
+    subjects_file.write_text("/nonexistent/subject\n")
+    rc = main([
+        "--subjects-file", str(subjects_file),
+        "--user", "alice",
+        "--remote-dir-override", str(tmp_path / "dest"),
+        "--only-subjects-file", str(tmp_path / "does_not_exist.txt"),
+    ])
+    assert rc == 2
+
+
+def test_main_only_subjects_file_merges_with_inline_only_subjects(
+        tmp_path, monkeypatch):
+    """Inline --only-subjects merged with --only-subjects-file: union,
+    same as clean-batch-eeg. Regression guard against a bug where one
+    would silently override the other."""
+    out = _make_subject_dir(tmp_path)
+    subjects_file = tmp_path / "subjects.txt"
+    subjects_file.write_text(str(out) + "\n")
+    filter_path = tmp_path / "filter.txt"
+    filter_path.write_text("R_FROM_FILE\n")   # not in this batch
+
+    seen: list[str] = []
+
+    def stub_rsync(plan, *a, **k):
+        seen.append(plan.subject_code)
+        return 0, "", False
+
+    monkeypatch.setattr("clean_eeg.bulk_transfer._run_subject_rsync",
+                        stub_rsync)
+
+    # Inline R1755A is present in the batch; file's R_FROM_FILE is not.
+    # The union should still pick R1755A -- proving both inputs feed
+    # the filter.
+    rc = main([
+        "--subjects-file", str(subjects_file),
+        "--user", "alice", "--parallel", "1",
+        "--max-retries", "1", "--backoff-base", "0",
+        "--remote-dir-override", str(tmp_path / "dest"),
+        "--only-subjects", "R1755A",
+        "--only-subjects-file", str(filter_path),
+    ])
+    assert rc == 0
+    assert seen == ["R1755A"]
+
+
 # ---------------------------------------------------------------------------
 # Failed-subjects CSV: post-batch review artifact
 # ---------------------------------------------------------------------------

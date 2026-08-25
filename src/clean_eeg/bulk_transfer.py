@@ -737,6 +737,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         "smoke-testing one subject before releasing the whole "
                         "batch. Warns for entries that don't match any "
                         "successful preflight.")
+    p.add_argument("--only-subjects-file", type=Path, default=None,
+                   metavar="FILE",
+                   help="File with one subject code per line (blank lines and "
+                        "'#' comments ignored). Merged with --only-subjects "
+                        "if both are given. Same subjects-list file can "
+                        "drive clean-batch-eeg and bulk-transfer-eeg so "
+                        "the two stages stay in lockstep.")
     return p
 
 
@@ -776,6 +783,20 @@ def main(argv: list[str] | None = None) -> int:
         day_end=_parse_hhmm(args.day_end),
     )
 
+    only_subjects: list[str] = list(args.only_subjects or [])
+    if args.only_subjects_file is not None:
+        # Reuse the loader from clean_batch so both wrappers accept
+        # the same file format (single point of truth for the parse
+        # rules: strip whitespace, ignore blank + '#' lines, dedupe).
+        from clean_eeg.clean_batch import load_subject_codes_from_file
+        try:
+            only_subjects.extend(
+                load_subject_codes_from_file(args.only_subjects_file))
+        except OSError as e:
+            print(f"Cannot read --only-subjects-file "
+                  f"{args.only_subjects_file}: {e}", file=sys.stderr)
+            return 2
+
     results, hard_failures = run_bulk_transfer(
         subject_dirs,
         ssh_user=args.user or getpass.getuser(),
@@ -786,13 +807,14 @@ def main(argv: list[str] | None = None) -> int:
         remote_dir_override=args.remote_dir_override,
         log_path=args.log_path,
         subjects_file=args.subjects_file,
-        only_subjects=args.only_subjects,
+        only_subjects=only_subjects or None,
     )
-    if args.only_subjects and not results and not hard_failures:
-        # Picker matched nothing (--only-subjects entries all typos or
-        # missing manifests). Don't silently exit 0 -- that would mask
-        # a smoke-test typo. run_bulk_transfer already warned on stderr.
-        print("[error] --only-subjects picker matched zero subjects; "
+    if only_subjects and not results and not hard_failures:
+        # Picker matched nothing (--only-subjects[-file] entries all
+        # typos or missing manifests). Don't silently exit 0 -- that
+        # would mask a smoke-test typo. run_bulk_transfer already
+        # warned on stderr.
+        print("[error] subject filter matched zero subjects; "
               "check for typos.", file=sys.stderr)
         return 1
     # Exit nonzero on any failure so a wrapping script (cron, batch

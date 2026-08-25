@@ -201,8 +201,23 @@ def clean_one_subject(row: SubjectRow, *, extra_argv: list[str] | None = None,
 
 
 # ---------------------------------------------------------------------------
-# Subject filter (--only-subjects)
+# Subject filter (--only-subjects, --only-subjects-file)
 # ---------------------------------------------------------------------------
+
+def load_subject_codes_from_file(path: Path) -> list[str]:
+    """One subject code per line; blank lines and '#' comments ignored.
+    Whitespace stripped. Preserves order and duplicates removed."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in Path(path).read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line not in seen:
+            seen.add(line)
+            out.append(line)
+    return out
+
 
 def filter_rows_by_subject(rows: list[SubjectRow],
                             only_subjects: list[str] | None,
@@ -367,6 +382,14 @@ def _build_parser() -> argparse.ArgumentParser:
                          "for smoke-testing one subject before releasing "
                          "the whole batch. Warns if any listed code did "
                          "not match a row."))
+    p.add_argument("--only-subjects-file", type=Path, default=None,
+                   metavar="FILE",
+                   help=("File with one subject code per line (blank "
+                         "lines and '#' comments ignored). Merged with "
+                         "--only-subjects if both are given. Lets you "
+                         "generate the CSV once (with every subject) "
+                         "and drive successive runs by editing a filter "
+                         "file instead of re-running the extractor."))
     p.add_argument("--audit-after-clean", action="store_true",
                    help=("After each successful clean, invoke "
                          "audit-subject-eeg against the output_path. "
@@ -395,9 +418,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"No subject rows found in {args.subjects_csv}", file=sys.stderr)
         return 1
 
-    rows = filter_rows_by_subject(rows, args.only_subjects)
+    only_subjects: list[str] = list(args.only_subjects or [])
+    if args.only_subjects_file is not None:
+        try:
+            only_subjects.extend(
+                load_subject_codes_from_file(args.only_subjects_file))
+        except OSError as e:
+            print(f"Cannot read --only-subjects-file "
+                  f"{args.only_subjects_file}: {e}", file=sys.stderr)
+            return 2
+    rows = filter_rows_by_subject(rows, only_subjects or None)
     if not rows:
-        print(f"No rows match --only-subjects {args.only_subjects}",
+        print(f"No rows match the subject filter "
+              f"(--only-subjects={args.only_subjects}, "
+              f"--only-subjects-file={args.only_subjects_file})",
               file=sys.stderr)
         return 1
 

@@ -21,6 +21,7 @@ from clean_eeg.clean_batch import (
     audit_one_subject,
     clean_one_subject,
     filter_rows_by_subject,
+    load_subject_codes_from_file,
     main,
     parse_subjects_csv,
     run_batch,
@@ -659,3 +660,120 @@ def test_audit_flag_off_by_default_skips_audit(tmp_path, monkeypatch):
     rc = main(["--subjects-csv", str(csv_path), "--quiet-child-output"])
     assert rc == 0
     assert not audit_marker.exists()
+
+
+# ---------------------------------------------------------------------------
+# --only-subjects-file: file-based subject picker
+# ---------------------------------------------------------------------------
+
+def test_load_subject_codes_from_file_ignores_blanks_and_comments(tmp_path):
+    """Same parse rules as --subjects-file / subjects_filter.txt:
+    blank lines and '#' comments dropped, whitespace stripped."""
+    f = tmp_path / "filter.txt"
+    f.write_text(
+        "# subjects to run this batch\n"
+        "R1651J\n"
+        "\n"
+        "  R1665J  \n"      # extra whitespace stripped
+        "# R1755J is out this round\n"
+        "R1753J\n"
+    )
+    codes = load_subject_codes_from_file(f)
+    assert codes == ["R1651J", "R1665J", "R1753J"]
+
+
+def test_load_subject_codes_from_file_dedupes_preserving_order(tmp_path):
+    """Duplicate entries in the filter file are collapsed to a single
+    occurrence; first-seen order preserved. Guards against a typo
+    where the same code appears twice generating a spurious warning
+    downstream."""
+    f = tmp_path / "filter.txt"
+    f.write_text("R1B\nR1A\nR1B\nR1C\nR1A\n")
+    assert load_subject_codes_from_file(f) == ["R1B", "R1A", "R1C"]
+
+
+def test_main_only_subjects_file_runs_just_the_listed_row(tmp_path,
+                                                            monkeypatch):
+    """POSITIVE integration: file-based filter selects the intended
+    row and skips the others."""
+    csv_path = tmp_path / "s.csv"
+    _write_csv(csv_path, [_valid_row("R1"), _valid_row("R2"),
+                          _valid_row("R3")])
+    filter_path = tmp_path / "filter.txt"
+    filter_path.write_text("# batch of Aug 24\nR2\n")
+
+    seen = tmp_path / "seen.txt"
+    stub = tmp_path / "capture.py"
+    stub.write_text(
+        "import sys\n"
+        "code = sys.argv[sys.argv.index('--subject_code') + 1]\n"
+        f"open({str(seen)!r}, 'a').write(code + '\\n')\n"
+        "sys.exit(0)\n"
+    )
+    monkeypatch.setattr(
+        "clean_eeg.clean_batch._default_clean_argv_prefix",
+        lambda: [sys.executable, str(stub)])
+
+    rc = main(["--subjects-csv", str(csv_path), "--quiet-child-output",
+               "--only-subjects-file", str(filter_path)])
+    assert rc == 0
+    assert seen.read_text().splitlines() == ["R2"]
+
+
+def test_main_only_subjects_file_merges_with_inline_only_subjects(
+        tmp_path, monkeypatch):
+    """When both --only-subjects and --only-subjects-file are given,
+    their union is used. Useful for 'run everyone in the standing
+    batch file PLUS one ad-hoc code'."""
+    csv_path = tmp_path / "s.csv"
+    _write_csv(csv_path, [_valid_row("R1"), _valid_row("R2"),
+                          _valid_row("R3")])
+    filter_path = tmp_path / "filter.txt"
+    filter_path.write_text("R1\n")   # file lists R1
+
+    seen = tmp_path / "seen.txt"
+    stub = tmp_path / "capture.py"
+    stub.write_text(
+        "import sys\n"
+        "code = sys.argv[sys.argv.index('--subject_code') + 1]\n"
+        f"open({str(seen)!r}, 'a').write(code + '\\n')\n"
+        "sys.exit(0)\n"
+    )
+    monkeypatch.setattr(
+        "clean_eeg.clean_batch._default_clean_argv_prefix",
+        lambda: [sys.executable, str(stub)])
+
+    rc = main(["--subjects-csv", str(csv_path), "--quiet-child-output",
+               "--only-subjects", "R3",
+               "--only-subjects-file", str(filter_path)])
+    assert rc == 0
+    assert sorted(seen.read_text().splitlines()) == ["R1", "R3"]
+
+
+def test_main_only_subjects_file_returns_2_when_file_missing(tmp_path):
+    """Missing filter file is an input-validation error, distinct from
+    'ran and everything failed' (exit 1). Exit code 2 matches the
+    CSV-schema-error convention already used by this CLI."""
+    csv_path = tmp_path / "s.csv"
+    _write_csv(csv_path, [_valid_row("R1")])
+    rc = main(["--subjects-csv", str(csv_path), "--quiet-child-output",
+               "--only-subjects-file", str(tmp_path / "nonexistent.txt")])
+    assert rc == 2
+
+
+def test_main_only_subjects_file_returns_nonzero_when_no_match(
+        tmp_path, monkeypatch):
+    """Negative regression: file whose codes match no CSV row must
+    NOT silently succeed with 'nothing to do'. Same semantics as
+    typo'd inline --only-subjects."""
+    csv_path = tmp_path / "s.csv"
+    _write_csv(csv_path, [_valid_row("R1"), _valid_row("R2")])
+    filter_path = tmp_path / "filter.txt"
+    filter_path.write_text("R_NOT_IN_CSV\n")
+
+    monkeypatch.setattr(
+        "clean_eeg.clean_batch._default_clean_argv_prefix",
+        lambda: _make_stub_child(tmp_path, 0))
+    rc = main(["--subjects-csv", str(csv_path), "--quiet-child-output",
+               "--only-subjects-file", str(filter_path)])
+    assert rc == 1
