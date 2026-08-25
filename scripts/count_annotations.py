@@ -75,12 +75,13 @@ def scan_parent(parent_dir: Path,
                 subfolder: str = "clinical_eeg",
                 whitelist=None,
                 respect_reviewed_tracker: bool = True,
-                ) -> dict[str, tuple[int, int, int, int, int, int]]:
-    """Walk ``parent_dir`` looking for per-subject folders. For each
-    subject, look for ``<subject>/<subfolder>/*.edf`` first; fall back
-    to ``<subject>/*.edf`` if the subfolder doesn't exist. Skips
-    ``*_annotations.edf`` sidecars so we don't double-count post-clean
-    inplace-mode annotation stubs.
+                ) -> tuple[dict[str, tuple[int, int, int, int, int, int]],
+                            list[tuple[str, str]]]:
+    """Walk ``parent_dir`` looking for per-subject folders. Only
+    subjects with a ``<subject>/<subfolder>/`` subdir are counted;
+    subjects missing that subdir are skipped (reported in the second
+    return value). Skips ``*_annotations.edf`` sidecars so we don't
+    double-count post-clean inplace-mode annotation stubs.
 
     ``whitelist``: if given, annotations matched by the per-site
     whitelist are excluded from the review-time count and reported
@@ -92,22 +93,78 @@ def scan_parent(parent_dir: Path,
     skipped and reported in ``n_files_reviewed`` -- lets the estimate
     shrink as the operator makes progress.
 
-    Returns ``{subject_dir_name: (n_ann, n_words, n_files_ok,
-    n_files_skipped, n_files_reviewed, n_whitelisted)}``.
+    Returns ``(per_subject, skipped_subjects)`` where:
+        per_subject = {subject_dir_name: (n_ann, n_words, n_files_ok,
+                       n_files_skipped, n_files_reviewed, n_whitelisted)}
+        skipped_subjects = [(subject_dir_name, reason), ...]  ordered
+
+    Reasons include ``"no <subfolder>/ subdir"`` and
+    ``"permission denied: <path>"``. Permission errors on any read
+    inside a subject are captured and the subject is skipped rather
+    than halting the whole scan -- an operator running against a
+    shared collab drive routinely doesn't own everything.
     """
     per_subject: dict[str, tuple[int, int, int, int, int, int]] = {}
+    skipped_subjects: list[tuple[str, str]] = []
     if not parent_dir.exists():
         raise FileNotFoundError(f"{parent_dir} does not exist")
-    for subj_dir in sorted(parent_dir.iterdir()):
-        if not subj_dir.is_dir():
+
+    try:
+        subject_dirs = sorted(parent_dir.iterdir())
+    except PermissionError as e:
+        raise PermissionError(
+            f"{parent_dir}: cannot list children: {e}") from e
+
+    for subj_dir in subject_dirs:
+        try:
+            if not subj_dir.is_dir():
+                continue
+        except PermissionError as e:
+            skipped_subjects.append(
+                (subj_dir.name, f"permission denied: {e}"))
             continue
+
         inner = subj_dir / subfolder
-        target = inner if inner.exists() else subj_dir
+        # Explicit: no fallback to the subject dir itself. If the
+        # expected subfolder is missing, the subject is not laid out
+        # the way this tool expects and gets skipped with a clear
+        # reason.
+        try:
+            inner_exists = inner.exists()
+        except PermissionError as e:
+            skipped_subjects.append(
+                (subj_dir.name, f"permission denied: {e}"))
+            continue
+        if not inner_exists:
+            skipped_subjects.append(
+                (subj_dir.name, f"no {subfolder}/ subdir"))
+            continue
+
         site_code = _derive_site_code(subj_dir.name)
-        reviewed_paths = (_reviewed_paths_for(subj_dir)
-                          if respect_reviewed_tracker else set())
+        try:
+            reviewed_paths = (_reviewed_paths_for(subj_dir)
+                              if respect_reviewed_tracker else set())
+        except PermissionError as e:
+            skipped_subjects.append(
+                (subj_dir.name, f"permission denied on tracker: {e}"))
+            continue
+
         n_ann = n_words = n_ok = n_skipped = n_reviewed = n_whitelisted = 0
-        for edf in sorted(target.rglob("*.edf")):
+        # Force an explicit permission check -- pathlib.Path.rglob
+        # silently returns [] on a chmod-000 directory instead of
+        # raising, which would leave the subject in the results with
+        # 0 counts and mask the coverage gap. os.listdir DOES raise.
+        try:
+            import os as _os
+            _os.listdir(inner)
+        except PermissionError as e:
+            skipped_subjects.append(
+                (subj_dir.name,
+                 f"permission denied while listing EDFs: {e}"))
+            continue
+        edfs = sorted(inner.rglob("*.edf"))
+
+        for edf in edfs:
             if edf.name.endswith("_annotations.edf"):
                 continue
             if str(edf) in reviewed_paths:
@@ -116,6 +173,12 @@ def scan_parent(parent_dir: Path,
             try:
                 a, w, wl = count_edf_annotations(
                     edf, whitelist=whitelist, site_code=site_code)
+            except PermissionError:
+                # Per-file permission problem -- report as skipped so
+                # the operator knows coverage is incomplete for this
+                # subject.
+                n_skipped += 1
+                continue
             except Exception:
                 n_skipped += 1
                 continue
@@ -125,11 +188,13 @@ def scan_parent(parent_dir: Path,
             n_ok += 1
         per_subject[subj_dir.name] = (n_ann, n_words, n_ok, n_skipped,
                                        n_reviewed, n_whitelisted)
-    return per_subject
+    return per_subject, skipped_subjects
 
 
 def print_report(per_subject: dict[str, tuple[int, int, int, int, int, int]],
-                 wpm: int) -> None:
+                 wpm: int,
+                 skipped_subjects: list[tuple[str, str]] | None = None,
+                 ) -> None:
     total_ann = sum(a for a, _, _, _, _, _ in per_subject.values())
     total_words = sum(w for _, w, _, _, _, _ in per_subject.values())
     total_skipped = sum(s for _, _, _, s, _, _ in per_subject.values())
@@ -175,6 +240,11 @@ def print_report(per_subject: dict[str, tuple[int, int, int, int, int, int]],
         print(f"{code:<20s}  {f_ok:>5d}  {s:>4d}  {r:>4d}  "
               f"{wl:>5d}  {a:>7,}  {w:>8,}  {mins:>7.0f}")
 
+    if skipped_subjects:
+        print(f"\n=== Skipped subjects ({len(skipped_subjects)}) ===")
+        for name, reason in skipped_subjects:
+            print(f"  {name:<20s}  {reason}")
+
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
@@ -219,14 +289,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     try:
-        per_subject = scan_parent(
+        per_subject, skipped_subjects = scan_parent(
             args.parent_dir, args.subfolder,
             whitelist=whitelist,
             respect_reviewed_tracker=not args.include_reviewed)
     except FileNotFoundError as e:
         print(f"[error] {e}", file=sys.stderr)
         return 2
-    print_report(per_subject, args.wpm)
+    print_report(per_subject, args.wpm,
+                 skipped_subjects=skipped_subjects)
     return 0
 
 

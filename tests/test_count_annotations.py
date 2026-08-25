@@ -10,12 +10,14 @@ Small ops tool -- coverage is minimal but proves:
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pyedflib
+import pytest
 
 
 _SCRIPT = (Path(__file__).parent.parent
@@ -89,7 +91,7 @@ def test_scan_parent_reports_per_subject_totals(tmp_path):
         _write_edf_with_annotations(
             tmp_path / code / "clinical_eeg" / f"{code}_file.edf", texts)
 
-    result = count_annotations.scan_parent(tmp_path)
+    result, _ = count_annotations.scan_parent(tmp_path)
     assert result["R1A"] == (2, 3, 1, 0, 0, 0)
     assert result["R1B"] == (1, 4, 1, 0, 0, 0)
 
@@ -107,7 +109,7 @@ def test_scan_parent_skips_annotation_sidecars(tmp_path):
     _write_edf_with_annotations(inner / "R1SUBJ_annotations.edf",
                                  ["one two", "three"])   # sidecar dup
 
-    result = count_annotations.scan_parent(tmp_path)
+    result, _ = count_annotations.scan_parent(tmp_path)
     assert result["R1SUBJ"] == (2, 3, 1, 0, 0, 0)
 
 
@@ -120,7 +122,7 @@ def test_scan_parent_reports_skipped_files_separately(tmp_path):
     _write_edf_with_annotations(inner / "ok.edf", ["one two"])
     (inner / "garbage.edf").write_bytes(b"not an EDF at all")
 
-    result = count_annotations.scan_parent(tmp_path)
+    result, _ = count_annotations.scan_parent(tmp_path)
     n_ann, n_words, n_ok, n_skipped, n_reviewed, n_wl = result["R1SUBJ"]
     assert n_ok == 1
     assert n_skipped == 1
@@ -153,7 +155,7 @@ def test_scan_parent_excludes_whitelist_matched_annotations(tmp_path):
         "eyes closed",            # counted (2 words)
     ])
 
-    result = count_annotations.scan_parent(tmp_path, whitelist=wl)
+    result, _ = count_annotations.scan_parent(tmp_path, whitelist=wl)
     n_ann, n_words, n_ok, n_skip, n_rev, n_wl = result["R1755A"]
     assert n_ann == 2           # PAT REF EEG excluded
     assert n_words == 3         # 'seizure' + 'eyes closed' = 1 + 2
@@ -176,7 +178,7 @@ def test_scan_parent_whitelist_uses_correct_site_bucket(tmp_path):
     inner.mkdir(parents=True)
     _write_edf_with_annotations(inner / "R1755A.edf", ["PAT REF EEG"])
 
-    result = count_annotations.scan_parent(tmp_path, whitelist=wl)
+    result, _ = count_annotations.scan_parent(tmp_path, whitelist=wl)
     n_ann, n_words, _, _, _, n_wl = result["R1755A"]
     assert n_ann == 1   # NOT whitelisted for site A
     assert n_wl == 0
@@ -197,7 +199,7 @@ def test_scan_parent_whitelist_matches_full_text_only(tmp_path):
     _write_edf_with_annotations(inner / "R1755A.edf",
                                  ["PAT REF EEG CAROL LOOK AT THIS"])
 
-    result = count_annotations.scan_parent(tmp_path, whitelist=wl)
+    result, _ = count_annotations.scan_parent(tmp_path, whitelist=wl)
     n_ann, n_words, _, _, _, n_wl = result["R1755A"]
     assert n_ann == 1
     assert n_wl == 0     # NOT matched (partial)
@@ -225,7 +227,7 @@ def test_scan_parent_skips_files_in_reviewed_tracker(tmp_path):
     ReviewedTracker(subj).mark_reviewed(
         ReviewedFile.new(file_path=done, n_annotations=3, n_edited=0))
 
-    result = count_annotations.scan_parent(tmp_path)
+    result, _ = count_annotations.scan_parent(tmp_path)
     n_ann, n_words, n_ok, n_skip, n_rev, n_wl = result["R1755A"]
     assert n_rev == 1
     assert n_ok == 1
@@ -247,10 +249,76 @@ def test_scan_parent_include_reviewed_disables_tracker_filter(tmp_path):
         ReviewedFile.new(file_path=inner / "R1755A.edf",
                          n_annotations=1, n_edited=0))
 
-    result = count_annotations.scan_parent(
+    result, _ = count_annotations.scan_parent(
         tmp_path, respect_reviewed_tracker=False)
     n_ann, n_words, n_ok, n_skip, n_rev, n_wl = result["R1755A"]
     assert n_rev == 0        # tracker ignored
     assert n_ok == 1
     assert n_ann == 1
     assert n_words == 3
+
+
+# ---------------------------------------------------------------------------
+# Skip subjects without the expected subfolder / with permission errors
+# ---------------------------------------------------------------------------
+
+def test_scan_parent_skips_subject_missing_expected_subfolder(tmp_path):
+    """A subject folder without <subfolder>/ (e.g. subject wasn't
+    ingested yet, or has a different layout) MUST be skipped -- NOT
+    fall back to walking the subject root. Falling back would pick
+    up unrelated files (raw exports, notes) and inflate the count
+    with garbage. Reported in the skipped list so the operator can
+    see which subjects need attention.
+    """
+    # Layout A: expected -- gets counted
+    (tmp_path / "R1755A" / "clinical_eeg").mkdir(parents=True)
+    _write_edf_with_annotations(
+        tmp_path / "R1755A" / "clinical_eeg" / "R1755A.edf",
+        ["one two"])
+    # Layout B: no clinical_eeg subdir -- gets skipped
+    (tmp_path / "R1000Z").mkdir()
+    _write_edf_with_annotations(
+        tmp_path / "R1000Z" / "loose.edf", ["should not count"])
+
+    result, skipped = count_annotations.scan_parent(tmp_path)
+    assert "R1755A" in result
+    assert "R1000Z" not in result
+    assert any(name == "R1000Z" and "clinical_eeg" in reason
+               for name, reason in skipped)
+
+
+@pytest.mark.skipif(os.geteuid() == 0,
+                     reason="root bypasses chmod-based permission checks")
+def test_scan_parent_skips_permission_denied_subject_and_continues(
+        tmp_path):
+    """POSITIVE robustness test: an unreadable subject dir does NOT
+    halt the whole scan. Simulated by chmod'ing one subject's
+    clinical_eeg dir to 000 so iterdir/rglob raise PermissionError.
+    The other subject still gets counted, and the offender is
+    reported in the skipped list with a clear reason.
+    """
+    import stat
+    # Good subject
+    good = tmp_path / "R1755A" / "clinical_eeg"
+    good.mkdir(parents=True)
+    _write_edf_with_annotations(good / "R1755A.edf", ["one two"])
+    # Bad subject: clinical_eeg exists but is unreadable
+    bad = tmp_path / "R1666A" / "clinical_eeg"
+    bad.mkdir(parents=True)
+    _write_edf_with_annotations(bad / "R1666A.edf", ["cant read this"])
+    # Chmod to 000. Restore on the way out so pytest can clean up.
+    original_mode = bad.stat().st_mode
+    os.chmod(bad, 0)
+    try:
+        result, skipped = count_annotations.scan_parent(tmp_path)
+    finally:
+        os.chmod(bad, original_mode | stat.S_IRWXU)
+
+    # Good subject counted
+    assert "R1755A" in result
+    assert result["R1755A"][:2] == (1, 2)
+    # Bad subject skipped with a permission-denied reason
+    assert "R1666A" not in result
+    bad_entries = [(n, r) for n, r in skipped if n == "R1666A"]
+    assert len(bad_entries) == 1
+    assert "permission" in bad_entries[0][1].lower()
