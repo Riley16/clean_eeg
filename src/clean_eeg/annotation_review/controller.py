@@ -20,6 +20,7 @@ Explicitly OUT of scope for this module:
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +34,21 @@ from clean_eeg.annotation_review.journal import (
     SessionJournal,
 )
 from clean_eeg.annotation_review.models import EditRecord, ReviewedFile
+
+
+PREFETCH_LOOKAHEAD = 2   # how many files ahead of cursor to pre-load
+
+
+def _prefetch_one(edf_path: Path) -> list[Annotation]:
+    """Worker function for the prefetch thread pool. Errors are
+    swallowed to an empty list -- the caller decides how to surface
+    the failure (typically: leave the cached entry empty so the
+    operator can navigate past the bad file without hanging on it).
+    """
+    try:
+        return list(iter_annotations(edf_path))
+    except Exception:
+        return []
 
 
 class PreflightFailure(RuntimeError):
@@ -128,7 +144,14 @@ class AnnotationReviewController:
     def __init__(self, subject_dir: Path, *,
                  subfolder: str = "clinical_eeg",
                  whitelist_path: Path | None = None,
-                 respect_reviewed_tracker: bool = True):
+                 respect_reviewed_tracker: bool = True,
+                 external_prefetch_paths: list[Path] | None = None):
+        """``external_prefetch_paths``: optional additional EDF paths
+        (e.g. the FIRST N files of the NEXT subject) to warm the
+        prefetch queue after this subject's own files are exhausted.
+        Lets a caller iterating parent-dir subjects avoid the
+        subject-transition pause. None -> intra-subject prefetch only.
+        """
         self.subject_dir = Path(subject_dir)
         self.subfolder = subfolder
         self.whitelist_path = whitelist_path
@@ -148,15 +171,40 @@ class AnnotationReviewController:
         self._file_indices: list[int] = [
             i for i, p in enumerate(self._edfs)
             if str(p) not in reviewed_set]
-        # Load annotations per file. Empty entry means an already-
-        # reviewed file (kept in _annotations to keep index alignment
-        # with self._edfs, but never displayed).
-        self._annotations: list[list[Annotation]] = []
-        for i, p in enumerate(self._edfs):
-            if i in self._file_indices:
-                self._annotations.append(list(iter_annotations(p)))
-            else:
-                self._annotations.append([])
+
+        # ---- Lazy per-file annotation loading + background prefetch ----
+        # Previously loaded ALL files' annotations synchronously in
+        # the constructor -- a 50-file subject on /oceanus took ~2 min
+        # of startup pause. Now: load the current file synchronously
+        # (blocking is fine, operator hasn't seen anything yet), and
+        # let a 2-worker thread pool warm the next PREFETCH_LOOKAHEAD
+        # files in the background. Moving between files hits the
+        # cache and returns instantly.
+        #
+        # ``_annotations_cache``: file_index -> list[Annotation],
+        # populated on demand.
+        # ``_prefetch_futures``: file_index -> Future waiting to
+        # populate the cache. Consulted before triggering a fresh
+        # sync load.
+        # ``_prefetch_pool``: 2 workers -- fits the "next 2 files"
+        # ask. Larger pool = more concurrent I/O but no meaningful
+        # UX win.
+        self._annotations_cache: dict[int, list[Annotation]] = {}
+        self._prefetch_futures: dict[int, "Future[list[Annotation]]"] = {}
+        self._prefetch_pool = ThreadPoolExecutor(
+            max_workers=PREFETCH_LOOKAHEAD,
+            thread_name_prefix="ann-prefetch")
+        # Already-reviewed files: cache empty list (never shown, but
+        # keeps annotations_by_file_index() total-consistent).
+        for i, _ in enumerate(self._edfs):
+            if i not in self._file_indices:
+                self._annotations_cache[i] = []
+
+        # External prefetch queue (e.g. next-subject files). Loaded
+        # via a separate _external_prefetch_futures so they don't
+        # collide with per-subject index keys.
+        self._external_prefetch_paths = list(external_prefetch_paths or [])
+        self._external_prefetch_futures: dict[str, "Future[list[Annotation]]"] = {}
 
         self.file_cursor: int = (self._file_indices[0]
                                  if self._file_indices else 0)
@@ -166,11 +214,16 @@ class AnnotationReviewController:
         # second edit to the same annotation overwrites the first --
         # the operator's most-recent intent wins.
         self._pending: dict[tuple[int, int], EditRecord] = {}
-        # Re-hydrate from journal on restart (crash recovery).
+        # Re-hydrate from journal on restart (crash recovery). Requires
+        # some file annotations loaded -- do sync loads for any files
+        # referenced by the journal.
         for e in self._journal.read_all():
             key = self._locate_edit_in_current_state(e)
             if key is not None:
                 self._pending[key] = e
+
+        # Warm the prefetch queue for the initial cursor position.
+        self._schedule_prefetch()
 
     # ---- whitelist ----
 
@@ -199,7 +252,98 @@ class AnnotationReviewController:
         return len(self._file_indices)
 
     def annotations_in_current_file(self) -> list[Annotation]:
-        return self._annotations[self.file_cursor]
+        return self._load_annotations_for_index(self.file_cursor)
+
+    # ---- lazy loading + background prefetch ----
+
+    def _load_annotations_for_index(self, file_index: int
+                                     ) -> list[Annotation]:
+        """Get annotations for ``file_index``. If a prefetch future is
+        already in flight for this file, WAIT for it (don't spawn a
+        duplicate load). If neither cache nor future is available,
+        load synchronously here.
+
+        Always schedules prefetch for the next PREFETCH_LOOKAHEAD
+        files after this call returns, so subsequent moves are
+        instantaneous.
+        """
+        if file_index in self._annotations_cache:
+            self._schedule_prefetch()
+            return self._annotations_cache[file_index]
+        if file_index in self._prefetch_futures:
+            # Prefetch already started -- wait for it rather than
+            # racing a duplicate load. .result() will re-raise any
+            # exception; we swallow to an empty list so navigation
+            # still works (a bad file's annotations are gone but the
+            # cursor isn't stuck).
+            try:
+                anns = self._prefetch_futures[file_index].result()
+            except Exception:
+                anns = []
+            self._annotations_cache[file_index] = anns
+            del self._prefetch_futures[file_index]
+            self._schedule_prefetch()
+            return anns
+        # Cold: load synchronously here (blocks current op).
+        try:
+            anns = list(iter_annotations(self._edfs[file_index]))
+        except Exception:
+            anns = []
+        self._annotations_cache[file_index] = anns
+        self._schedule_prefetch()
+        return anns
+
+    def _schedule_prefetch(self) -> None:
+        """Ensure the next PREFETCH_LOOKAHEAD unreviewed files after
+        the cursor are being loaded in the background. Idempotent:
+        already-cached and already-scheduled files are left alone.
+        When intra-subject files are exhausted, warms the external
+        prefetch queue (cross-subject) instead.
+        """
+        # Find the next PREFETCH_LOOKAHEAD reviewable file indices
+        # after the current cursor (not INCLUDING the cursor itself
+        # -- that one is either cached or being loaded right now).
+        try:
+            cursor_pos = self._file_indices.index(self.file_cursor)
+        except ValueError:
+            cursor_pos = -1
+        next_indices = self._file_indices[cursor_pos + 1:
+                                            cursor_pos + 1
+                                            + PREFETCH_LOOKAHEAD]
+        for fi in next_indices:
+            if (fi in self._annotations_cache
+                    or fi in self._prefetch_futures):
+                continue
+            self._prefetch_futures[fi] = self._prefetch_pool.submit(
+                _prefetch_one, self._edfs[fi])
+
+        # Cross-subject warmup: if our own file queue is exhausted
+        # (fewer than PREFETCH_LOOKAHEAD files remaining), fill the
+        # rest from the external queue.
+        room = PREFETCH_LOOKAHEAD - len(next_indices)
+        for path in self._external_prefetch_paths[:room]:
+            key = str(path)
+            if key in self._external_prefetch_futures:
+                continue
+            self._external_prefetch_futures[key] = \
+                self._prefetch_pool.submit(_prefetch_one, path)
+
+    def annotations_for_external_prefetch_path(self, path: Path
+                                                 ) -> list[Annotation]:
+        """Retrieve pre-warmed annotations for a cross-subject file
+        listed in ``external_prefetch_paths``. If the future finished,
+        returns its result; if still running, blocks. Used by a
+        parent-dir iterator (e.g. an upcoming multi-subject CLI) to
+        hand off the pre-warmed cache to the next subject's
+        controller without re-reading."""
+        key = str(path)
+        fut = self._external_prefetch_futures.get(key)
+        if fut is None:
+            return list(iter_annotations(path))
+        try:
+            return fut.result()
+        except Exception:
+            return []
 
     def current_annotation(self) -> Annotation | None:
         anns = self.annotations_in_current_file()
@@ -244,6 +388,10 @@ class AnnotationReviewController:
             return False
         self.file_cursor = self._file_indices[pos + 1]
         self.annotation_cursor = 0
+        # Warm the queue for the NEW cursor position -- if the
+        # operator has been advancing steadily, the file they just
+        # arrived on was almost certainly already prefetched.
+        self._schedule_prefetch()
         return True
 
     def prev_file(self) -> bool:
@@ -253,6 +401,7 @@ class AnnotationReviewController:
             return False
         self.file_cursor = self._file_indices[pos - 1]
         self.annotation_cursor = 0
+        self._schedule_prefetch()
         return True
 
     def on_last_annotation_of_file(self) -> bool:
@@ -334,6 +483,10 @@ class AnnotationReviewController:
 
     def close(self) -> None:
         self._journal.close()
+        # Shutdown the prefetch pool without waiting for in-flight
+        # loads (their results are about to be discarded anyway).
+        # cancel_futures=True skips any not-yet-started tasks.
+        self._prefetch_pool.shutdown(wait=False, cancel_futures=True)
 
     # ---- crash-recovery helper ----
 
@@ -349,7 +502,11 @@ class AnnotationReviewController:
         for fi, p in enumerate(self._edfs):
             if str(p) != edit.file_path:
                 continue
-            for ai, ann in enumerate(self._annotations[fi]):
+            # Journal replay needs annotations loaded to look them
+            # up. Force a sync load; the prefetch pool would be
+            # overkill here (one-time cost at controller init).
+            anns_for_file = self._load_annotations_for_index(fi)
+            for ai, ann in enumerate(anns_for_file):
                 if (ann.onset_s == edit.onset_s
                         and ann.text == edit.orig_text):
                     return (fi, ai)

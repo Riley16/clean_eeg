@@ -390,6 +390,85 @@ def test_controller_rehydrates_pending_edits_from_journal(tmp_path):
     assert pending[0].new_text == "one-edited"
 
 
+def test_prefetch_warms_next_two_files_at_init(tmp_path):
+    """POSITIVE: at controller init, prefetch should have queued
+    (or already loaded) the file at cursor + the next
+    PREFETCH_LOOKAHEAD files. Verified by checking
+    _annotations_cache after a brief wait for background workers.
+    """
+    from clean_eeg.annotation_review.controller import PREFETCH_LOOKAHEAD
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["one"],
+        "b.edf": ["two"],
+        "c.edf": ["three"],
+        "d.edf": ["four"],
+        "e.edf": ["five"],
+    })
+    c = AnnotationReviewController(subj)
+    # Trigger sync load of the current file
+    c.annotations_in_current_file()
+    # Give the prefetch pool a chance to finish (small files ->
+    # milliseconds). Waiting on the pool's queue would be cleaner
+    # but that requires reaching into internals.
+    import time as _t
+    _t.sleep(0.5)
+    # After init + one sync load: current file (0) cached, next
+    # PREFETCH_LOOKAHEAD files (1..PREFETCH_LOOKAHEAD) either
+    # cached OR their futures still pending. Either way they must
+    # NOT need a fresh sync load when accessed.
+    for i in range(1, 1 + PREFETCH_LOOKAHEAD):
+        assert (i in c._annotations_cache
+                or i in c._prefetch_futures), (
+            f"file {i} not warmed (cache keys: "
+            f"{sorted(c._annotations_cache)}, "
+            f"future keys: {sorted(c._prefetch_futures)})")
+    c.close()
+
+
+def test_prefetched_file_returns_from_cache_on_next_file(tmp_path):
+    """HAPPY PATH: navigate to a pre-warmed file -- no synchronous
+    read from disk needed. Simulated by monkeypatching
+    iter_annotations to count calls; after prefetch has run for
+    file 1, next_file() should NOT trigger a fresh call.
+    """
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["a"], "b.edf": ["b"], "c.edf": ["c"],
+    })
+    c = AnnotationReviewController(subj)
+    c.annotations_in_current_file()
+    import time as _t
+    _t.sleep(0.5)   # let prefetch settle
+
+    call_count = {"n": 0}
+    from clean_eeg.annotation_review import controller as _cm
+    orig = _cm.iter_annotations
+    def counting(path):
+        call_count["n"] += 1
+        return orig(path)
+    _cm.iter_annotations = counting
+    try:
+        c.next_file()
+        anns = c.annotations_in_current_file()
+    finally:
+        _cm.iter_annotations = orig
+
+    assert [a.text for a in anns] == ["b"]
+    assert call_count["n"] == 0, (
+        f"next_file() triggered {call_count['n']} sync loads -- "
+        "prefetch cache missed")
+    c.close()
+
+
+def test_controller_close_shuts_down_prefetch_pool(tmp_path):
+    """Regression: close() must shutdown the ThreadPoolExecutor so
+    hanging daemon threads don't outlive the process. Verified by
+    checking the pool's _shutdown flag."""
+    subj = _make_subject(tmp_path, "R1755A", {"a.edf": ["x"]})
+    c = AnnotationReviewController(subj)
+    c.close()
+    assert c._prefetch_pool._shutdown is True
+
+
 def test_controller_drops_stale_journal_entries_that_no_longer_match(
         tmp_path):
     """DEFENSIVE: if the source file changed between sessions
