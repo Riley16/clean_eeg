@@ -1,5 +1,7 @@
 {
-  "shared": [],
+  "shared": [
+    ".{1,5}"
+  ],
   "per_site": {
     "S": [],
     "A": [
@@ -15,6 +17,22 @@
       "Stim Stop(?:[- ]\\S+)?"
     ],
     "H": [],
-    "J": []
+    "J": [
+      "SpikeBurst \\d+(?:\\.\\d+)? \\d+(?:\\.\\d+)?s",
+      "RhythmicBurst [A-Za-z]{1,8}",
+      "\\*Mark",
+      "A1\\+A2 OFF",
+      "RESET OFF",
+      "RESET ON",
+      "Mini junction box [A-Za-z0-9]{1,4}",
+      "Stim Stop.*",
+      "Stim Start.*"
+    ]
+  },
+  "delete_shared": [],
+  "delete_per_site": {
+    "J": [
+      "Segment: REC START.*"
+    ]
   }
 }

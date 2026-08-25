@@ -318,3 +318,91 @@ def test_parent_dir_skips_unreadable_subject_and_continues(tmp_path,
     assert "cant_read_this" not in out
     # Would-be read-fail message also absent (pre-filter caught it)
     assert "[skip-read] R1666A.edf" not in err
+
+
+# ---------------------------------------------------------------------------
+# Whitelist auto-applied by default + delete bucket excluded from view
+# ---------------------------------------------------------------------------
+
+def test_default_whitelist_filters_annotations(tmp_path, capsys):
+    """POSITIVE: pass --whitelist-path explicitly (mimics default
+    auto-locate). Annotations matching the whitelist are excluded
+    from the top-N output and reported in the '[filter] excluded N
+    whitelisted' line."""
+    import json as _json
+    subj = tmp_path / "R1755J" / "clinical_eeg"
+    subj.mkdir(parents=True)
+    _write_edf(subj / "R1755J.edf", [
+        (0.5, "PAT REF EEG"),        # whitelisted
+        (1.5, "real annotation here"),  # kept
+    ])
+    wl_path = tmp_path / "wl.json"
+    wl_path.write_text(_json.dumps({
+        "shared": [], "per_site": {"J": [r"PAT REF EEG"]},
+    }))
+    sample_mod.main([
+        "--parent-dir", str(tmp_path),
+        "--whitelist-path", str(wl_path),
+        "--top-n", "10",
+        "--sample-n", "0",
+    ])
+    out = capsys.readouterr().out
+    assert "real annotation here" in out
+    assert "PAT REF EEG" not in out
+    assert "excluded 1 whitelisted" in out
+
+
+def test_no_whitelist_flag_disables_filtering(tmp_path, capsys):
+    """--no-whitelist bypasses the auto-locate. Every annotation
+    appears in the output even if it would have been whitelisted.
+    Useful for seeing what the whitelist is silencing."""
+    subj = tmp_path / "R1755J" / "clinical_eeg"
+    subj.mkdir(parents=True)
+    _write_edf(subj / "R1755J.edf", [
+        (0.5, "PAT REF EEG"),
+        (1.5, "real annotation here"),
+    ])
+    sample_mod.main([
+        "--parent-dir", str(tmp_path),
+        "--no-whitelist",
+        "--top-n", "10",
+        "--sample-n", "0",
+    ])
+    out = capsys.readouterr().out
+    # BOTH annotations should now appear (whitelist not applied)
+    assert "PAT REF EEG" in out
+    assert "real annotation here" in out
+
+
+def test_delete_bucket_annotations_excluded_and_counted_separately(
+        tmp_path, capsys):
+    """POSITIVE: delete-bucket matches are separated from whitelist
+    matches in the '[filter] excluded ... delete-marked' line, so
+    the operator can see how many will be REMOVED (not just hidden
+    from review) once the pipeline supports the delete action."""
+    import json as _json
+    subj = tmp_path / "R1755J" / "clinical_eeg"
+    subj.mkdir(parents=True)
+    _write_edf(subj / "R1755J.edf", [
+        (0.5, "Segment: REC START at 10:00"),  # DELETE bucket
+        (1.5, "PAT REF EEG"),                   # WHITELIST bucket
+        (2.5, "real annotation"),               # kept
+    ])
+    wl_path = tmp_path / "wl.json"
+    wl_path.write_text(_json.dumps({
+        "shared": [], "per_site": {"J": [r"PAT REF EEG"]},
+        "delete_shared": [], "delete_per_site": {
+            "J": [r"Segment: REC START.*"]},
+    }))
+    sample_mod.main([
+        "--parent-dir", str(tmp_path),
+        "--whitelist-path", str(wl_path),
+        "--top-n", "10",
+        "--sample-n", "0",
+    ])
+    out = capsys.readouterr().out
+    assert "real annotation" in out
+    assert "PAT REF EEG" not in out
+    assert "Segment: REC START" not in out
+    # Filter line splits the two categories
+    assert "excluded 1 whitelisted + 1 delete-marked" in out

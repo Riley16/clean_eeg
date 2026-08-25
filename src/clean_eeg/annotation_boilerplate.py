@@ -30,34 +30,50 @@ from pathlib import Path
 
 @dataclass
 class BoilerplateWhitelist:
-    """Compiled matcher. ``shared`` regexes apply to every site;
-    ``per_site`` regexes apply only when queried with the matching site
-    letter. Both lists are pre-compiled at load time so each redaction
-    event costs O(pattern count) regex matches, not O(pattern count)
-    compilations."""
+    """Compiled matcher for two families of patterns:
+
+      * ``shared`` / ``per_site``: WHITELIST -- 'known-safe boilerplate,
+        silence from the human-review block but KEEP in the EDF output.'
+      * ``delete_shared`` / ``delete_per_site``: DELETE -- 'junk that
+        should be removed from the EDF output entirely.' Same
+        fullmatch semantics; different downstream action.
+
+    All four lists are pre-compiled at load time so each match check
+    costs O(pattern count) regex matches, not O(pattern count)
+    compilations.
+    """
 
     shared: list[re.Pattern] = field(default_factory=list)
     per_site: dict[str, list[re.Pattern]] = field(default_factory=dict)
+    delete_shared: list[re.Pattern] = field(default_factory=list)
+    delete_per_site: dict[str, list[re.Pattern]] = field(default_factory=dict)
 
     def matches(self, text: str, site_code: str | None = None) -> bool:
         """True if ``text`` matches (via ``re.fullmatch``) any shared
-        regex, or any regex under the ``site_code`` bucket. Unknown
-        ``site_code`` falls through to shared-only. ``None``
-        site_code also uses shared-only.
+        or per-site WHITELIST regex. Full-match semantics -- the
+        regex must match the ENTIRE text, not a substring."""
+        return self._matches_in(text, site_code,
+                                 self.shared, self.per_site)
 
-        Full-match semantics — the regex must match the ENTIRE text,
-        not a substring — because the intended use is "silence known-
-        safe phrases outright." A substring-match on a permissive
-        pattern like ``"CAL IN"`` could silence a legitimate PHI-
-        bearing annotation like ``"CAL IN CAROL AT 3PM"`` where the
-        interesting content follows the boilerplate. Operators who
-        want partial matches can write ``".*something.*"`` explicitly.
-        """
-        for pat in self.shared:
+    def matches_delete(self, text: str,
+                        site_code: str | None = None) -> bool:
+        """True if ``text`` matches (via ``re.fullmatch``) any shared
+        or per-site DELETE regex. Callers that only want to exclude
+        annotations from a review count should use
+        ``matches`` OR ``matches_delete``. Callers that will actually
+        mutate the EDF (delete these annotations) should use
+        ``matches_delete`` alone."""
+        return self._matches_in(text, site_code,
+                                 self.delete_shared, self.delete_per_site)
+
+    def _matches_in(self, text: str, site_code: str | None,
+                     shared: list[re.Pattern],
+                     per_site: dict[str, list[re.Pattern]]) -> bool:
+        for pat in shared:
             if pat.fullmatch(text):
                 return True
         if site_code:
-            for pat in self.per_site.get(site_code, ()):
+            for pat in per_site.get(site_code, ()):
                 if pat.fullmatch(text):
                     return True
         return False
@@ -93,22 +109,33 @@ def load_whitelist(path: str | Path | None) -> BoilerplateWhitelist:
         )
     shared_raw = data.get("shared", [])
     per_site_raw = data.get("per_site", {})
-    if not isinstance(shared_raw, list):
-        raise BoilerplateWhitelistError(
-            f"{p}: 'shared' must be a list of regex strings"
-        )
-    if not isinstance(per_site_raw, dict):
-        raise BoilerplateWhitelistError(
-            f"{p}: 'per_site' must be an object keyed by site code"
-        )
+    delete_shared_raw = data.get("delete_shared", [])
+    delete_per_site_raw = data.get("delete_per_site", {})
+    for name, raw in (("shared", shared_raw),
+                        ("delete_shared", delete_shared_raw)):
+        if not isinstance(raw, list):
+            raise BoilerplateWhitelistError(
+                f"{p}: {name!r} must be a list of regex strings")
+    for name, raw in (("per_site", per_site_raw),
+                        ("delete_per_site", delete_per_site_raw)):
+        if not isinstance(raw, dict):
+            raise BoilerplateWhitelistError(
+                f"{p}: {name!r} must be an object keyed by site code")
     try:
         shared = [re.compile(pat) for pat in shared_raw]
         per_site = {
             site: [re.compile(pat) for pat in patterns]
             for site, patterns in per_site_raw.items()
         }
+        delete_shared = [re.compile(pat) for pat in delete_shared_raw]
+        delete_per_site = {
+            site: [re.compile(pat) for pat in patterns]
+            for site, patterns in delete_per_site_raw.items()
+        }
     except re.error as e:
         raise BoilerplateWhitelistError(
             f"{p}: invalid regex — {e}"
         ) from e
-    return BoilerplateWhitelist(shared=shared, per_site=per_site)
+    return BoilerplateWhitelist(
+        shared=shared, per_site=per_site,
+        delete_shared=delete_shared, delete_per_site=delete_per_site)

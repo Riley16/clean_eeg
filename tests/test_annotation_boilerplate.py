@@ -139,3 +139,70 @@ def test_matches_uses_fullmatch_not_substring():
     # "hello world dr smith visited" otherwise).
     assert not wl.matches("hello world dr smith visited")
     assert not wl.matches("say hello world!")
+
+
+# ---------------------------------------------------------------------------
+# Delete bucket: 'these should be REMOVED from the EDF, not just
+# hidden from the review block'
+# ---------------------------------------------------------------------------
+
+def test_delete_bucket_loads_from_shared_and_per_site(tmp_path):
+    """POSITIVE: delete_shared / delete_per_site round-trip through
+    the loader with the same shape as the whitelist buckets."""
+    path = tmp_path / "wl.json"
+    path.write_text(json.dumps({
+        "shared": [],
+        "per_site": {},
+        "delete_shared": [r"GLOBAL DEBUG.*"],
+        "delete_per_site": {"J": [r"Segment: REC START.*"]},
+    }))
+    wl = load_whitelist(path)
+    assert wl.matches_delete("GLOBAL DEBUG foo") is True
+    assert wl.matches_delete("Segment: REC START at 10:00",
+                              site_code="J") is True
+    # Same string with a different site -> only shared applies
+    assert wl.matches_delete("Segment: REC START at 10:00",
+                              site_code="A") is False
+
+
+def test_delete_bucket_semantics_independent_of_whitelist(tmp_path):
+    """A pattern in the DELETE bucket does NOT also match the
+    whitelist (they're separate buckets with separate meaning).
+    Regression guard against a merge that conflates them."""
+    path = tmp_path / "wl.json"
+    path.write_text(json.dumps({
+        "shared": [], "per_site": {},
+        "delete_shared": [r"deletable"],
+        "delete_per_site": {},
+    }))
+    wl = load_whitelist(path)
+    assert wl.matches_delete("deletable") is True
+    assert wl.matches("deletable") is False
+
+
+def test_delete_bucket_optional_in_json(tmp_path):
+    """Backwards compat: existing whitelist files without
+    delete_shared / delete_per_site keys still load. matches_delete
+    returns False (nothing to delete)."""
+    path = tmp_path / "wl.json"
+    path.write_text(json.dumps({
+        "shared": [r"boilerplate"],
+        "per_site": {},
+    }))
+    wl = load_whitelist(path)
+    assert wl.matches("boilerplate") is True
+    assert wl.matches_delete("anything") is False
+
+
+def test_delete_bucket_malformed_type_raises(tmp_path):
+    """delete_shared with wrong type should fail LOUDLY at load,
+    same as the whitelist buckets. Otherwise a bad file could
+    silently disable deletion."""
+    path = tmp_path / "wl.json"
+    path.write_text(json.dumps({
+        "shared": [], "per_site": {},
+        "delete_shared": "not a list",
+    }))
+    with pytest.raises(BoilerplateWhitelistError,
+                        match="delete_shared"):
+        load_whitelist(path)

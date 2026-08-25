@@ -29,29 +29,68 @@ from pathlib import Path
 from clean_eeg.annotation_reader import iter_annotations
 
 
-def collect_annotation_texts(edf_paths: list[Path]) -> list[tuple[Path, str]]:
-    """Return every (file, text) pair across the given EDFs. Empty
-    or whitespace-only texts are dropped. Order preserved so
-    --sample-n's ``random.sample`` gets a uniform draw.
+def _derive_site_code(subject_dir_name: str) -> str | None:
+    """R1XXXY[_M] -> Y. None if the name doesn't match. Same regex
+    as count_annotations."""
+    import re
+    m = re.match(r"^R1\d{3}([ACDEFHJMNPST])(?:_\d+)?$", subject_dir_name)
+    return m.group(1) if m else None
 
-    File-level permission errors during read (rare -- _resolve_edfs
-    pre-filters via os.access) are surfaced with the exception class
-    so the operator can distinguish 'not readable' from 'corrupt
-    EDF'.
+
+def _site_code_for_edf(edf_path: Path) -> str | None:
+    """Walk up from the EDF file to find the R1XXXY[_M] subject
+    folder and derive the site code. Falls back to None (shared-
+    whitelist-only) if no ancestor matches. Lets --parent-dir scans
+    apply the right site's whitelist per file even though every
+    file has a different site under it."""
+    for parent in edf_path.parents:
+        code = _derive_site_code(parent.name)
+        if code is not None:
+            return code
+    return None
+
+
+def collect_annotation_texts(edf_paths: list[Path],
+                              whitelist=None,
+                              ) -> tuple[list[tuple[Path, str]], int, int]:
+    """Return ``(kept_pairs, n_whitelisted, n_deleted)``.
+
+    ``whitelist`` (optional BoilerplateWhitelist): annotations whose
+    text matches the whitelist (shared or per-site by the EDF's
+    parent subject_code) are EXCLUDED from ``kept_pairs`` and counted
+    in ``n_whitelisted``. Annotations matching the DELETE bucket are
+    counted separately in ``n_deleted`` (also excluded from kept).
+    Applying by default means the operator sees only the annotations
+    that still need review after boilerplate suppression -- the
+    whole point of the whitelist iteration loop.
+
+    Empty / whitespace-only texts are always dropped.
     """
     from tqdm import tqdm
-    out: list[tuple[Path, str]] = []
+    kept: list[tuple[Path, str]] = []
+    n_whitelisted = n_deleted = 0
     for p in tqdm(edf_paths, desc="loading annotations", unit="file"):
+        site_code = _site_code_for_edf(p)
         try:
             for a in iter_annotations(p):
-                if a.text.strip():
-                    out.append((p, a.text))
+                text = a.text
+                if not text.strip():
+                    continue
+                if whitelist is not None:
+                    if whitelist.matches_delete(text,
+                                                  site_code=site_code):
+                        n_deleted += 1
+                        continue
+                    if whitelist.matches(text, site_code=site_code):
+                        n_whitelisted += 1
+                        continue
+                kept.append((p, text))
         except PermissionError as e:
             print(f"[skip-perm] {p}: {e}", file=sys.stderr)
         except Exception as e:
             print(f"[skip-read] {p.name}: {type(e).__name__}: {e}",
                   file=sys.stderr)
-    return out
+    return kept, n_whitelisted, n_deleted
 
 
 def _list_edfs_in_subfolder(inner: Path) -> list[Path]:
@@ -238,15 +277,56 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--seed", type=int, default=0,
                    help="Random seed for --sample-n / --random-sample "
                         "(default 0 -> reproducible).")
+    p.add_argument("--whitelist-path", type=Path, default=None,
+                   metavar="FILE",
+                   help="Boilerplate whitelist JSON. If omitted, the "
+                        "standard file at data/annotation_boilerplate_"
+                        "whitelist.json is used automatically -- so "
+                        "each iteration of the whitelist takes effect "
+                        "on the next sample_annotations run. Pass "
+                        "--no-whitelist to disable.")
+    p.add_argument("--no-whitelist", action="store_true",
+                   help="Skip whitelist filtering. All annotations "
+                        "(including boilerplate) will appear in the "
+                        "top-N / all-annotations output. Useful for "
+                        "seeing what the whitelist is silencing.")
     args = p.parse_args(argv)
 
     random.seed(args.seed)
+
+    # Resolve whitelist. Default: standard data file, auto-located
+    # relative to this script (src/clean_eeg/../data/...). --no-
+    # whitelist disables entirely.
+    whitelist = None
+    if not args.no_whitelist:
+        from clean_eeg.annotation_boilerplate import (
+            BoilerplateWhitelistError,
+            load_whitelist,
+        )
+        wl_path = args.whitelist_path
+        if wl_path is None:
+            # Assume standard install layout: this script lives at
+            # <repo>/scripts/, data at <repo>/data/.
+            wl_path = (Path(__file__).parent.parent / "data"
+                       / "annotation_boilerplate_whitelist.json")
+        try:
+            whitelist = load_whitelist(wl_path)
+            print(f"applying whitelist: {wl_path}", file=sys.stderr)
+        except BoilerplateWhitelistError as e:
+            print(f"[error] {e}", file=sys.stderr)
+            return 2
+
     edfs = _resolve_edfs(args)
     if not edfs:
         print("[error] no EDF files found", file=sys.stderr)
         return 2
     print(f"inspecting {len(edfs)} file(s)", file=sys.stderr)
-    pairs = collect_annotation_texts(edfs)
+    pairs, n_whitelisted, n_deleted = collect_annotation_texts(
+        edfs, whitelist=whitelist)
+    if whitelist is not None and (n_whitelisted or n_deleted):
+        print(f"\n[filter] excluded {n_whitelisted:,} whitelisted + "
+              f"{n_deleted:,} delete-marked annotations from the "
+              f"views below (use --no-whitelist to include them).")
     _print_top_n(pairs, args.top_n)
     _print_sample(pairs, args.sample_n)
     if args.all_annotations:
