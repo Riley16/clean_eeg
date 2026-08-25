@@ -71,14 +71,16 @@ def test_count_edf_annotations_counts_words_whitespace_tokenized(tmp_path):
         "eyes closed",       # 2 words
         "",                  # empty -- excluded from BOTH counts
     ])
-    n_ann, n_words = count_annotations.count_edf_annotations(edf)
+    n_ann, n_words, n_wl = count_annotations.count_edf_annotations(edf)
     assert n_ann == 3
     assert n_words == 6
+    assert n_wl == 0
 
 
 def test_scan_parent_reports_per_subject_totals(tmp_path):
-    """Per-subject stats bucketed by subject folder name; the CSV-style
-    report uses these bins for its table."""
+    """Per-subject stats bucketed by subject folder name. Tuple shape:
+    (n_ann, n_words, n_files_ok, n_files_skipped, n_files_reviewed,
+    n_whitelisted)."""
     for code, texts in [
         ("R1A", ["one two", "three"]),           # 2 ann, 3 words
         ("R1B", ["four five six seven"]),        # 1 ann, 4 words
@@ -88,8 +90,8 @@ def test_scan_parent_reports_per_subject_totals(tmp_path):
             tmp_path / code / "clinical_eeg" / f"{code}_file.edf", texts)
 
     result = count_annotations.scan_parent(tmp_path)
-    assert result["R1A"] == (2, 3, 1, 0)   # (n_ann, n_words, ok, skipped)
-    assert result["R1B"] == (1, 4, 1, 0)
+    assert result["R1A"] == (2, 3, 1, 0, 0, 0)
+    assert result["R1B"] == (1, 4, 1, 0, 0, 0)
 
 
 def test_scan_parent_skips_annotation_sidecars(tmp_path):
@@ -106,8 +108,7 @@ def test_scan_parent_skips_annotation_sidecars(tmp_path):
                                  ["one two", "three"])   # sidecar dup
 
     result = count_annotations.scan_parent(tmp_path)
-    # Only the main EDF counted -- sidecar filtered
-    assert result["R1SUBJ"] == (2, 3, 1, 0)
+    assert result["R1SUBJ"] == (2, 3, 1, 0, 0, 0)
 
 
 def test_scan_parent_reports_skipped_files_separately(tmp_path):
@@ -120,7 +121,136 @@ def test_scan_parent_reports_skipped_files_separately(tmp_path):
     (inner / "garbage.edf").write_bytes(b"not an EDF at all")
 
     result = count_annotations.scan_parent(tmp_path)
-    n_ann, n_words, n_ok, n_skipped = result["R1SUBJ"]
+    n_ann, n_words, n_ok, n_skipped, n_reviewed, n_wl = result["R1SUBJ"]
     assert n_ok == 1
     assert n_skipped == 1
+    assert n_reviewed == 0
     assert n_ann == 1 and n_words == 2   # only the readable file
+
+
+# ---------------------------------------------------------------------------
+# Whitelist filtering: matched annotations excluded from review count
+# ---------------------------------------------------------------------------
+
+def test_scan_parent_excludes_whitelist_matched_annotations(tmp_path):
+    """Positive: annotations that match a per-site whitelist regex
+    are moved from the review-count bucket to the whitelisted bucket.
+    Lets the estimate shrink as the operator's whitelist grows during
+    review.
+    """
+    from clean_eeg.annotation_boilerplate import BoilerplateWhitelist
+    import re
+    # 'A' site letter -- matches folder R1755A below
+    wl = BoilerplateWhitelist(
+        shared=[],
+        per_site={"A": [re.compile(r"PAT REF EEG")]})
+
+    inner = tmp_path / "R1755A" / "clinical_eeg"
+    inner.mkdir(parents=True)
+    _write_edf_with_annotations(inner / "R1755A_file.edf", [
+        "PAT REF EEG",            # whitelisted -> excluded
+        "seizure",                # counted
+        "eyes closed",            # counted (2 words)
+    ])
+
+    result = count_annotations.scan_parent(tmp_path, whitelist=wl)
+    n_ann, n_words, n_ok, n_skip, n_rev, n_wl = result["R1755A"]
+    assert n_ann == 2           # PAT REF EEG excluded
+    assert n_words == 3         # 'seizure' + 'eyes closed' = 1 + 2
+    assert n_wl == 1
+
+
+def test_scan_parent_whitelist_uses_correct_site_bucket(tmp_path):
+    """NEGATIVE regression: a whitelist entry under site 'S' must NOT
+    silence the same text under site 'A'. Otherwise sites would
+    cross-contaminate each other's review counts.
+    """
+    from clean_eeg.annotation_boilerplate import BoilerplateWhitelist
+    import re
+    # Entry only under 'S' -- must NOT apply to 'A' below
+    wl = BoilerplateWhitelist(
+        shared=[],
+        per_site={"S": [re.compile(r"PAT REF EEG")]})
+
+    inner = tmp_path / "R1755A" / "clinical_eeg"
+    inner.mkdir(parents=True)
+    _write_edf_with_annotations(inner / "R1755A.edf", ["PAT REF EEG"])
+
+    result = count_annotations.scan_parent(tmp_path, whitelist=wl)
+    n_ann, n_words, _, _, _, n_wl = result["R1755A"]
+    assert n_ann == 1   # NOT whitelisted for site A
+    assert n_wl == 0
+
+
+def test_scan_parent_whitelist_matches_full_text_only(tmp_path):
+    """NEGATIVE regression: fullmatch semantics are load-bearing.
+    A permissive pattern like 'PAT REF' must NOT silence
+    'PAT REF EEG CAROL LOOK AT THIS' -- the operator would miss
+    the real content."""
+    from clean_eeg.annotation_boilerplate import BoilerplateWhitelist
+    import re
+    wl = BoilerplateWhitelist(shared=[re.compile(r"PAT REF")],
+                                per_site={})
+
+    inner = tmp_path / "R1755A" / "clinical_eeg"
+    inner.mkdir(parents=True)
+    _write_edf_with_annotations(inner / "R1755A.edf",
+                                 ["PAT REF EEG CAROL LOOK AT THIS"])
+
+    result = count_annotations.scan_parent(tmp_path, whitelist=wl)
+    n_ann, n_words, _, _, _, n_wl = result["R1755A"]
+    assert n_ann == 1
+    assert n_wl == 0     # NOT matched (partial)
+    assert n_words == 7  # PAT REF EEG CAROL LOOK AT THIS -> 7 words
+
+
+# ---------------------------------------------------------------------------
+# Reviewed tracker: already-reviewed files skipped by default
+# ---------------------------------------------------------------------------
+
+def test_scan_parent_skips_files_in_reviewed_tracker(tmp_path):
+    """POSITIVE integration with the annotation-review tracker: files
+    marked reviewed are excluded from the count so the operator's
+    remaining-work estimate shrinks as they progress."""
+    from clean_eeg.annotation_review.journal import ReviewedTracker
+    from clean_eeg.annotation_review.models import ReviewedFile
+    subj = tmp_path / "R1755A"
+    inner = subj / "clinical_eeg"
+    inner.mkdir(parents=True)
+    done = inner / "R1755A_done.edf"
+    todo = inner / "R1755A_todo.edf"
+    _write_edf_with_annotations(done, ["one", "two", "three"])
+    _write_edf_with_annotations(todo, ["four five"])
+
+    ReviewedTracker(subj).mark_reviewed(
+        ReviewedFile.new(file_path=done, n_annotations=3, n_edited=0))
+
+    result = count_annotations.scan_parent(tmp_path)
+    n_ann, n_words, n_ok, n_skip, n_rev, n_wl = result["R1755A"]
+    assert n_rev == 1
+    assert n_ok == 1
+    assert n_ann == 1        # only 'four five' -> 1 annotation
+    assert n_words == 2      # 'four five' -> 2 words
+
+
+def test_scan_parent_include_reviewed_disables_tracker_filter(tmp_path):
+    """--include-reviewed override: still count files listed in the
+    tracker. Useful when redoing a full pass after updating the
+    whitelist, so the operator can compare 'total' vs 'remaining'."""
+    from clean_eeg.annotation_review.journal import ReviewedTracker
+    from clean_eeg.annotation_review.models import ReviewedFile
+    subj = tmp_path / "R1755A"
+    inner = subj / "clinical_eeg"
+    inner.mkdir(parents=True)
+    _write_edf_with_annotations(inner / "R1755A.edf", ["one two three"])
+    ReviewedTracker(subj).mark_reviewed(
+        ReviewedFile.new(file_path=inner / "R1755A.edf",
+                         n_annotations=1, n_edited=0))
+
+    result = count_annotations.scan_parent(
+        tmp_path, respect_reviewed_tracker=False)
+    n_ann, n_words, n_ok, n_skip, n_rev, n_wl = result["R1755A"]
+    assert n_rev == 0        # tracker ignored
+    assert n_ok == 1
+    assert n_ann == 1
+    assert n_words == 3
