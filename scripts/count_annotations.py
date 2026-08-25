@@ -75,6 +75,7 @@ def scan_parent(parent_dir: Path,
                 subfolder: str = "clinical_eeg",
                 whitelist=None,
                 respect_reviewed_tracker: bool = True,
+                show_progress: bool = True,
                 ) -> tuple[dict[str, tuple[int, int, int, int, int, int]],
                             list[tuple[str, str]]]:
     """Walk ``parent_dir`` looking for per-subject folders. Only
@@ -115,7 +116,17 @@ def scan_parent(parent_dir: Path,
         raise PermissionError(
             f"{parent_dir}: cannot list children: {e}") from e
 
-    for subj_dir in subject_dirs:
+    # Progress bar: writes to stderr so the final report on stdout
+    # stays a clean, greppable block. disable=True gives silent
+    # scan for programmatic callers / tests.
+    from tqdm import tqdm
+    iterator = tqdm(subject_dirs, desc="scanning subjects",
+                    unit="subj", disable=not show_progress,
+                    dynamic_ncols=True)
+
+    for subj_dir in iterator:
+        if hasattr(iterator, "set_postfix_str"):
+            iterator.set_postfix_str(subj_dir.name, refresh=False)
         try:
             if not subj_dir.is_dir():
                 continue
