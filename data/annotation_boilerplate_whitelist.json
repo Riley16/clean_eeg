@@ -1,7 +1,7 @@
 {
   "shared": [
     ".{1,5}",
-    "(?i)(?:\\S{1,5} )?(?:artifact|asleep|awake|spikes|review)(?: \\S{1,5})?",
+    "(?i)(?:\\S{1,5} )?(?:artifact|asleep|awake|spikes?|review|no seizures)(?: \\S{1,5})?",
     "(?i)Mark(?: \\S{1,5})?"
   ],
   "per_site": {
@@ -21,6 +21,7 @@
     "H": [],
     "J": [
       "SpikeBurst \\d+(?:\\.\\d+)? \\d+(?:\\.\\d+)?s",
+      "@?SpikeBurst\\([A-Za-z]+\\)",
       "RhythmicBurst [A-Za-z0-9-]{1,8}",
       "A1\\+A2 OFF",
       "RESET OFF",
