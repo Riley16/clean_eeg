@@ -73,7 +73,7 @@ def test_count_edf_annotations_counts_words_whitespace_tokenized(tmp_path):
         "eyes closed",       # 2 words
         "",                  # empty -- excluded from BOTH counts
     ])
-    n_ann, n_words, n_wl = count_annotations.count_edf_annotations(edf)
+    n_ann, n_words, n_wl, n_del = count_annotations.count_edf_annotations(edf)
     assert n_ann == 3
     assert n_words == 6
     assert n_wl == 0
@@ -92,8 +92,8 @@ def test_scan_parent_reports_per_subject_totals(tmp_path):
             tmp_path / code / "clinical_eeg" / f"{code}_file.edf", texts)
 
     result, _ = count_annotations.scan_parent(tmp_path)
-    assert result["R1A"] == (2, 3, 1, 0, 0, 0)
-    assert result["R1B"] == (1, 4, 1, 0, 0, 0)
+    assert result["R1A"] == (2, 3, 1, 0, 0, 0, 0)
+    assert result["R1B"] == (1, 4, 1, 0, 0, 0, 0)
 
 
 def test_scan_parent_skips_annotation_sidecars(tmp_path):
@@ -110,7 +110,7 @@ def test_scan_parent_skips_annotation_sidecars(tmp_path):
                                  ["one two", "three"])   # sidecar dup
 
     result, _ = count_annotations.scan_parent(tmp_path)
-    assert result["R1SUBJ"] == (2, 3, 1, 0, 0, 0)
+    assert result["R1SUBJ"] == (2, 3, 1, 0, 0, 0, 0)
 
 
 def test_scan_parent_reports_skipped_files_separately(tmp_path):
@@ -123,7 +123,7 @@ def test_scan_parent_reports_skipped_files_separately(tmp_path):
     (inner / "garbage.edf").write_bytes(b"not an EDF at all")
 
     result, _ = count_annotations.scan_parent(tmp_path)
-    n_ann, n_words, n_ok, n_skipped, n_reviewed, n_wl = result["R1SUBJ"]
+    n_ann, n_words, n_ok, n_skipped, n_reviewed, n_wl, n_del = result["R1SUBJ"]
     assert n_ok == 1
     assert n_skipped == 1
     assert n_reviewed == 0
@@ -156,7 +156,7 @@ def test_scan_parent_excludes_whitelist_matched_annotations(tmp_path):
     ])
 
     result, _ = count_annotations.scan_parent(tmp_path, whitelist=wl)
-    n_ann, n_words, n_ok, n_skip, n_rev, n_wl = result["R1755A"]
+    n_ann, n_words, n_ok, n_skip, n_rev, n_wl, n_del = result["R1755A"]
     assert n_ann == 2           # PAT REF EEG excluded
     assert n_words == 3         # 'seizure' + 'eyes closed' = 1 + 2
     assert n_wl == 1
@@ -179,7 +179,7 @@ def test_scan_parent_whitelist_uses_correct_site_bucket(tmp_path):
     _write_edf_with_annotations(inner / "R1755A.edf", ["PAT REF EEG"])
 
     result, _ = count_annotations.scan_parent(tmp_path, whitelist=wl)
-    n_ann, n_words, _, _, _, n_wl = result["R1755A"]
+    n_ann, n_words, _, _, _, n_wl, n_del = result["R1755A"]
     assert n_ann == 1   # NOT whitelisted for site A
     assert n_wl == 0
 
@@ -200,7 +200,7 @@ def test_scan_parent_whitelist_matches_full_text_only(tmp_path):
                                  ["PAT REF EEG CAROL LOOK AT THIS"])
 
     result, _ = count_annotations.scan_parent(tmp_path, whitelist=wl)
-    n_ann, n_words, _, _, _, n_wl = result["R1755A"]
+    n_ann, n_words, _, _, _, n_wl, n_del = result["R1755A"]
     assert n_ann == 1
     assert n_wl == 0     # NOT matched (partial)
     assert n_words == 7  # PAT REF EEG CAROL LOOK AT THIS -> 7 words
@@ -228,7 +228,7 @@ def test_scan_parent_skips_files_in_reviewed_tracker(tmp_path):
         ReviewedFile.new(file_path=done, n_annotations=3, n_edited=0))
 
     result, _ = count_annotations.scan_parent(tmp_path)
-    n_ann, n_words, n_ok, n_skip, n_rev, n_wl = result["R1755A"]
+    n_ann, n_words, n_ok, n_skip, n_rev, n_wl, n_del = result["R1755A"]
     assert n_rev == 1
     assert n_ok == 1
     assert n_ann == 1        # only 'four five' -> 1 annotation
@@ -251,7 +251,7 @@ def test_scan_parent_include_reviewed_disables_tracker_filter(tmp_path):
 
     result, _ = count_annotations.scan_parent(
         tmp_path, respect_reviewed_tracker=False)
-    n_ann, n_words, n_ok, n_skip, n_rev, n_wl = result["R1755A"]
+    n_ann, n_words, n_ok, n_skip, n_rev, n_wl, n_del = result["R1755A"]
     assert n_rev == 0        # tracker ignored
     assert n_ok == 1
     assert n_ann == 1
@@ -322,3 +322,40 @@ def test_scan_parent_skips_permission_denied_subject_and_continues(
     bad_entries = [(n, r) for n, r in skipped if n == "R1666A"]
     assert len(bad_entries) == 1
     assert "permission" in bad_entries[0][1].lower()
+
+
+# ---------------------------------------------------------------------------
+# Delete bucket: excluded from review count separately from whitelist
+# ---------------------------------------------------------------------------
+
+def test_scan_parent_excludes_delete_bucket_annotations(tmp_path):
+    """HARD REQUIREMENT: annotations matched by the DELETE bucket
+    are excluded from the review count separately from whitelist
+    matches. Was a bug: earlier count_annotations only applied
+    whitelist.matches, not matches_delete -- delete-marked
+    annotations still inflated the count.
+    """
+    from clean_eeg.annotation_boilerplate import BoilerplateWhitelist
+    import re
+    # J site: 'Segment: REC START.*' in the delete bucket,
+    # 'PAT REF EEG' in the whitelist bucket.
+    wl = BoilerplateWhitelist(
+        shared=[], per_site={"J": [re.compile(r"PAT REF EEG")]},
+        delete_shared=[], delete_per_site={
+            "J": [re.compile(r"Segment: REC START.*")]})
+
+    inner = tmp_path / "R1755J" / "clinical_eeg"
+    inner.mkdir(parents=True)
+    _write_edf_with_annotations(inner / "R1755J.edf", [
+        "Segment: REC START at 10:00",   # DELETE bucket
+        "PAT REF EEG",                    # WHITELIST bucket
+        "seizure onset",                  # kept (real content)
+    ])
+
+    result, _ = count_annotations.scan_parent(tmp_path, whitelist=wl)
+    n_ann, n_words, n_ok, n_skip, n_rev, n_wl, n_del = result["R1755J"]
+    # Only 'seizure onset' remains
+    assert n_ann == 1
+    assert n_words == 2
+    assert n_wl == 1      # PAT REF EEG
+    assert n_del == 1     # Segment: REC START ...

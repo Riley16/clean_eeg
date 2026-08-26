@@ -36,17 +36,18 @@ def _derive_site_code(subject_dir_name: str) -> str | None:
 def count_edf_annotations(edf_path: Path,
                            whitelist=None,
                            site_code: str | None = None,
-                           ) -> tuple[int, int, int]:
-    """Return ``(n_annotations, n_words, n_whitelisted)`` for the non-
-    timekeeping annotations in ``edf_path``. Whitespace-only entries
-    excluded.
+                           ) -> tuple[int, int, int, int]:
+    """Return ``(n_annotations, n_words, n_whitelisted, n_deleted)``
+    for the non-timekeeping annotations in ``edf_path``.
+    Whitespace-only entries excluded.
 
     ``whitelist`` (an optional :class:`BoilerplateWhitelist`): if
-    given, annotations that ``fullmatch`` a whitelist pattern for the
-    subject's ``site_code`` are counted separately as
-    ``n_whitelisted`` and EXCLUDED from ``n_annotations`` /
-    ``n_words``. Lets the review-time estimate shrink as the operator
-    grows the whitelist during review.
+    given, annotations that ``fullmatch`` a WHITELIST pattern for
+    the subject's ``site_code`` are counted separately as
+    ``n_whitelisted``; DELETE-bucket matches counted separately as
+    ``n_deleted``. Both are EXCLUDED from ``n_annotations`` /
+    ``n_words`` (they're not going to be reviewed). Lets the
+    review-time estimate shrink as the operator grows either bucket.
     """
     from clean_eeg.annotation_reader import (
         count_words_in_annotations,
@@ -55,14 +56,21 @@ def count_edf_annotations(edf_path: Path,
     anns = iter_annotations(edf_path)
     kept = [a for a in anns if a.text.strip()]
     if whitelist is None:
-        return len(kept), count_words_in_annotations(kept), 0
-    to_review, whitelisted = [], 0
+        return len(kept), count_words_in_annotations(kept), 0, 0
+    to_review, whitelisted, deleted = [], 0, 0
     for a in kept:
-        if whitelist.matches(a.text, site_code=site_code):
+        # DELETE bucket checked FIRST -- annotations marked for
+        # deletion get their own bucket even if they'd also match
+        # a whitelist pattern (rare but possible; delete semantics
+        # are stronger).
+        if whitelist.matches_delete(a.text, site_code=site_code):
+            deleted += 1
+        elif whitelist.matches(a.text, site_code=site_code):
             whitelisted += 1
         else:
             to_review.append(a)
-    return len(to_review), count_words_in_annotations(to_review), whitelisted
+    return (len(to_review), count_words_in_annotations(to_review),
+            whitelisted, deleted)
 
 
 def _reviewed_paths_for(subj_dir: Path) -> set[str]:
@@ -77,7 +85,7 @@ def scan_parent(parent_dir: Path,
                 whitelist=None,
                 respect_reviewed_tracker: bool = True,
                 show_progress: bool = True,
-                ) -> tuple[dict[str, tuple[int, int, int, int, int, int]],
+                ) -> tuple[dict[str, tuple[int, int, int, int, int, int, int]],
                             list[tuple[str, str]]]:
     """Walk ``parent_dir`` looking for per-subject folders. Only
     subjects with a ``<subject>/<subfolder>/`` subdir are counted;
@@ -106,7 +114,7 @@ def scan_parent(parent_dir: Path,
     than halting the whole scan -- an operator running against a
     shared collab drive routinely doesn't own everything.
     """
-    per_subject: dict[str, tuple[int, int, int, int, int, int]] = {}
+    per_subject: dict[str, tuple[int, int, int, int, int, int, int]] = {}
     skipped_subjects: list[tuple[str, str]] = []
     if not parent_dir.exists():
         raise FileNotFoundError(f"{parent_dir} does not exist")
@@ -242,10 +250,12 @@ def scan_parent(parent_dir: Path,
         else:
             file_iter.set_postfix_str(current_subject, refresh=False)
 
+    running_deleted = 0
     for meta in subject_metas:
         # Per-subject accumulators; flushed to per_subject +
         # incremental summary print at end of each subject.
-        n_ann = n_words = n_ok = n_skipped = n_reviewed = n_whitelisted = 0
+        n_ann = n_words = n_ok = n_skipped = 0
+        n_reviewed = n_whitelisted = n_deleted = 0
         _update_bar_postfix(meta.subj_dir.name)
 
         for edf in meta.edfs:
@@ -255,7 +265,7 @@ def scan_parent(parent_dir: Path,
                 _update_bar_postfix(meta.subj_dir.name)
                 continue
             try:
-                a, w, wl = count_edf_annotations(
+                a, w, wl, dl = count_edf_annotations(
                     edf, whitelist=whitelist, site_code=meta.site_code)
             except PermissionError:
                 n_skipped += 1
@@ -270,6 +280,7 @@ def scan_parent(parent_dir: Path,
             n_ann += a
             n_words += w
             n_whitelisted += wl
+            n_deleted += dl
             n_ok += 1
             # Bump running totals BEFORE the postfix update so the
             # mean reflects the file that just completed.
@@ -277,11 +288,13 @@ def scan_parent(parent_dir: Path,
             running_words += w
             running_files_ok += 1
             running_wl += wl
+            running_deleted += dl
             file_iter.update(1)
             _update_bar_postfix(meta.subj_dir.name)
 
-        per_subject[meta.subj_dir.name] = (n_ann, n_words, n_ok, n_skipped,
-                                            n_reviewed, n_whitelisted)
+        per_subject[meta.subj_dir.name] = (
+            n_ann, n_words, n_ok, n_skipped, n_reviewed,
+            n_whitelisted, n_deleted)
         # Running totals were already bumped inside the per-file
         # loop above (so postfix updates every file reflect the
         # latest data). Nothing to add here -- just print the
@@ -307,15 +320,17 @@ def scan_parent(parent_dir: Path,
     return per_subject, skipped_subjects
 
 
-def print_report(per_subject: dict[str, tuple[int, int, int, int, int, int]],
+def print_report(per_subject: dict[str, tuple[int, int, int, int, int, int, int]],
                  wpm: int,
                  skipped_subjects: list[tuple[str, str]] | None = None,
                  ) -> None:
-    total_ann = sum(a for a, _, _, _, _, _ in per_subject.values())
-    total_words = sum(w for _, w, _, _, _, _ in per_subject.values())
-    total_skipped = sum(s for _, _, _, s, _, _ in per_subject.values())
-    total_reviewed = sum(r for _, _, _, _, r, _ in per_subject.values())
-    total_whitelisted = sum(wl for _, _, _, _, _, wl in per_subject.values())
+    total_ann = sum(a for a, _, _, _, _, _, _ in per_subject.values())
+    total_words = sum(w for _, w, _, _, _, _, _ in per_subject.values())
+    total_skipped = sum(s for _, _, _, s, _, _, _ in per_subject.values())
+    total_reviewed = sum(r for _, _, _, _, r, _, _ in per_subject.values())
+    total_whitelisted = sum(wl for _, _, _, _, _, wl, _
+                             in per_subject.values())
+    total_deleted = sum(d for _, _, _, _, _, _, d in per_subject.values())
     with_data = [k for k, v in per_subject.items() if v[2] > 0]
 
     print(f"\n=== Annotation review estimate ===")
@@ -325,9 +340,12 @@ def print_report(per_subject: dict[str, tuple[int, int, int, int, int, int]],
     print(f"Remaining words:        {total_words:,}")
     if total_whitelisted:
         print(f"Whitelisted (excluded): {total_whitelisted:,} annotations")
+    if total_deleted:
+        print(f"Delete-marked (excluded): "
+              f"{total_deleted:,} annotations")
     if total_reviewed:
         print(f"Files already reviewed: {total_reviewed}  (skipped)")
-    total_files_ok = sum(f_ok for _, _, f_ok, _, _, _
+    total_files_ok = sum(f_ok for _, _, f_ok, _, _, _, _
                           in per_subject.values())
     if with_data:
         print(f"Mean / subject:         "
@@ -353,15 +371,15 @@ def print_report(per_subject: dict[str, tuple[int, int, int, int, int, int]],
 
     print(f"\n=== Per-subject ({len(per_subject)} rows) ===")
     header = (f"{'subject':<20s}  {'files':>5s}  {'skip':>4s}  "
-              f"{'done':>4s}  {'wlist':>5s}  {'ann':>7s}  "
-              f"{'words':>8s}  {'min@' + str(wpm):>7s}")
+              f"{'done':>4s}  {'wlist':>6s}  {'del':>5s}  "
+              f"{'ann':>7s}  {'words':>8s}  {'min@' + str(wpm):>7s}")
     print(header)
     print("-" * len(header))
     for code in sorted(per_subject):
-        a, w, f_ok, s, r, wl = per_subject[code]
+        a, w, f_ok, s, r, wl, dl = per_subject[code]
         mins = w / wpm if w else 0
         print(f"{code:<20s}  {f_ok:>5d}  {s:>4d}  {r:>4d}  "
-              f"{wl:>5d}  {a:>7,}  {w:>8,}  {mins:>7.0f}")
+              f"{wl:>6d}  {dl:>5d}  {a:>7,}  {w:>8,}  {mins:>7.0f}")
 
     if skipped_subjects:
         print(f"\n=== Skipped subjects ({len(skipped_subjects)}) ===")
@@ -387,11 +405,18 @@ def main(argv: list[str] | None = None) -> int:
                         f"estimate (default: {DEFAULT_WPM})")
     p.add_argument("--whitelist-path", type=Path, default=None,
                    metavar="FILE",
-                   help="Path to a boilerplate whitelist JSON (per-site "
-                        "regex fullmatch). Matched annotations are "
-                        "excluded from the review-time count and "
-                        "reported separately. Site code is derived "
-                        "from the R1XXXY[_M] subject folder name.")
+                   help="Boilerplate whitelist JSON. If omitted, the "
+                        "standard file at data/annotation_boilerplate_"
+                        "whitelist.json is used automatically. Matched "
+                        "annotations (whitelist AND delete buckets) "
+                        "are excluded from the review-time count and "
+                        "reported separately. Pass --no-whitelist "
+                        "to disable filtering entirely.")
+    p.add_argument("--no-whitelist", action="store_true",
+                   help="Skip whitelist filtering. Every annotation "
+                        "(including boilerplate + delete-marked) is "
+                        "counted toward the review estimate. Useful "
+                        "for seeing the raw baseline.")
     p.add_argument("--include-reviewed", action="store_true",
                    help="Include EDF files listed in "
                         "<subject>/.annotation_reviewed_tracker. Default "
@@ -399,14 +424,22 @@ def main(argv: list[str] | None = None) -> int:
                         "review show only the remaining work).")
     args = p.parse_args(argv)
 
+    # Auto-locate the standard whitelist so operators don't have to
+    # remember the flag. --no-whitelist disables entirely; explicit
+    # --whitelist-path overrides.
     whitelist = None
-    if args.whitelist_path is not None:
+    if not args.no_whitelist:
         from clean_eeg.annotation_boilerplate import (
             BoilerplateWhitelistError,
             load_whitelist,
         )
+        wl_path = args.whitelist_path
+        if wl_path is None:
+            wl_path = (Path(__file__).parent.parent / "data"
+                       / "annotation_boilerplate_whitelist.json")
         try:
-            whitelist = load_whitelist(args.whitelist_path)
+            whitelist = load_whitelist(wl_path)
+            print(f"applying whitelist: {wl_path}", file=sys.stderr)
         except BoilerplateWhitelistError as e:
             print(f"[error] {e}", file=sys.stderr)
             return 2
