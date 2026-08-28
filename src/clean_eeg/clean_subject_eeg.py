@@ -327,6 +327,7 @@ def clean_subject_edf_files(
     skip_if_already_cleaned: bool = False,
     fail_on_name_mismatch: bool = False,
     launch_review: bool = False,
+    audit_sample_files: Union[int, None] = None,
 ):
     if approve_confirmations is None:
         approve_confirmations = set()
@@ -390,8 +391,15 @@ def clean_subject_edf_files(
     all_filenames = list(EDF_meta_data.keys())
     if skip_audit:
         audit_filenames: set = set()
+    elif audit_sample_files is not None:
+        audit_filenames = set(_select_audit_sample_filenames(
+            all_filenames, n=audit_sample_files))
     else:
         audit_filenames = set(all_filenames)
+    if audit_filenames != set(all_filenames) and audit_filenames:
+        print(f"[audit-sample] auditing {len(audit_filenames)}/"
+              f"{len(all_filenames)} file(s) for signal integrity: "
+              f"{sorted(audit_filenames)}")
 
     # Build Presidio once per subject and reuse across all redact_string calls.
     # This amortizes the spaCy-model + recognizer-registry construction cost.
@@ -769,6 +777,46 @@ def _print_review_block(events: list) -> None:
         for e in trunc:
             print(f"    {e.file}: {e.details.get('message')}")
     print("===========================\n")
+
+
+def _select_audit_sample_filenames(all_filenames: list, n: int) -> list:
+    """Pick ``n`` filenames from ``all_filenames`` to audit for signal
+    integrity. Deterministic: same input list + same n -> same subset,
+    so re-runs audit the same files (useful when combined with
+    --skip-if-already-cleaned to reproduce a prior audit's coverage).
+
+    Selection rule:
+      - ``n <= 0`` -> [] (equivalent to skip_audit)
+      - ``n >= len(all_filenames)`` -> every file (equivalent to
+        default full audit)
+      - Otherwise: always include the FIRST + LAST filename (they
+        anchor the recording start / end) plus (n - 2) evenly-spaced
+        interior indices. When n == 1, only the first is returned;
+        n == 2 -> first + last.
+
+    Even spacing (rather than random sampling) gives predictable
+    coverage across the recording -- a mid-recording defect in the
+    pipeline is more likely to be caught by 'sample every ~N/n files'
+    than by 'sample N random files'. Also easier to reason about
+    coverage from the log line.
+    """
+    if n <= 0:
+        return []
+    total = len(all_filenames)
+    if n >= total:
+        return list(all_filenames)
+    if n == 1:
+        return [all_filenames[0]]
+    if n == 2:
+        return [all_filenames[0], all_filenames[-1]]
+    # n >= 3: first, last, and (n-2) evenly-spaced interior indices.
+    # Use round() with a linspace-style index over (n-1) intervals so
+    # both endpoints land on 0 and total-1.
+    picked_indices = set()
+    for k in range(n):
+        idx = round(k * (total - 1) / (n - 1))
+        picked_indices.add(int(idx))
+    return [all_filenames[i] for i in sorted(picked_indices)]
 
 
 def _run_audit_and_launch_review(output_path: str) -> None:
@@ -1576,7 +1624,8 @@ def get_clean_eeg_cli_arguments():
                              "--approve-confirmations recording-gaps to auto-answer 'yes'.")
     parser.add_argument("--approve-confirmations", "--approve_confirmations",
                         dest="approve_confirmations", nargs="+", default=[],
-                        choices=["wipe-annotations", "recording-gaps"],
+                        choices=["wipe-annotations", "recording-gaps",
+                                  "in-place"],
                         help="List of destructive-operation or safety-check confirmation "
                              "prompts to auto-approve (for headless / non-interactive runs). "
                              "Each type must be listed explicitly — there is no global --yes. "
@@ -1629,6 +1678,23 @@ def get_clean_eeg_cli_arguments():
                              "per-subject subprocess so the per-subject "
                              "cleanings don't stop mid-batch waiting for a "
                              "reviewer.")
+    parser.add_argument("--audit-sample-files", "--audit_sample_files",
+                        dest="audit_sample_files", type=int, default=None,
+                        metavar="N",
+                        help="Audit signal integrity on N sampled files per "
+                             "subject instead of every file. N=0 is equivalent "
+                             "to --skip_audit (no audit); N>=len(files) "
+                             "reverts to the default full audit. Selection is "
+                             "deterministic: always includes first + last "
+                             "file, plus (N-2) evenly-spaced interior files. "
+                             "Trade defense-in-depth (bit-verify EVERY file) "
+                             "for wall-time (skip signal I/O on unaudited "
+                             "files -- signal preload is the dominant per-file "
+                             "cost on multi-GB EEGs over network storage). "
+                             "Recommended for batch runs on large subjects "
+                             "when you trust the pipeline's per-file "
+                             "primitives (which are covered by their own unit "
+                             "tests).")
 
     args = parser.parse_args()
 
@@ -1668,9 +1734,17 @@ def validate_cli_arguments(args):
         print(f"WARNING: De-identification will modify EDF files in place at:\n"
               f"  {args.input_path}\n"
               f"Original headers will be overwritten. Use --copy_path to write to a separate directory instead.")
-        confirm = logged_input("Continue with in-place de-identification? yes/no: ")
-        if confirm.lower() not in ['yes', 'y']:
-            raise RuntimeError("Aborting. Re-run with --copy_path to write to a separate directory.")
+        # Auto-approve bypass: --approve-confirmations in-place skips the
+        # interactive gate for headless / batch runs. Batch's
+        # _default_clean_argv_prefix passes this by default so 27-subject
+        # unattended runs don't stall on prompt N.
+        if "in-place" in set(args.approve_confirmations or []):
+            print("[!] in-place de-identification auto-approved via "
+                  "--approve-confirmations in-place.")
+        else:
+            confirm = logged_input("Continue with in-place de-identification? yes/no: ")
+            if confirm.lower() not in ['yes', 'y']:
+                raise RuntimeError("Aborting. Re-run with --copy_path to write to a separate directory.")
 
     if args.middle_name == 'NOT_SPECIFIED':
         raise ValueError('Middle name must be specified. Pass --middle_name '
@@ -1778,6 +1852,7 @@ if __name__ == "__main__":
             # stdin/stdout aren't TTYs, so SSH-without-PTY / nohup / cron
             # invocations are safe.
             launch_review=not args.no_launch_review,
+            audit_sample_files=args.audit_sample_files,
         )
 
     except Exception:

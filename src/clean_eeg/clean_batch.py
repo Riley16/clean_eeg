@@ -169,15 +169,26 @@ def _default_clean_argv_prefix() -> list[str]:
     wrapper works in any env where ``clean_eeg`` is importable, without
     depending on the ``clean-subject-eeg`` console script being on PATH.
 
-    Forwards ``--no-launch-review`` so the per-subject cleaner does NOT
-    auto-launch its end-of-run audit + TUI. Batch mode aggregates the
-    review phase into a single post-batch pass (see :func:`run_review_phase`)
-    so the operator can complete every clean first, then work through
-    every subject's review back-to-back without being interrupted mid-
-    batch.
+    Forwards flags so the per-subject cleaner runs completely unattended:
+
+      --no-launch-review        Suppress the per-subject audit + TUI
+                                auto-launch; batch aggregates review
+                                into a single post-batch pass.
+      --quiet-gap-check         Silence + auto-approve the recording-gap
+                                "Continue?" prompt (large inter-file gaps
+                                trigger a warning + prompt in interactive
+                                mode; batch can't stop for it).
+      --approve-confirmations recording-gaps in-place
+                                Auto-approve the in-place de-identification
+                                warning (in-place is the only mode used
+                                for batch runs) and the recording-gaps
+                                confirmation (belt + suspenders with
+                                --quiet-gap-check).
     """
     return [sys.executable, "-m", "clean_eeg.clean_subject_eeg",
-            "--no-launch-review"]
+            "--no-launch-review",
+            "--quiet-gap-check",
+            "--approve-confirmations", "recording-gaps", "in-place"]
 
 
 def clean_one_subject(row: SubjectRow, *, extra_argv: list[str] | None = None,

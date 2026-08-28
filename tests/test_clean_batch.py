@@ -512,6 +512,42 @@ def test_default_argv_prefix_forwards_no_launch_review():
     )
 
 
+def test_default_argv_prefix_auto_approves_interactive_prompts():
+    """Batch runs unattended (potentially overnight, on 27+ subjects).
+    Every interactive prompt in clean_subject_eeg must be bypassed by
+    the default per-subject argv, or the batch stalls on prompt 1:
+
+      - Recording-gap 'Continue?' prompt (fires when a large gap
+        between consecutive files is detected) -> --quiet-gap-check
+        AND --approve-confirmations recording-gaps (belt + suspenders).
+      - In-place de-identification warning + confirm -> --approve-
+        confirmations in-place.
+
+    Regression against a stalled batch after a new prompt is added
+    without also updating this prefix."""
+    prefix = _default_clean_argv_prefix()
+    assert "--quiet-gap-check" in prefix, (
+        f"batch must silence + auto-approve the recording-gap check "
+        f"to run unattended: {prefix}"
+    )
+    assert "--approve-confirmations" in prefix, (
+        f"batch must forward --approve-confirmations for the in-place "
+        f"warning and recording-gap prompt: {prefix}"
+    )
+    # Approved kinds appear right after the flag.
+    i = prefix.index("--approve-confirmations")
+    approved = set()
+    for a in prefix[i + 1:]:
+        if a.startswith("-"):
+            break
+        approved.add(a)
+    assert "in-place" in approved, (
+        f"batch must auto-approve the in-place de-identification "
+        f"warning: {prefix}")
+    assert "recording-gaps" in approved, (
+        f"batch must auto-approve the recording-gap prompt: {prefix}")
+
+
 # ---------------------------------------------------------------------------
 # --only-subjects: subject-picker filter
 # ---------------------------------------------------------------------------

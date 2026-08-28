@@ -2061,6 +2061,110 @@ def test_clean_subject_edf_files_launch_review_defaults_off(monkeypatch, capsys,
     )
 
 
+def test_in_place_prompt_bypassed_by_approve_confirmations(tmp_path):
+    """The 'Continue with in-place de-identification? yes/no:' gate must
+    be bypassable via --approve-confirmations in-place so batch runs
+    don't stall on it. Subprocesses the real CLI with stdin=DEVNULL --
+    if the bypass is broken, the CLI's logged_input() raises EOFError
+    and the error surfaces as an uncaught exception in stderr. With the
+    bypass working, the CLI prints the auto-approve banner + continues
+    past the gate (then fails on the missing input path, which is fine)."""
+    import subprocess as _sp
+
+    # Real empty directory: the in-place gate lives INSIDE
+    # validate_cli_arguments (which checks input_path exists first), so
+    # the input_path must exist. The pipeline then fails later on
+    # "no EDF files" -- fine, that's after the gate we're testing.
+    input_dir = tmp_path / "empty_edf_dir"
+    input_dir.mkdir()
+    argv = [
+        "--input_path", str(input_dir),
+        "--subject_code", "R1755J",
+        "--first_name", "J", "--last_name", "S", "--no_middle_name",
+        "--approve-confirmations", "in-place",
+        "--skip-if-already-cleaned",
+        "--fail-on-name-mismatch",
+        "--no-launch-review",
+    ]
+    result = _sp.run(
+        [sys.executable, "-m", "clean_eeg.clean_subject_eeg", *argv],
+        capture_output=True, text=True,
+        stdin=_sp.DEVNULL, timeout=30,
+    )
+    combined = result.stdout + result.stderr
+    # Bypass fired: banner printed instead of prompting on stdin.
+    assert "in-place de-identification auto-approved" in combined, (
+        f"expected auto-approve banner; got stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}")
+    # Bypass did NOT hang or raise EOFError from the prompt.
+    assert "EOFError" not in combined, (
+        f"in-place prompt still hit stdin -- bypass broken: {combined}")
+
+
+def test_select_audit_sample_zero_returns_empty():
+    """N=0 is the 'skip audit entirely' shortcut. Equivalent to
+    --skip_audit but reachable via the same CLI flag."""
+    from clean_eeg.clean_subject_eeg import _select_audit_sample_filenames
+    assert _select_audit_sample_filenames(["a.edf", "b.edf", "c.edf"], 0) == []
+
+
+def test_select_audit_sample_n_geq_total_returns_all():
+    """N >= number of files reverts to the default full audit -- no
+    coverage loss when the operator over-specifies N."""
+    from clean_eeg.clean_subject_eeg import _select_audit_sample_filenames
+    files = ["a.edf", "b.edf", "c.edf"]
+    assert _select_audit_sample_filenames(files, 3) == files
+    assert _select_audit_sample_filenames(files, 5) == files
+
+
+def test_select_audit_sample_n_1_picks_first():
+    """N=1: audit the first file only."""
+    from clean_eeg.clean_subject_eeg import _select_audit_sample_filenames
+    files = ["a.edf", "b.edf", "c.edf", "d.edf"]
+    assert _select_audit_sample_filenames(files, 1) == ["a.edf"]
+
+
+def test_select_audit_sample_n_2_picks_first_and_last():
+    """N=2: anchor both ends of the recording so any pipeline defect
+    concentrated at the start OR end is caught."""
+    from clean_eeg.clean_subject_eeg import _select_audit_sample_filenames
+    files = ["a.edf", "b.edf", "c.edf", "d.edf"]
+    assert _select_audit_sample_filenames(files, 2) == ["a.edf", "d.edf"]
+
+
+def test_select_audit_sample_n_3_evenly_spaced():
+    """N=3 with 5 files: first, middle, last. Even spacing gives
+    predictable coverage."""
+    from clean_eeg.clean_subject_eeg import _select_audit_sample_filenames
+    files = ["a.edf", "b.edf", "c.edf", "d.edf", "e.edf"]
+    assert _select_audit_sample_filenames(files, 3) == ["a.edf", "c.edf", "e.edf"]
+
+
+def test_select_audit_sample_is_deterministic():
+    """Same input list + same N MUST return the same subset. Enables
+    re-runs to reproduce a prior audit's coverage exactly (important
+    when combined with --skip-if-already-cleaned)."""
+    from clean_eeg.clean_subject_eeg import _select_audit_sample_filenames
+    files = [f"f{i:03d}.edf" for i in range(20)]
+    first = _select_audit_sample_filenames(files, 4)
+    second = _select_audit_sample_filenames(files, 4)
+    assert first == second
+
+
+def test_select_audit_sample_always_includes_endpoints_for_n_geq_2():
+    """Invariant: the first and last file MUST be in the audit sample
+    whenever N >= 2. Guards against 'clever' selection that drops
+    endpoints (they anchor the recording -- any defect at start-of-
+    recording or end-of-recording concentrates there)."""
+    from clean_eeg.clean_subject_eeg import _select_audit_sample_filenames
+    for n_files in (3, 5, 10, 20, 50):
+        files = [f"f{i:03d}.edf" for i in range(n_files)]
+        for n in range(2, min(n_files, 10)):
+            picked = _select_audit_sample_filenames(files, n)
+            assert picked[0] == files[0], f"n_files={n_files} n={n}: {picked}"
+            assert picked[-1] == files[-1], f"n_files={n_files} n={n}: {picked}"
+
+
 def test_run_audit_and_launch_review_subprocesses_full_audit_cli(monkeypatch,
                                                                   capsys,
                                                                   tmp_path):
