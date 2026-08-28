@@ -33,6 +33,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -515,46 +516,152 @@ def execute_plan_background(plan: TransferPlan, output_path: Path,
     return proc.pid, script_path, log_path
 
 
-def _check_ssh_agent_loaded() -> None:
-    """Warn (non-fatal) if ssh-agent isn't running with any keys loaded.
+DEFAULT_SSH_KEY_PATH = Path.home() / ".ssh" / "id_ed25519"
 
-    Bulk transfers open many SSH connections in sequence. Without
-    ssh-agent, each one prompts for the key passphrase; on a 27-
-    subject batch that's ~54+ prompts. Users have gotten burned by
-    this; the check + hint saves them.
 
-    `ssh-add -l` semantics (per man page):
-      exit 0 -> keys are loaded
-      exit 1 -> agent running but no keys, OR agent not running
-                (message differs but exit code doesn't -- both
-                warrant the same hint)
-      exit 2 -> can't connect to agent
-
-    Non-fatal: some setups use host-based auth, ProxyJump chains, or
-    per-connection ControlPersist and don't need the agent. We print
-    a hint and continue. The transfer will still function if the
-    operator's setup handles auth differently.
-    """
-    import subprocess as _sp
+def _agent_has_keys() -> bool:
+    """True iff `ssh-add -l` reports at least one loaded key.
+    Exit 0 = keys loaded; anything else (1 = no keys or no agent,
+    2 = can't connect) treated as 'no'."""
     try:
-        proc = _sp.run(["ssh-add", "-l"], capture_output=True,
-                        text=True, timeout=5)
-    except (FileNotFoundError, _sp.SubprocessError, OSError):
-        # No ssh-add binary or agent misconfigured -- can't hint
-        # confidently, don't spam.
-        return
-    if proc.returncode == 0:
-        return    # keys loaded -- silent OK
-    # exit 1 or 2 -- agent not usable
+        proc = subprocess.run(["ssh-add", "-l"], capture_output=True,
+                                text=True, timeout=5)
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return False
+    return proc.returncode == 0
+
+
+def _spawn_ssh_agent() -> bool:
+    """Spawn a fresh ssh-agent, parse its stdout env exports, set the
+    corresponding env vars in this process's os.environ so subprocesses
+    (rsync, ssh, ssh-add) inherit the agent socket. Registers atexit
+    cleanup so the spawned agent doesn't leak between invocations.
+    Returns True on success, False on any failure."""
+    try:
+        proc = subprocess.run(["ssh-agent", "-s"], capture_output=True,
+                                text=True, timeout=5)
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return False
+    if proc.returncode != 0:
+        return False
+    # Output shape (POSIX / -s flag):
+    #   SSH_AUTH_SOCK=/tmp/ssh-XXXX/agent.NNN; export SSH_AUTH_SOCK;
+    #   SSH_AGENT_PID=NNN; export SSH_AGENT_PID;
+    #   echo Agent pid NNN;
+    parsed: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        for part in line.split(";"):
+            part = part.strip()
+            if "=" not in part or part.lower().startswith("export"):
+                continue
+            k, _, v = part.partition("=")
+            parsed[k.strip()] = v.strip()
+    sock = parsed.get("SSH_AUTH_SOCK")
+    pid = parsed.get("SSH_AGENT_PID")
+    if not sock or not pid:
+        return False
+    os.environ["SSH_AUTH_SOCK"] = sock
+    os.environ["SSH_AGENT_PID"] = pid
+    # Kill the spawned agent when Python exits so successive
+    # transfer runs don't pile up orphaned agent processes.
+    import atexit as _atexit
+
+    def _kill_agent():
+        try:
+            subprocess.run(
+                ["ssh-agent", "-k"],
+                env={**os.environ, "SSH_AGENT_PID": pid},
+                capture_output=True, timeout=5)
+        except (FileNotFoundError, subprocess.SubprocessError, OSError):
+            pass
+    _atexit.register(_kill_agent)
+    return True
+
+
+def _print_ssh_agent_manual_hint(key_path: Path,
+                                  ssh_add_returncode: int | None = None) -> None:
+    """Print the manual `eval $(ssh-agent); ssh-add <key>` recipe. Used
+    when auto-setup fails or is disabled. Non-fatal -- the transfer
+    still WORKS, it'll just prompt for the passphrase repeatedly."""
+    rc_note = (f" (`ssh-add -l` exit {ssh_add_returncode})"
+                if ssh_add_returncode is not None else "")
     print(
-        "\n[transfer] hint: ssh-agent has no keys loaded (`ssh-add -l` "
-        f"exit {proc.returncode}). Bulk transfers may prompt for your "
-        "SSH passphrase repeatedly. To load your key once for this "
-        "shell session:\n"
+        f"\n[transfer] hint: ssh-agent has no keys loaded{rc_note}. "
+        "Bulk transfers may prompt for your SSH passphrase repeatedly. "
+        "Set up your agent manually with:\n"
         "    eval $(ssh-agent)\n"
-        "    ssh-add ~/.ssh/id_ed25519      # enter passphrase once\n"
+        f"    ssh-add {key_path}      # enter passphrase once\n"
         "Then re-run this transfer. Continuing anyway.",
         flush=True)
+
+
+def ensure_ssh_agent(key_path: Path | None = None,
+                      auto: bool = True) -> None:
+    """Ensure ssh-agent is running with a key loaded. Idempotent -- safe
+    to call at the top of every transfer invocation (subsequent calls
+    see the agent already up and no-op).
+
+    Flow:
+      1. If `ssh-add -l` already reports keys -> done, silent.
+      2. If auto=False -> print manual-setup hint, return.
+      3. If no SSH_AUTH_SOCK -> spawn a fresh ssh-agent + set env vars
+         (atexit cleanup registered so we don't leak agent processes).
+      4. If key file exists AND stdin is a TTY -> run `ssh-add <key>`.
+         This prompts for the passphrase ONCE per invocation.
+      5. Any step fails -> print manual-setup hint, continue.
+
+    Non-fatal by design: transfers still work without the agent (just
+    with per-connection prompts). Some setups (host-based auth,
+    ProxyJump chains) don't need the agent at all -- we silently
+    proceed in that case if the operator has authenticated elsewhere.
+    """
+    key_path = key_path or DEFAULT_SSH_KEY_PATH
+
+    # Step 1: already good?
+    if _agent_has_keys():
+        return
+
+    if not auto:
+        _print_ssh_agent_manual_hint(key_path)
+        return
+
+    # Step 3: no agent -> spawn one.
+    if not os.environ.get("SSH_AUTH_SOCK"):
+        if not _spawn_ssh_agent():
+            _print_ssh_agent_manual_hint(key_path)
+            return
+        print(f"[transfer] started ssh-agent for this session (pid "
+              f"{os.environ.get('SSH_AGENT_PID')}); agent dies with this "
+              f"process.", flush=True)
+
+    # Step 4: ssh-add the key.
+    if not key_path.exists():
+        print(f"[transfer] SSH key not found at {key_path} -- skipping "
+              f"auto-add. Pass --ssh-key <path> if the key lives "
+              f"elsewhere.", flush=True)
+        _print_ssh_agent_manual_hint(key_path)
+        return
+    if not sys.stdin.isatty():
+        # ssh-add prompts for the passphrase on a TTY. Under nohup /
+        # cron / SSH-without-PTY there's no way to enter it.
+        print(f"[transfer] no TTY -- can't prompt for SSH passphrase "
+              f"non-interactively. Load the key before invoking:\n"
+              f"    eval $(ssh-agent)\n"
+              f"    ssh-add {key_path}\n"
+              f"then re-run under nohup / batch.", flush=True)
+        return
+    print(f"[transfer] loading SSH key {key_path} into agent "
+          f"(passphrase prompt below; entered once per invocation)...",
+          flush=True)
+    try:
+        proc = subprocess.run(["ssh-add", str(key_path)], timeout=120)
+        if proc.returncode != 0:
+            _print_ssh_agent_manual_hint(
+                key_path, ssh_add_returncode=proc.returncode)
+    except (FileNotFoundError, subprocess.SubprocessError, OSError) as e:
+        print(f"[transfer] ssh-add failed ({type(e).__name__}: {e}). "
+              f"Continuing without the agent.", flush=True)
+        _print_ssh_agent_manual_hint(key_path)
 
 
 def transfer_subject(output_path: str | Path, *,
@@ -565,6 +672,8 @@ def transfer_subject(output_path: str | Path, *,
                      remote_dir_override: str | None = None,
                      skip_perms: bool = False,
                      background: bool = False,
+                     ssh_key: Path | None = None,
+                     auto_ssh_agent: bool = True,
                      ) -> TransferPlan:
     """Preflight, then execute (unless ``dry_run``). Returns the
     composed :class:`TransferPlan` either way.
@@ -601,16 +710,16 @@ def transfer_subject(output_path: str | Path, *,
             "command line."
         )
 
-    # ssh-agent hint: bulk transfers open many SSH connections in
-    # sequence. Without ssh-agent, each one prompts for the key
-    # passphrase -- the operator would enter it hundreds of times.
-    # `ssh-add -l` lists loaded keys; exit-1 means "no keys" or
-    # "agent not running", exit-2 means "can't connect to agent".
-    # Non-fatal warning: the transfer still WORKS without agent, just
-    # painfully, and the check may spuriously fail (e.g. key-less
-    # setups using host-based auth or ProxyJump chains). Print a hint
-    # and continue.
-    _check_ssh_agent_loaded()
+    # ssh-agent: bulk transfers open many SSH connections in sequence.
+    # Without an agent, each prompts for the key passphrase -- on a
+    # 27-subject batch that's dozens of prompts. ensure_ssh_agent is
+    # idempotent: called at the top of every transfer_subject; the
+    # FIRST call spawns the agent + prompts once for the passphrase,
+    # subsequent calls see the agent already up and no-op. Setup is
+    # non-fatal (transfer still works with per-connection prompts if
+    # the agent can't be set up), and auto=False lets callers with
+    # their own agent management disable this entirely.
+    ensure_ssh_agent(key_path=ssh_key, auto=auto_ssh_agent)
 
     plan = build_transfer_plan(
         output_path,

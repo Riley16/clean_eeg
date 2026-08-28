@@ -456,6 +456,8 @@ def run_bulk_transfer(subject_dirs: list[Path],
                       log_path: Path | None = None,
                       subjects_file: Path | None = None,
                       only_subjects: list[str] | None = None,
+                      ssh_key: Path | None = None,
+                      auto_ssh_agent: bool = True,
                       ) -> tuple[list[SubjectResult], list[tuple[Path, str]]]:
     """Drive the whole batch. Returns
     ``(subject_results, preflight_hard_failures)``.
@@ -465,9 +467,21 @@ def run_bulk_transfer(subject_dirs: list[Path],
     invalid dirs stay visible in ``preflight_hard_failures``; the
     picker only filters the eligible-for-transfer queue.
 
+    ``ssh_key`` + ``auto_ssh_agent``: forwarded to ensure_ssh_agent so
+    the passphrase gets entered ONCE before the batch instead of
+    dozens of times per subject. See clean_eeg.transfer.ensure_ssh_agent
+    for the auto-setup semantics.
+
     Prints periodic progress (subjects done / bytes done / ETA) and
     writes structured JSONL log entries alongside.
     """
+    # Set up ssh-agent ONCE before the batch starts (passphrase entered
+    # once, not per-subject). Every subprocess spawned below (mkdir,
+    # rsync, perms per subject) inherits SSH_AUTH_SOCK from this
+    # process, so they all reuse the same agent.
+    from clean_eeg.transfer import ensure_ssh_agent
+    ensure_ssh_agent(key_path=ssh_key, auto=auto_ssh_agent)
+
     log_path = log_path or _default_log_path(subjects_file)
     ready, hard_failures = build_subject_plans(subject_dirs)
     ready = _filter_plans_by_subject(ready, only_subjects)
@@ -744,6 +758,19 @@ def _build_parser() -> argparse.ArgumentParser:
                         "if both are given. Same subjects-list file can "
                         "drive clean-batch-eeg and bulk-transfer-eeg so "
                         "the two stages stay in lockstep.")
+    p.add_argument("--ssh-key", type=Path, default=None,
+                   help="SSH private key path for auto-loading into "
+                        "ssh-agent (default: ~/.ssh/id_ed25519). Only "
+                        "used when ssh-agent isn't already running with "
+                        "keys; the passphrase is entered ONCE per "
+                        "invocation (not per subject).")
+    p.add_argument("--no-auto-ssh-agent", action="store_true",
+                   help="Disable the auto-spawn-ssh-agent + auto-add-key "
+                        "behaviour. Use when you're managing the agent "
+                        "externally (keychain integration, custom "
+                        "setup) or already have SSH_AUTH_SOCK exported "
+                        "in your shell. Prints the manual-setup hint "
+                        "instead if the agent is empty.")
     return p
 
 
@@ -808,6 +835,8 @@ def main(argv: list[str] | None = None) -> int:
         log_path=args.log_path,
         subjects_file=args.subjects_file,
         only_subjects=only_subjects or None,
+        ssh_key=args.ssh_key,
+        auto_ssh_agent=not args.no_auto_ssh_agent,
     )
     if only_subjects and not results and not hard_failures:
         # Picker matched nothing (--only-subjects[-file] entries all

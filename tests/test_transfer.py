@@ -12,6 +12,7 @@ network or subprocess is invoked.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -583,80 +584,198 @@ def test_preflight_passes_when_raw_annotations_dump_is_sibling(tmp_path):
 # ---------- ssh-agent hint ----------
 
 
-def test_ssh_agent_check_prints_hint_when_no_keys_loaded(monkeypatch, capsys,
-                                                          tmp_path):
-    """When `ssh-add -l` exits 1 (no keys / no agent), transfer_subject
-    must print the ssh-agent setup hint and continue (non-fatal). Bulk
-    transfers otherwise prompt for the passphrase repeatedly."""
+def _stub_subprocess_run_for_ssh_agent(monkeypatch, *,
+                                         ssh_add_l_exit: int = 0,
+                                         ssh_agent_stdout: str | None = None,
+                                         ssh_add_exit: int = 0):
+    """Helper: stub subprocess.run to fake ssh-agent-related calls
+    deterministically. Returns a call-log list the test can inspect.
+
+    - `ssh-add -l` returns exit=ssh_add_l_exit.
+    - `ssh-agent -s` returns exit 0 with the stdout you pass (or a
+      valid default); pass None to disable (raises).
+    - `ssh-add <key>` returns exit=ssh_add_exit.
+
+    Every OTHER subprocess.run (`git rev-parse HEAD` for manifest
+    provenance, `rsync`, etc.) is forwarded to the real subprocess.run
+    so the rest of the pipeline works normally. Only ssh-related
+    calls are intercepted.
+    """
     import clean_eeg.transfer as _tr
+    real_run = _tr.subprocess.run
+    call_log: list[list[str]] = []
 
-    class _FakeProc:
-        returncode = 1
-        stdout = ""
-        stderr = "The agent has no identities.\n"
+    class _P:
+        def __init__(self, rc: int, out: str = "", err: str = ""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = err
 
-    def _fake_run(argv, **kw):
+    def _run(argv, **kw):
+        call_log.append(list(argv))
         if argv[:2] == ["ssh-add", "-l"]:
-            return _FakeProc()
-        # any OTHER subprocess in transfer_subject (rsync itself) shouldn't
-        # fire in dry_run mode, but stub just in case.
-        raise AssertionError(f"unexpected subprocess call: {argv}")
+            return _P(ssh_add_l_exit)
+        if argv[:2] == ["ssh-agent", "-s"]:
+            if ssh_agent_stdout is None:
+                raise FileNotFoundError("ssh-agent not on PATH")
+            return _P(0, ssh_agent_stdout)
+        if argv[:2] == ["ssh-agent", "-k"]:
+            return _P(0)   # atexit cleanup call
+        if argv[:1] == ["ssh-add"] and len(argv) >= 2:
+            return _P(ssh_add_exit)
+        # Forward every non-ssh subprocess (git, rsync, etc.) to the
+        # real subprocess.run so upstream code paths (provenance,
+        # execution) work unchanged.
+        return real_run(argv, **kw)
+
+    monkeypatch.setattr(_tr.subprocess, "run", _run)
+    return call_log
+
+
+def test_ensure_ssh_agent_noop_when_keys_already_loaded(monkeypatch, capsys,
+                                                          tmp_path):
+    """Positive control: `ssh-add -l` exit 0 means the operator already
+    has an agent with keys. Auto-setup must be silent -- no hint, no
+    spawn, no ssh-add -- just proceed."""
+    # Guard against SSH_AUTH_SOCK leaking from an earlier test.
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.delenv("SSH_AGENT_PID", raising=False)
+    call_log = _stub_subprocess_run_for_ssh_agent(
+        monkeypatch, ssh_add_l_exit=0)
 
     out = _make_subject_dir(tmp_path)
-    monkeypatch.setattr(_tr.subprocess, "run", _fake_run)
+    transfer_subject(out, ssh_user="testuser", dry_run=True,
+                      remote_dir_override="/tmp/dry")
+    combined = capsys.readouterr().out + capsys.readouterr().err
+    assert "ssh-agent has no keys loaded" not in combined
+    assert "started ssh-agent" not in combined
+    # Only `ssh-add -l` was called; nothing spawned.
+    ssh_related = [c for c in call_log if c[0] in ("ssh-add", "ssh-agent")]
+    assert ssh_related == [["ssh-add", "-l"]], ssh_related
 
-    plan = _tr.transfer_subject(out, ssh_user="testuser", dry_run=True,
-                                 remote_dir_override="/tmp/dry")
-    captured = capsys.readouterr()
-    combined = captured.out + captured.err
+
+def test_ensure_ssh_agent_auto_spawns_and_adds_key(monkeypatch, capsys, tmp_path):
+    """No agent, no keys -> auto-spawn ssh-agent, capture its env vars,
+    then run `ssh-add <key>` (interactive one-time passphrase prompt).
+    Verifies the full auto-setup happy path."""
+    # Simulate: no agent env, ssh-add -l exit 1 (no keys), ssh-agent
+    # spawn succeeds with realistic-looking output, ssh-add succeeds.
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.delenv("SSH_AGENT_PID", raising=False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    # Fake key file so ensure_ssh_agent doesn't bail on "not found".
+    fake_key = tmp_path / "id_ed25519"
+    fake_key.write_text("stub")
+
+    agent_out = (
+        "SSH_AUTH_SOCK=/tmp/ssh-XXX/agent.999; export SSH_AUTH_SOCK;\n"
+        "SSH_AGENT_PID=999; export SSH_AGENT_PID;\n"
+        "echo Agent pid 999;\n"
+    )
+    call_log = _stub_subprocess_run_for_ssh_agent(
+        monkeypatch, ssh_add_l_exit=1, ssh_agent_stdout=agent_out,
+        ssh_add_exit=0)
+
+    out = _make_subject_dir(tmp_path)
+    transfer_subject(out, ssh_user="testuser", dry_run=True,
+                      remote_dir_override="/tmp/dry",
+                      ssh_key=fake_key)
+
+    # Env vars were extracted from the agent stdout and set.
+    assert os.environ.get("SSH_AUTH_SOCK") == "/tmp/ssh-XXX/agent.999"
+    assert os.environ.get("SSH_AGENT_PID") == "999"
+    # Sequence: ssh-add -l (check), ssh-agent -s (spawn), ssh-add <key> (load).
+    ssh_related = [c for c in call_log if c[0] in ("ssh-add", "ssh-agent")]
+    assert ssh_related[0] == ["ssh-add", "-l"]
+    assert ssh_related[1] == ["ssh-agent", "-s"]
+    assert ssh_related[2][0] == "ssh-add"
+    assert str(fake_key) in ssh_related[2][1]
+    combined = capsys.readouterr().out + capsys.readouterr().err
+    assert "started ssh-agent" in combined
+    assert "loading SSH key" in combined
+
+
+def test_ensure_ssh_agent_no_tty_prints_manual_hint(monkeypatch, capsys,
+                                                     tmp_path):
+    """Under nohup / cron / SSH-without-PTY, ssh-add can't prompt for
+    the passphrase. Auto-setup must recognise this and print the
+    manual-setup hint instead of trying to prompt on a dead stdin."""
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    fake_key = tmp_path / "id_ed25519"
+    fake_key.write_text("stub")
+
+    agent_out = ("SSH_AUTH_SOCK=/tmp/s; export SSH_AUTH_SOCK;\n"
+                  "SSH_AGENT_PID=1; export SSH_AGENT_PID;\n")
+    call_log = _stub_subprocess_run_for_ssh_agent(
+        monkeypatch, ssh_add_l_exit=1, ssh_agent_stdout=agent_out)
+
+    out = _make_subject_dir(tmp_path)
+    transfer_subject(out, ssh_user="testuser", dry_run=True,
+                      remote_dir_override="/tmp/dry",
+                      ssh_key=fake_key)
+    # ssh-add should NOT be called on the key (no TTY to prompt on),
+    # only the `ssh-add -l` probe and the agent spawn.
+    ssh_add_key_calls = [c for c in call_log
+                          if c[:1] == ["ssh-add"] and len(c) >= 2
+                          and c[1] != "-l"]
+    assert ssh_add_key_calls == [], (
+        f"ssh-add on key must not fire without a TTY: {ssh_add_key_calls}"
+    )
+    combined = capsys.readouterr().out + capsys.readouterr().err
+    assert "no TTY" in combined
+
+
+def test_ensure_ssh_agent_auto_false_bypasses_setup(monkeypatch, capsys,
+                                                     tmp_path):
+    """auto=False disables the auto-setup entirely. Useful for external
+    agent-management setups (e.g. keychain, keychain-integrated shells).
+    Just prints the manual hint if the agent is empty."""
+    # Guard against SSH_AUTH_SOCK leaking from an earlier test.
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.delenv("SSH_AGENT_PID", raising=False)
+    call_log = _stub_subprocess_run_for_ssh_agent(
+        monkeypatch, ssh_add_l_exit=1)
+
+    out = _make_subject_dir(tmp_path)
+    transfer_subject(out, ssh_user="testuser", dry_run=True,
+                      remote_dir_override="/tmp/dry",
+                      auto_ssh_agent=False)
+    # Only the probe fired; no spawn attempted.
+    assert all(c[0] != "ssh-agent" for c in call_log)
+    combined = capsys.readouterr().out + capsys.readouterr().err
     assert "ssh-agent has no keys loaded" in combined
     assert "eval $(ssh-agent)" in combined
-    assert "ssh-add" in combined
-    # Non-fatal: plan was still returned.
-    assert plan is not None
 
 
-def test_ssh_agent_check_silent_when_keys_loaded(monkeypatch, capsys, tmp_path):
-    """Positive control: `ssh-add -l` exit 0 means keys are loaded;
-    the hint must NOT print (silent OK). Regression against a hint
-    that spams every invocation regardless of state."""
+def test_ensure_ssh_agent_hints_when_ssh_tooling_completely_missing(
+        monkeypatch, capsys, tmp_path):
+    """When both ssh-add AND ssh-agent are missing (no SSH tooling
+    installed at all), auto-setup can't help. Print the manual-setup
+    hint so the operator at least sees the recommended commands, then
+    proceed non-fatally. Transfer will still work if the operator has
+    alternative auth (host-based, ProxyJump)."""
     import clean_eeg.transfer as _tr
+    real_run = _tr.subprocess.run
+    # Guard against SSH_AUTH_SOCK leaking from an earlier test that
+    # exercised _spawn_ssh_agent (which does a direct os.environ
+    # assignment, not monkeypatch.setenv, so it doesn't auto-revert).
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.delenv("SSH_AGENT_PID", raising=False)
 
-    class _FakeProc:
-        returncode = 0
-        stdout = "2048 SHA256:abcd... user@host (ED25519)\n"
-        stderr = ""
-
-    def _fake_run(argv, **kw):
-        if argv[:2] == ["ssh-add", "-l"]:
-            return _FakeProc()
-        raise AssertionError(f"unexpected subprocess call: {argv}")
+    def _run(argv, **kw):
+        if argv[0] in ("ssh-add", "ssh-agent"):
+            raise FileNotFoundError(f"{argv[0]} not found")
+        return real_run(argv, **kw)
 
     out = _make_subject_dir(tmp_path)
-    monkeypatch.setattr(_tr.subprocess, "run", _fake_run)
+    monkeypatch.setattr(_tr.subprocess, "run", _run)
 
-    _tr.transfer_subject(out, ssh_user="testuser", dry_run=True,
-                          remote_dir_override="/tmp/dry")
+    # Must not raise -- hint is a warning, not an error.
+    transfer_subject(out, ssh_user="testuser", dry_run=True,
+                      remote_dir_override="/tmp/dry")
     combined = capsys.readouterr().out + capsys.readouterr().err
-    assert "ssh-agent has no keys loaded" not in combined, (
-        f"hint should be silent when keys loaded; got: {combined!r}"
-    )
-
-
-def test_ssh_agent_check_silent_when_ssh_add_missing(monkeypatch, tmp_path):
-    """If `ssh-add` isn't on PATH, don't hint -- we can't confidently
-    say the operator's SSH auth is broken (they might be on a
-    minimal system with different auth). Just proceed silently."""
-    import clean_eeg.transfer as _tr
-
-    def _fake_run(argv, **kw):
-        if argv[:2] == ["ssh-add", "-l"]:
-            raise FileNotFoundError("ssh-add not found")
-        raise AssertionError(f"unexpected subprocess call: {argv}")
-
-    out = _make_subject_dir(tmp_path)
-    monkeypatch.setattr(_tr.subprocess, "run", _fake_run)
-
-    # Must not raise -- silent fallthrough.
-    _tr.transfer_subject(out, ssh_user="testuser", dry_run=True,
-                          remote_dir_override="/tmp/dry")
+    assert "ssh-agent has no keys loaded" in combined
+    # Continued past the hint (didn't raise) -- transfer plan built.

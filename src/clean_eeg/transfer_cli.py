@@ -61,6 +61,19 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(via nohup) that survives SSH disconnects. Writes "
                         "transfer.sh + transfer.log alongside the output dir; "
                         "tail -f the log to monitor progress.")
+    p.add_argument("--ssh-key", type=Path, default=None,
+                   help="SSH private key path for auto-loading into "
+                        "ssh-agent (default: ~/.ssh/id_ed25519). Only "
+                        "used when ssh-agent isn't already running with "
+                        "keys; the passphrase is entered ONCE per "
+                        "invocation.")
+    p.add_argument("--no-auto-ssh-agent", action="store_true",
+                   help="Disable the auto-spawn-ssh-agent + auto-add-key "
+                        "behaviour. Use when you're managing the agent "
+                        "externally (keychain integration, custom "
+                        "setup) or already have SSH_AUTH_SOCK exported "
+                        "in your shell. Prints the manual-setup hint "
+                        "instead if the agent is empty.")
     return p
 
 
@@ -120,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
             ssh_user=args.user,
             dry_run=False,
             background=args.background,
+            ssh_key=args.ssh_key,
+            auto_ssh_agent=not args.no_auto_ssh_agent,
         )
     except RuntimeError as e:
         print(f"Transfer failed: {e}", file=sys.stderr)
