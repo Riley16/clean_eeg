@@ -2101,6 +2101,156 @@ def test_in_place_prompt_bypassed_by_approve_confirmations(tmp_path):
         f"in-place prompt still hit stdin -- bypass broken: {combined}")
 
 
+def test_audit_sample_files_end_to_end_calls_audit_exactly_N_times(
+        monkeypatch, tmp_path):
+    """End-to-end confirmation: --audit-sample-files N causes
+    _audit_signal_integrity to run on EXACTLY N files per subject.
+    Complements the unit test on _select_audit_sample_filenames --
+    that one tests the picker in isolation; this one verifies the
+    wiring from picker -> audit_filenames set -> per-file gate.
+
+    Approach: 5-file subject, patch _audit_signal_integrity to count
+    calls, run with audit_sample_files=3, assert count==3 and the
+    audited names are first + middle + last (the deterministic picker
+    result)."""
+    import pyedflib
+    from datetime import datetime, timedelta
+    from clean_eeg import clean_subject_eeg as _csm
+
+    # Build 5 EDFs with distinct, non-overlapping startdates so the
+    # recording-gap check doesn't fire (which would need approval).
+    input_dir = tmp_path / "in5"
+    input_dir.mkdir()
+    n_files = 5
+    duration_s = 4
+    written_names: list[str] = []
+    for i in range(n_files):
+        name = f"f{i:02d}.edf"
+        path = input_dir / name
+        signal_headers = [
+            {"label": f"CH{k}", "dimension": "uV",
+             "sample_frequency": 100,
+             "physical_max": 3200.0, "physical_min": -3200.0,
+             "digital_max": 32767, "digital_min": -32768,
+             "prefilter": "", "transducer": ""}
+            for k in range(2)
+        ]
+        t = np.arange(0, duration_s, 1.0 / 100, dtype=np.float32)
+        sigs = [(1000.0 * np.sin(2 * np.pi * (k + 1) * t)).astype(np.float64)
+                for k in range(2)]
+        with pyedflib.EdfWriter(str(path), 2,
+                                 file_type=pyedflib.FILETYPE_EDFPLUS) as f:
+            f.setHeader({
+                "technician": "T", "recording_additional": "",
+                "patientname": f"{PATIENT_NAME.first_name} {PATIENT_NAME.last_name}",
+                "patient_additional": "",
+                "patientcode": SUBJECT_CODE, "equipment": "test",
+                "admincode": "", "sex": "Male",
+                # Stagger: 5-sec gap between files, well under 60s max
+                # so recording-gaps check passes without prompting.
+                "startdate": datetime(2023, 1, 1, 10, 0, 0) + timedelta(seconds=i * (duration_s + 5)),
+                "birthdate": "01 feb 1970", "gender": "Male",
+            })
+            f.setSignalHeaders(signal_headers)
+            f.writeSamples(sigs)
+            f.writeAnnotation(0.5, -1, "START")
+            f.writeAnnotation(float(duration_s) - 0.5, -1, "END")
+        written_names.append(name)
+
+    # Patch _audit_signal_integrity to record every call.
+    audited: list[str] = []
+    real_audit = _csm._audit_signal_integrity
+
+    def _counting_audit(orig_signals, clean_file_path, filename, **kw):
+        audited.append(filename)
+        return real_audit(orig_signals, clean_file_path, filename, **kw)
+
+    monkeypatch.setattr(_csm, "_audit_signal_integrity", _counting_audit)
+
+    # Auto-answer any interactive prompt with 'y' as a safety net (the
+    # fixture is designed to not need it, but keep the test robust).
+    monkeypatch.setattr("builtins.input", lambda _msg="": "y")
+
+    _csm.clean_subject_edf_files(
+        subject_name=PATIENT_NAME,
+        subject_code=SUBJECT_CODE,
+        input_path=str(input_dir),
+        output_path=str(input_dir),
+        inplace=True,
+        auto_transfer_response="n",
+        raise_errors=True,
+        audit_sample_files=3,
+    )
+
+    # Load-bearing assertion: audit fired on EXACTLY 3 files.
+    assert len(audited) == 3, (
+        f"expected exactly 3 audits with audit_sample_files=3, got "
+        f"{len(audited)}: {audited}")
+    # Deterministic picker: first + middle + last of the input list
+    # (sorted alphabetically by filename per _load_edf_metadata's
+    # sorted(os.listdir(...))). For files f00..f04 that's f00, f02, f04.
+    assert set(audited) == {"f00.edf", "f02.edf", "f04.edf"}, (
+        f"deterministic picker should audit first/middle/last but got "
+        f"{sorted(audited)}")
+
+
+def test_audit_sample_files_zero_calls_audit_zero_times(monkeypatch, tmp_path):
+    """audit_sample_files=0 is equivalent to --skip_audit. Zero audits."""
+    import pyedflib
+    from datetime import datetime, timedelta
+    from clean_eeg import clean_subject_eeg as _csm
+
+    input_dir = tmp_path / "in3"
+    input_dir.mkdir()
+    for i in range(3):
+        path = input_dir / f"f{i:02d}.edf"
+        signal_headers = [
+            {"label": f"CH{k}", "dimension": "uV",
+             "sample_frequency": 100,
+             "physical_max": 3200.0, "physical_min": -3200.0,
+             "digital_max": 32767, "digital_min": -32768,
+             "prefilter": "", "transducer": ""}
+            for k in range(2)
+        ]
+        t = np.arange(0, 4, 1.0 / 100, dtype=np.float32)
+        sigs = [(1000.0 * np.sin(2 * np.pi * (k + 1) * t)).astype(np.float64)
+                for k in range(2)]
+        with pyedflib.EdfWriter(str(path), 2,
+                                 file_type=pyedflib.FILETYPE_EDFPLUS) as f:
+            f.setHeader({
+                "technician": "T", "recording_additional": "",
+                "patientname": f"{PATIENT_NAME.first_name} {PATIENT_NAME.last_name}",
+                "patient_additional": "",
+                "patientcode": SUBJECT_CODE, "equipment": "test",
+                "admincode": "", "sex": "Male",
+                "startdate": datetime(2023, 1, 1, 10, 0, 0) + timedelta(seconds=i * 10),
+                "birthdate": "01 feb 1970", "gender": "Male",
+            })
+            f.setSignalHeaders(signal_headers)
+            f.writeSamples(sigs)
+            f.writeAnnotation(0.5, -1, "START")
+            f.writeAnnotation(3.5, -1, "END")
+
+    audited: list[str] = []
+    real_audit = _csm._audit_signal_integrity
+
+    def _counting(orig_signals, clean_file_path, filename, **kw):
+        audited.append(filename)
+        return real_audit(orig_signals, clean_file_path, filename, **kw)
+
+    monkeypatch.setattr(_csm, "_audit_signal_integrity", _counting)
+    monkeypatch.setattr("builtins.input", lambda _msg="": "y")
+
+    _csm.clean_subject_edf_files(
+        subject_name=PATIENT_NAME, subject_code=SUBJECT_CODE,
+        input_path=str(input_dir), output_path=str(input_dir),
+        inplace=True, auto_transfer_response="n", raise_errors=True,
+        audit_sample_files=0,
+    )
+    assert audited == [], (
+        f"audit_sample_files=0 must fire NO audits, got {audited}")
+
+
 def test_select_audit_sample_zero_returns_empty():
     """N=0 is the 'skip audit entirely' shortcut. Equivalent to
     --skip_audit but reachable via the same CLI flag."""
