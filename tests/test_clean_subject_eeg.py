@@ -62,7 +62,7 @@ def test_deidentify_edf_annotations():
     from clean_eeg.clean_subject_eeg import deidentify_edf_annotations
     data = load_edf(BASIC_EDF_PATH, load_method='pyedflib', preload=True)
     annotations = data['annotations']
-    
+
     # insert patient pronoun and name into annotations
     annotation_texts = list(annotations[2])
     annotation_texts[2] = 'his ' + PATIENT_NAME.get_full_name()
@@ -74,6 +74,72 @@ def test_deidentify_edf_annotations():
                                                  subject_name=PATIENT_NAME)
 
     assert new_annotations[2][2] == REDACT_PRONOUN_REPLACEMENT + ' ' + REDACT_NAME_REPLACEMENT
+
+
+def test_deidentify_edf_annotations_whitelist_bypasses_redaction():
+    """PHI-leak fix: annotations that fullmatch the boilerplate whitelist
+    must skip Presidio entirely and be preserved as-is. Without this,
+    a subject whose first name is 'Mark' would have '*Mark' (common
+    Jefferson boilerplate) rewritten to '*<REDACTED>' while every OTHER
+    subject in the batch keeps '*Mark' in the cleaned output. That
+    diagnostic divergence lets a sleuth infer the affected subject's
+    first name.
+
+    Approach: subject_name explicitly = 'Mark Smith', annotation
+    contains '*Mark' (which the shared whitelist matches via
+    asterisk-strip -> 'Mark' -> Mark family). Without whitelist:
+    Presidio redacts 'Mark'. With whitelist: '*Mark' preserved as-is."""
+    from clean_eeg.anonymize import PersonalName
+    from clean_eeg.annotation_boilerplate import load_whitelist
+    from clean_eeg.paths import ANNOTATION_BOILERPLATE_WHITELIST_PATH
+    from clean_eeg.clean_subject_eeg import deidentify_edf_annotations
+
+    mark_name = PersonalName(first_name="Mark", middle_names=[], last_name="Smith")
+    ann_texts = ["*Mark", "patient noted by Mark", "*Mark"]
+    annotations = (np.array([0.0, 1.0, 2.0]),
+                    np.array([-1.0, -1.0, -1.0]),
+                    np.array(ann_texts, dtype=object))
+    wl = load_whitelist(ANNOTATION_BOILERPLATE_WHITELIST_PATH)
+
+    # With whitelist: '*Mark' preserved as-is; 'patient noted by Mark'
+    # still redacted (it doesn't fullmatch any whitelist pattern).
+    new = deidentify_edf_annotations(annotations,
+                                      subject_name=mark_name,
+                                      whitelist=wl,
+                                      site_code="J")
+    out = list(new[2])
+    assert out[0] == "*Mark", (
+        f"whitelisted '*Mark' must be preserved verbatim, got {out[0]!r}"
+    )
+    assert out[2] == "*Mark", (
+        f"whitelisted '*Mark' must be preserved verbatim, got {out[2]!r}"
+    )
+    # The non-boilerplate annotation still gets Mark redacted.
+    assert "Mark" not in out[1], (
+        f"non-boilerplate annotation must have 'Mark' redacted, got {out[1]!r}"
+    )
+
+
+def test_deidentify_edf_annotations_no_whitelist_still_redacts():
+    """When whitelist=None (opt-out or absent), every annotation goes
+    through Presidio -- preserves the pre-existing behavior for
+    programmatic callers that don't pass the whitelist arg."""
+    from clean_eeg.anonymize import PersonalName
+    from clean_eeg.clean_subject_eeg import deidentify_edf_annotations
+
+    mark_name = PersonalName(first_name="Mark", middle_names=[], last_name="Smith")
+    ann_texts = ["*Mark"]
+    annotations = (np.array([0.0]), np.array([-1.0]),
+                    np.array(ann_texts, dtype=object))
+    new = deidentify_edf_annotations(annotations,
+                                      subject_name=mark_name,
+                                      whitelist=None,
+                                      site_code="J")
+    # No whitelist -> Mark gets redacted, '*Mark' becomes '*<placeholder>'.
+    out = new[2][0]
+    assert "Mark" not in out, (
+        f"without whitelist, 'Mark' must be redacted from '*Mark', got {out!r}"
+    )
 
 
 def test_deidentify_edf():

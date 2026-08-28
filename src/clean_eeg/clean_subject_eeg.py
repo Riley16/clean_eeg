@@ -64,7 +64,9 @@ def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_star
                    redactor: Union[SubjectNameRedactor, None] = None,
                    review_events: Union[list, None] = None,
                    source_file: Union[str, None] = None,
-                   wipe_annotations: bool = False):
+                   wipe_annotations: bool = False,
+                   whitelist=None,
+                   site_code: Union[str, None] = None):
     # remove protected health information (PHI) from EEG
     # accepts EDF data in 'pyedflib' format
 
@@ -106,6 +108,8 @@ def deidentify_edf(edf_data, subject_name, subject_code, earliest_recording_star
             redactor=redactor,
             review_events=review_events,
             source_file=source_file,
+            whitelist=whitelist,
+            site_code=site_code,
         )
     return {
         'header': deidentify_edf_header(edf_data['header'],
@@ -163,19 +167,45 @@ def deidentify_edf_header(header: dict,
 def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: PersonalName,
                                 redactor: Union[SubjectNameRedactor, None] = None,
                                 review_events: Union[list, None] = None,
-                                source_file: Union[str, None] = None):
+                                source_file: Union[str, None] = None,
+                                whitelist=None,
+                                site_code: Union[str, None] = None):
+    """De-identify EDF annotations. Annotations that fullmatch the
+    boilerplate whitelist bypass Presidio redaction and are preserved
+    as-is; this prevents a specific PHI leak where a subject whose
+    first name matches a common boilerplate token (e.g. 'Mark' in the
+    Jefferson '*Mark' marker) would have their marker rewritten to a
+    unique placeholder while OTHER subjects' identical markers were
+    left alone -- a diagnostic divergence a sleuth could use to infer
+    the subject's name.
+
+    ``whitelist`` should be a ``BoilerplateWhitelist``; None disables
+    the skip (all annotations flow through Presidio). ``site_code``
+    picks the correct per-site bucket (last letter of the subject_code
+    by convention).
+    """
     clean_start_times = list()
     clean_durations = list()
     clean_descriptions = list()
     for (start_time, duration, text) in zip(*annotations):
         assert isinstance(text, str)
-        redacted_text = redact_string(str(text),
-                                      field_name='annotation',
-                                      subject_name=subject_name,
-                                      alert=True,
-                                      redactor=redactor,
-                                      review_events=review_events,
-                                      source_file=source_file)
+        text_str = str(text)
+        if whitelist is not None and (
+                whitelist.matches(text_str, site_code=site_code)
+                or whitelist.matches_delete(text_str, site_code=site_code)):
+            # Boilerplate: preserve as-is. Skipping Presidio here means
+            # the on-disk annotation matches what OTHER subjects (whose
+            # names don't collide with the boilerplate token) have
+            # written for the same marker -- no diagnostic divergence.
+            redacted_text = text_str
+        else:
+            redacted_text = redact_string(text_str,
+                                          field_name='annotation',
+                                          subject_name=subject_name,
+                                          alert=True,
+                                          redactor=redactor,
+                                          review_events=review_events,
+                                          source_file=source_file)
         clean_start_times.append(start_time)
         clean_durations.append(duration)
         clean_descriptions.append(redacted_text)
@@ -406,6 +436,16 @@ def clean_subject_edf_files(
     with bench.step("build_presidio_redactor"):
         redactor = SubjectNameRedactor(subject_name) if subject_name is not None else None
 
+    # Load the boilerplate whitelist once so Presidio can be bypassed on
+    # annotations that fullmatch a known-boilerplate pattern. This prevents
+    # a specific PHI leak: annotations like '*Mark' (Jefferson boilerplate)
+    # would otherwise be redacted for subjects whose first name matches
+    # the boilerplate token, leaving the cleaned output diagnostically
+    # different from other subjects for the same marker. site_code is the
+    # last letter of subject_code by convention.
+    annotation_whitelist = load_whitelist(ANNOTATION_BOILERPLATE_WHITELIST_PATH)
+    site_code = subject_code[-1] if subject_code else None
+
     # Review events accumulated across the whole subject — printed once
     # in the end-of-run 'Human review needed' block and persisted in
     # deidentify.json for post-hoc audit.
@@ -466,6 +506,8 @@ def clean_subject_edf_files(
                     review_events=review_events,
                     source_file=filename,
                     wipe_annotations=wipe_annotations,
+                    whitelist=annotation_whitelist,
+                    site_code=site_code,
                 )
             with bench.step("validate_header_roundtrip", file=filename):
                 truncation_warnings = validate_header_roundtrip(
