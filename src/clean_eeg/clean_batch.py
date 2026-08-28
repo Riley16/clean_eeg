@@ -52,14 +52,24 @@ class SubjectRow:
         this row. ``extra_argv`` are appended verbatim -- operator's
         --wipe-annotations / --recursive / --approve-confirmations
         pass through unchanged.
+
+        The single-subject CLI does NOT accept ``--output_path``; it
+        derives output from ``--input_path`` (in-place default) OR
+        ``--copy_path`` (rewrite mode). Map the CSV's ``output_path``
+        column accordingly:
+          - ``output_path == input_path`` -> in-place (only --input_path)
+          - ``output_path != input_path`` -> rewrite (--input_path + --copy_path)
         """
         argv = [
             "--input_path", self.input_path,
-            "--output_path", self.output_path,
             "--subject_code", self.subject_code,
             "--first_name", self.first_name,
             "--last_name", self.last_name,
         ]
+        if self.output_path and self.output_path != self.input_path:
+            # Rewrite mode: single-subject CLI writes cleaned files to
+            # --copy_path instead of mutating --input_path in-place.
+            argv += ["--copy_path", self.output_path]
         if self.middle_name:
             argv += ["--middle_name", self.middle_name]
         else:

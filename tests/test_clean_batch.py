@@ -226,6 +226,75 @@ def test_to_clean_argv_appends_extra_argv():
                           "--approve-confirmations", "wipe-annotations"]
 
 
+def test_to_clean_argv_inplace_mode_emits_no_copy_path():
+    """When CSV row has output_path == input_path, this is in-place
+    mode. The single-subject CLI expects NO --copy_path (in-place is
+    the default when --copy_path is absent), and definitely does NOT
+    accept --output_path."""
+    row = SubjectRow(input_path="/data/R1", output_path="/data/R1",
+                     subject_code="R1", first_name="J", last_name="S",
+                     middle_name=None)
+    argv = row.to_clean_argv()
+    assert "--input_path" in argv
+    assert "/data/R1" in argv
+    assert "--copy_path" not in argv, (
+        f"in-place mode must not pass --copy_path: {argv}")
+    assert "--output_path" not in argv, (
+        f"single-subject CLI does not accept --output_path: {argv}")
+
+
+def test_to_clean_argv_rewrite_mode_emits_copy_path():
+    """When CSV row has output_path != input_path, this is rewrite mode.
+    Must emit --copy_path (not --output_path)."""
+    row = SubjectRow(input_path="/data/raw/R1",
+                     output_path="/data/clean/R1",
+                     subject_code="R1", first_name="J", last_name="S",
+                     middle_name=None)
+    argv = row.to_clean_argv()
+    assert "--copy_path" in argv
+    i = argv.index("--copy_path")
+    assert argv[i + 1] == "/data/clean/R1"
+    assert "--output_path" not in argv
+
+
+def test_to_clean_argv_survives_real_clean_subject_eeg_argparser():
+    """Regression: any argv produced by to_clean_argv must be accepted
+    by the REAL clean_subject_eeg CLI parser. The existing subprocess
+    tests use a stub script that accepts any argv, which lets bad
+    argv-shape regressions slip through -- this test hits the actual
+    CLI so a change like adding a stray --output_path is caught
+    immediately.
+
+    Motivated by an incident where the batch was emitting --output_path
+    (never a valid clean_subject_eeg CLI arg) and no test caught it
+    because all subprocess tests used stubs.
+
+    Subprocesses `python -m clean_eeg.clean_subject_eeg` with the
+    candidate argv + /dev/null on stdin, and checks that stderr does
+    NOT contain 'unrecognized arguments'. Downstream errors (missing
+    input path, prompt-if-missing EOFError, etc.) are fine and expected
+    -- we only care that argparse itself accepts the shape."""
+    import subprocess as _sp
+    import sys as _sys
+    row = SubjectRow(input_path="/nonexistent/data/R1755J",
+                     output_path="/nonexistent/data/R1755J",
+                     subject_code="R1755J",
+                     first_name="J", last_name="S", middle_name=None)
+    argv = row.to_clean_argv(
+        extra_argv=["--fail-on-name-mismatch", "--skip-if-already-cleaned"])
+    result = _sp.run(
+        [_sys.executable, "-m", "clean_eeg.clean_subject_eeg", *argv],
+        capture_output=True, text=True,
+        stdin=_sp.DEVNULL,   # prompt-if-missing -> EOFError, no hang
+        timeout=30,
+    )
+    assert "unrecognized arguments" not in result.stderr, (
+        f"batch-generated argv rejected by clean_subject_eeg CLI:\n"
+        f"  argv: {argv}\n"
+        f"  stderr: {result.stderr}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # clean_one_subject: subprocess dispatch (with a real stub script)
 # ---------------------------------------------------------------------------
