@@ -587,6 +587,70 @@ def test_audit_raises_runtime_error_on_signal_corruption(tmp_path):
                                 inplace=True, digital=True)
 
 
+def test_audit_madvise_hint_is_correctness_neutral(tmp_path, monkeypatch):
+    """Bit-level regression: MADV_SEQUENTIAL is a kernel prefetch hint,
+    NEVER a data mutation. Verify the audit's behavior is identical
+    with and without the hint applied.
+      1. Passes (no false positive) when the hint is applied normally.
+      2. Passes identically when MADV_SEQUENTIAL is removed (simulating
+         platforms without it -- the code's try/except catches the
+         AttributeError at constant lookup and falls through to the
+         no-hint mmap path).
+    If any future refactor accidentally makes the hint mutate data
+    (e.g. writing MADV_DONTNEED that evicts a dirty page mid-loop),
+    the second call would diverge or crash and this test would catch it.
+
+    Implementation note: mmap.mmap is an immutable C type, so we
+    simulate 'missing madvise' by deleting mmap.MADV_SEQUENTIAL
+    instead of monkeypatching the method itself."""
+    from clean_eeg.clean_subject_eeg import _audit_signal_integrity
+    from clean_eeg.load_eeg import load_edf
+    import mmap as _mmap
+
+    path = str(tmp_path / "hint_neutrality.edf")
+    _write_minimal_edfplus_with_annotations(str(path),
+                                              n_channels=3,
+                                              sample_rate=100,
+                                              duration_s=2)
+
+    data = load_edf(path, preload=True, read_digital=True, use_mmap=True)
+    orig_signals = data['signals']
+
+    # Path 1: normal (hint applied).
+    _audit_signal_integrity(orig_signals, path, "hint_neutrality.edf",
+                             inplace=True, digital=True)
+
+    # Path 2: remove MADV_SEQUENTIAL. The audit's try/except catches
+    # the AttributeError and falls through to the no-hint mmap path.
+    # Same signals, same audit verdict (pass).
+    monkeypatch.delattr(_mmap, "MADV_SEQUENTIAL", raising=False)
+    _audit_signal_integrity(orig_signals, path, "hint_neutrality.edf",
+                             inplace=True, digital=True)
+
+
+def test_audit_survives_missing_madvise(tmp_path, monkeypatch):
+    """Some platforms lack MADV_SEQUENTIAL. The audit must degrade
+    gracefully -- no crash, still verifies signal integrity correctly.
+    Guards against a future 'let's remove the try/except, we always
+    have madvise' change breaking Windows builds."""
+    from clean_eeg.clean_subject_eeg import _audit_signal_integrity
+    from clean_eeg.load_eeg import load_edf
+    import mmap as _mmap
+
+    path = str(tmp_path / "no_madvise_audit.edf")
+    _write_minimal_edfplus_with_annotations(str(path),
+                                              n_channels=2,
+                                              sample_rate=100,
+                                              duration_s=2)
+    data = load_edf(path, preload=True, read_digital=True, use_mmap=True)
+    orig_signals = data['signals']
+
+    monkeypatch.delattr(_mmap, "MADV_SEQUENTIAL", raising=False)
+    # Must complete without raising -- audit still passes on matching signals.
+    _audit_signal_integrity(orig_signals, path, "no_madvise_audit.edf",
+                             inplace=True, digital=True)
+
+
 def test_audit_raises_on_signal_count_mismatch(tmp_path):
     """If orig_signals has a different number of data signals than the
     clean file on disk, the audit must raise immediately rather than

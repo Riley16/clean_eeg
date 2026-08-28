@@ -401,6 +401,74 @@ def test_mmap_loader_falls_back_to_pyedflib_when_read_digital_false(tmp_path):
         np.testing.assert_array_equal(a, b)
 
 
+# ---------------------------------------------------------------------------
+# MADV_SEQUENTIAL hint: correctness-neutral kernel prefetch hint
+# ---------------------------------------------------------------------------
+
+def test_mmap_loader_madvise_hint_is_correctness_neutral(tmp_path, monkeypatch):
+    """MADV_SEQUENTIAL is a kernel prefetch HINT: it must NEVER change the
+    bytes we return. Compare the mmap-loader's output with the hint
+    applied (normal path) vs. with the hint forced to raise via a
+    removed MADV_SEQUENTIAL constant, and assert byte-identical
+    results. Guards against a future 'optimization' that silently
+    mutates data (e.g. writing MADV_DONTNEED instead, or eagerly
+    copying into a stale page).
+
+    Implementation note: mmap.mmap is an immutable C type -- can't
+    monkeypatch its methods. Instead we delete mmap.MADV_SEQUENTIAL,
+    so the ``mm.madvise(mmap.MADV_SEQUENTIAL)`` call raises
+    AttributeError on constant lookup and the code's try/except
+    catches it. Same fall-through path as a platform without
+    MADV_SEQUENTIAL.
+    """
+    import mmap as _mmap
+    path = str(tmp_path / "hint_check.edf")
+    _write_synthetic_edf_with_signals(
+        path, n_channels=3, sample_rates=[100, 200, 50],
+        record_duration_s=1.0, n_records=5,
+    )
+    with_hint = load_edf(path, load_method='pyedflib',
+                          preload=True, read_digital=True, use_mmap=True)
+
+    monkeypatch.delattr(_mmap, "MADV_SEQUENTIAL", raising=False)
+    without_hint = load_edf(path, load_method='pyedflib',
+                             preload=True, read_digital=True, use_mmap=True)
+
+    assert len(with_hint['signals']) == len(without_hint['signals'])
+    for i, (a, b) in enumerate(
+            zip(with_hint['signals'], without_hint['signals'])):
+        assert a.dtype == b.dtype
+        assert a.shape == b.shape
+        # Byte-identical: madvise is a hint, not a data mutation.
+        np.testing.assert_array_equal(
+            a, b, err_msg=f"signal {i} differs with/without MADV_SEQUENTIAL")
+
+
+def test_mmap_loader_survives_missing_madvise(tmp_path, monkeypatch):
+    """Some platforms (older Windows in particular) lack MADV_SEQUENTIAL
+    entirely. The hint-application code must degrade silently rather
+    than crashing the load. Simulate the missing constant by deleting
+    mmap.MADV_SEQUENTIAL -- the AttributeError at attribute lookup is
+    exactly what those platforms produce."""
+    import mmap as _mmap
+    path = str(tmp_path / "no_madvise.edf")
+    _write_synthetic_edf_with_signals(
+        path, n_channels=2, sample_rates=[100, 100],
+        record_duration_s=1.0, n_records=3,
+    )
+    monkeypatch.delattr(_mmap, "MADV_SEQUENTIAL", raising=False)
+
+    # Must not raise; must return usable signals with the same dtype
+    # as the hinted path (int16 -- the on-disk EDF sample width).
+    data = load_edf(path, load_method='pyedflib',
+                    preload=True, read_digital=True, use_mmap=True)
+    assert data['signals'] is not None
+    assert len(data['signals']) == 2
+    for sig in data['signals']:
+        assert sig.dtype == np.int16
+        assert len(sig) > 0
+
+
 def test_mmap_loader_detects_truncated_file(tmp_path):
     """If the data region is shorter than the header claims, the mmap
     helper must raise rather than reading garbage. This guards the

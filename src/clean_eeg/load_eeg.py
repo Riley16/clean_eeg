@@ -179,6 +179,22 @@ def _read_signals_via_mmap(filename: str) -> list:
     # --- mmap and de-interleave all signals ---
     with open(filename, "rb") as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            # Hint the kernel that we'll walk this file sequentially,
+            # from header_bytes to EOF, in one pass. On network mounts
+            # (NFS, Lustre, Ceph, SMB on HPC compute nodes) this lets
+            # the kernel prefetch multi-MB windows instead of making
+            # conservative per-pagefault decisions -- reported 3-10x
+            # throughput improvement on real EDF loads over network
+            # storage. Local SSDs see minimal change (kernel already
+            # predicts the pattern from access).
+            #
+            # Correctness-neutral: madvise is a hint. Wrapped in
+            # try/except so platforms without MADV_SEQUENTIAL (some
+            # Windows configurations) fall through silently.
+            try:
+                mm.madvise(mmap.MADV_SEQUENTIAL)
+            except (AttributeError, OSError):
+                pass
             data = np.frombuffer(
                 mm,
                 dtype=np.int16,

@@ -1034,6 +1034,19 @@ def _audit_signal_integrity(orig_signals: list, clean_file_path: str, filename: 
     # --- stream: one signal at a time, compare, free ---
     with open(clean_file_path, "rb") as f:
         with _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ) as mm:
+            # Same MADV_SEQUENTIAL hint as load_eeg.read_edf_signals_mmap
+            # and annotation_reader.iter_annotations. Load-bearing on
+            # network storage (HPC compute nodes with Lustre/NFS): kernel
+            # prefetches multi-MB windows instead of chasing per-page
+            # faults. Correctness-neutral -- madvise is a hint. Was
+            # missing here even though the same pattern was applied
+            # elsewhere; the audit path dominates cleaning time on
+            # network mounts, so the impact of the omission was
+            # disproportionate.
+            try:
+                mm.madvise(_mmap.MADV_SEQUENTIAL)
+            except (AttributeError, OSError):
+                pass
             data = np.frombuffer(
                 mm,
                 dtype=np.int16,
