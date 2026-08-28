@@ -272,6 +272,100 @@ def test_queue_edit_second_time_overwrites_first(tmp_path):
     assert len(SessionJournal(subj).read_all()) == 2
 
 
+def test_bulk_regex_swap_queues_edits_across_all_files(tmp_path):
+    """The operator's use case: subject has *X annotations (from an
+    earlier Presidio pass on a Mark-named subject); bulk_regex_swap
+    with pattern '\\*X\\b' -> '*Mark' queues pending edits on every
+    matching annotation in every reviewable file."""
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["*X", "other", "*X trailing"],
+        "b.edf": ["*X", "*Y"],
+    })
+    c = AnnotationReviewController(subj)
+
+    n = c.bulk_regex_swap(r"\*X\b", "*Mark")
+
+    # *X in a.edf[0], a.edf[2], b.edf[0] all match; other/*Y don't.
+    assert n == 3
+    pending = c.pending_edits()
+    assert len(pending) == 3
+    new_texts = {p.new_text for p in pending}
+    assert new_texts == {"*Mark", "*Mark trailing", "*Mark"}
+
+
+def test_bulk_regex_swap_invalid_regex_returns_minus_1(tmp_path):
+    """Malformed regex -> -1 sentinel + no pending edits queued. The
+    TUI turns this into an error banner instead of crashing."""
+    subj = _make_subject(tmp_path, "R1755A", {"a.edf": ["*X"]})
+    c = AnnotationReviewController(subj)
+    n = c.bulk_regex_swap("[unclosed", "*Mark")
+    assert n == -1
+    assert c.pending_edits() == []
+
+
+def test_bulk_regex_swap_skips_no_op_matches(tmp_path):
+    """When the pattern matches but sub returns identical text, DON'T
+    queue an edit. Keeps the pending counter honest and the journal
+    tidy."""
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["*Mark", "other"]})
+    c = AnnotationReviewController(subj)
+    n = c.bulk_regex_swap(r"\*Mark", "*Mark")  # substitution -> identical
+    assert n == 0
+    assert c.pending_edits() == []
+
+
+def test_bulk_regex_swap_respects_prior_pending_edit(tmp_path):
+    """If a manual edit already queued 'FOO' on some annotation, the
+    swap operates on FOO (the current display text), not the raw
+    annotation. Same principle as re-editing via 'e' pre-fills the
+    edit buffer with the pending text."""
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["raw text"]})
+    c = AnnotationReviewController(subj)
+    c.queue_edit("FOO")  # manual edit on ann 0
+    assert c.pending_edits()[0].new_text == "FOO"
+
+    # Swap should see FOO, not "raw text".
+    n = c.bulk_regex_swap("FOO", "BAR")
+    assert n == 1
+    pending = c.pending_edits()
+    assert len(pending) == 1
+    assert pending[0].new_text == "BAR"
+    # orig_text stays anchored to the RAW value for a clean audit trail
+    # regardless of how many stacked edits fed into the final new_text.
+    assert pending[0].orig_text == "raw text"
+
+
+def test_bulk_regex_swap_scope_current_only_touches_current_file(tmp_path):
+    """scope='current' walks only the file at self.file_cursor. Useful
+    for spot fixes when the operator doesn't want a global rewrite."""
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["*X"], "b.edf": ["*X"]})
+    c = AnnotationReviewController(subj)
+
+    # Cursor starts at file_cursor=0 (a.edf).
+    n = c.bulk_regex_swap(r"\*X", "*Mark", scope="current")
+    assert n == 1
+    pending = c.pending_edits()
+    assert len(pending) == 1
+    # Only the a.edf annotation was rewritten.
+    assert pending[0].file_path.endswith("a.edf")
+
+
+def test_bulk_regex_swap_backreferences_work(tmp_path):
+    """re.sub with backreferences (\\1, \\g<name>) is a common idiom.
+    Verify the swap uses full re.sub semantics, not a plain string
+    replace."""
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["marker: 123", "marker: 456"]})
+    c = AnnotationReviewController(subj)
+    n = c.bulk_regex_swap(r"marker: (\d+)", r"code=\1", scope="all")
+    assert n == 2
+    new_texts = sorted(p.new_text for p in c.pending_edits())
+    assert new_texts == ["code=123", "code=456"]
+
+
 def test_queue_edit_dedups_identical_repeat_submission(tmp_path):
     """Enter-mashing or re-saving the same text must NOT append duplicate
     journal lines or inflate the pending-count. Same key + same new_text

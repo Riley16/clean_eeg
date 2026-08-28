@@ -20,6 +20,7 @@ Explicitly OUT of scope for this module:
 
 from __future__ import annotations
 
+import re
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -542,6 +543,65 @@ class AnnotationReviewController:
         self._pending[key] = record
         self._journal.append(record)
         return record
+
+    def bulk_regex_swap(self, pattern_str: str, replacement: str,
+                         scope: str = "all") -> int:
+        """Apply a regex substitution to every annotation in scope and
+        queue each result as a pending edit. Returns the number of
+        annotations changed; -1 signals an invalid regex.
+
+        Semantics:
+          - ``re.sub`` under the hood -- backreferences (\\1, \\g<name>)
+            and character-class escapes work as expected.
+          - Scope: ``'all'`` (default) walks every reviewable file
+            in the subject; ``'current'`` walks only the currently-
+            open file. Bulk fix-ups (e.g. '*X' -> '*Mark' across
+            hundreds of annotations for a Mark-named subject) use
+            'all'; single-file spot fixes use 'current'.
+          - Respects prior pending edits: the pattern is applied to
+            each annotation's CURRENT displayed text (i.e. an earlier
+            pending edit's new_text takes precedence over the raw
+            annotation text). Same principle as the ``e`` re-edit
+            behaviour: build on existing state, don't reset it.
+          - No-op swaps (pattern matches but sub returns identical
+            text) are NOT queued -- keeps the pending counter honest.
+          - Nothing lands on disk here. The pending edits flow through
+            the standard end-of-session ``apply_pending_edits`` gate
+            just like manual edits.
+        """
+        try:
+            pat = re.compile(pattern_str)
+        except re.error:
+            return -1
+        if scope not in ("all", "current"):
+            raise ValueError(f"scope must be 'all' or 'current', got {scope!r}")
+        target_indices = (list(self._file_indices) if scope == "all"
+                          else [self.file_cursor])
+        count = 0
+        for file_idx in target_indices:
+            anns = self._load_annotations_for_index(file_idx)
+            for ann_idx, ann in enumerate(anns):
+                key = (file_idx, ann_idx)
+                existing = self._pending.get(key)
+                current_text = existing.new_text if existing else ann.text
+                new_text = pat.sub(replacement, current_text)
+                if new_text == current_text:
+                    continue    # regex didn't change anything -> skip
+                record = EditRecord.new(
+                    file_path=str(self._edfs[file_idx]),
+                    record_index=ann.record_index,
+                    byte_offset_in_record=ann.byte_offset_in_record,
+                    onset_s=ann.onset_s,
+                    # orig_text is the RAW on-disk value so the audit
+                    # trail always shows what was actually mutated,
+                    # regardless of how many stacked edits fed into it.
+                    orig_text=ann.text,
+                    new_text=new_text,
+                )
+                self._pending[key] = record
+                self._journal.append(record)
+                count += 1
+        return count
 
     def is_current_edited(self) -> bool:
         return (self.file_cursor, self.annotation_cursor) in self._pending

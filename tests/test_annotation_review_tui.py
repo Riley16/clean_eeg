@@ -359,6 +359,50 @@ def test_tui_w_appends_current_to_whitelist_and_reloads(tmp_path):
         controller.annotations_in_current_file()[0])
 
 
+def test_tui_s_key_two_stage_swap_queues_edits(tmp_path):
+    """End-to-end TUI drive of the regex-swap flow: press 's' (enter
+    swap-pattern mode) -> type `\\*X` -> Enter (transition to
+    swap-replace mode) -> type `*Mark` -> Enter (apply). Pending
+    edits land in the controller; display would show the substituted
+    text via the existing display_text mechanism.
+
+    Guards against three regressions at once:
+      * 's' keybind wired to swap_pattern mode transition.
+      * Enter in swap_pattern advances to swap_replace (not review).
+      * Enter in swap_replace calls bulk_regex_swap correctly.
+    """
+    subj = _make_subject(tmp_path, files={
+        "a.edf": [(0.5, "*X"), (1.5, "other"), (2.5, "*X trailing")]})
+    controller = AnnotationReviewController(subj)
+
+    # Sequence: s (open swap) -> `\*X` (pattern) -> Enter (advance)
+    # -> `*Mark` (replacement) -> Enter (apply) -> q (quit)
+    _drive_tui(controller, "s" + r"\*X" + "\n" + "*Mark" + "\nq")
+
+    pending = controller.pending_edits()
+    # Two *X occurrences in a.edf; "other" is unchanged.
+    assert len(pending) == 2, f"expected 2 pending edits, got {pending}"
+    new_texts = {p.new_text for p in pending}
+    assert new_texts == {"*Mark", "*Mark trailing"}
+
+
+def test_tui_s_key_swap_escape_aborts(tmp_path):
+    """Pressing Esc during either stage of the swap prompt returns
+    to review mode WITHOUT queuing edits. Same escape-hatch UX as
+    the manual-edit abort path."""
+    subj = _make_subject(tmp_path, files={
+        "a.edf": [(0.5, "*X"), (1.5, "other")]})
+    controller = AnnotationReviewController(subj)
+
+    # s (open swap) -> `\*X` (pattern) -> Esc (abort) -> q (quit)
+    # \x1b is Escape.
+    _drive_tui(controller, "s" + r"\*X" + "\x1b" + "q")
+
+    assert controller.pending_edits() == [], (
+        f"escape from swap must NOT queue edits: {controller.pending_edits()}"
+    )
+
+
 def test_tui_n_marks_current_file_reviewed(tmp_path):
     """Press 'n': current file's entry lands in
     .annotation_reviewed_tracker on disk. Regression guard against

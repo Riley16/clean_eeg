@@ -65,10 +65,15 @@ class UIState:
     describe what MODE the UI is currently in and any transient
     input buffer."""
     mode: str = "review"          # 'review' | 'edit' | 'confirm_abort' |
-                                  # 'help' | 'quit_prompt'
+                                  # 'help' | 'quit_prompt' |
+                                  # 'swap_pattern' | 'swap_replace'
     status_message: str = ""      # transient one-line message
     quit_requested: bool = False  # set true when the operator confirms
                                   # quit; app.exit() runs on next tick
+    # Regex-swap pattern buffered between the two-stage swap prompt --
+    # captured when the operator hits Enter on the pattern input,
+    # consumed when they Enter on the replacement input.
+    pending_swap_pattern: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +260,11 @@ def build_review_app(controller: AnnotationReviewController,
     on_bell = on_bell or (lambda: None)
     ui = UIState()
     edit_buf = Buffer(multiline=False)
+    # Separate buffer for the two-stage regex-swap prompt so the swap
+    # input doesn't clobber the current annotation's edit-buffer state
+    # (an unfinished manual edit shouldn't be lost just because the
+    # operator invoked a bulk swap in between).
+    swap_buf = Buffer(multiline=False)
 
     kb = KeyBindings()
 
@@ -381,12 +391,76 @@ def build_review_app(controller: AnnotationReviewController,
     def _(event):
         ui.mode = "help"
 
+    @kb.add("s", filter=in_review)
+    def _(event):
+        # Regex-swap: enter two-stage prompt. First the pattern, then
+        # the replacement. Both use swap_buf so the operator's edit_buf
+        # state (from a partial manual edit) is preserved.
+        swap_buf.text = ""
+        ui.mode = "swap_pattern"
+        ui.status_message = ("regex swap [1/2]: enter PATTERN "
+                              "(Enter=continue, Esc=abort)")
+        event.app.layout.focus(swap_control)
+
     # --- HELP mode: any key returns to review ---
     in_help = Condition(lambda: ui.mode == "help")
 
     @kb.add("<any>", filter=in_help)
     def _(event):
         ui.mode = "review"
+
+    # --- SWAP_PATTERN mode: first stage of the two-stage regex swap ---
+    in_swap_pattern = Condition(lambda: ui.mode == "swap_pattern")
+
+    @kb.add("enter", filter=in_swap_pattern)
+    def _(event):
+        ui.pending_swap_pattern = swap_buf.text
+        swap_buf.text = ""
+        ui.mode = "swap_replace"
+        # Show the pattern so operator can double-check before typing
+        # the replacement; a mistyped pattern silently no-op's the swap.
+        preview = (ui.pending_swap_pattern[:40] +
+                    ("..." if len(ui.pending_swap_pattern) > 40 else ""))
+        ui.status_message = (f"regex swap [2/2]: pattern={preview!r} "
+                              f"enter REPLACEMENT (Enter=apply, Esc=abort)")
+
+    @kb.add("escape", filter=in_swap_pattern)
+    def _(event):
+        ui.mode = "review"
+        ui.status_message = "regex swap aborted"
+        event.app.layout.focus(scroll_window)
+
+    # --- SWAP_REPLACE mode: second stage; applies on Enter ---
+    in_swap_replace = Condition(lambda: ui.mode == "swap_replace")
+
+    @kb.add("enter", filter=in_swap_replace)
+    def _(event):
+        replacement = swap_buf.text
+        count = controller.bulk_regex_swap(
+            ui.pending_swap_pattern, replacement)
+        if count == -1:
+            ui.status_message = (f"regex swap FAILED: pattern "
+                                  f"{ui.pending_swap_pattern!r} is invalid")
+        elif count == 0:
+            ui.status_message = (f"regex swap: 0 matches for pattern "
+                                  f"{ui.pending_swap_pattern!r}. Nothing "
+                                  f"queued.")
+        else:
+            ui.status_message = (f"regex swap: queued {count} edit(s). "
+                                  f"Scroll to verify; q to quit + apply.")
+        # Reset transient state and return to review.
+        ui.pending_swap_pattern = ""
+        swap_buf.text = ""
+        ui.mode = "review"
+        event.app.layout.focus(scroll_window)
+
+    @kb.add("escape", filter=in_swap_replace)
+    def _(event):
+        ui.pending_swap_pattern = ""
+        swap_buf.text = ""
+        ui.mode = "review"
+        ui.status_message = "regex swap aborted"
+        event.app.layout.focus(scroll_window)
 
     # --- EDIT mode key bindings ---
     in_edit = Condition(lambda: ui.mode == "edit")
@@ -439,6 +513,19 @@ def build_review_app(controller: AnnotationReviewController,
         content=edit_control,
         height=Dimension(min=1, max=1, preferred=1))
 
+    swap_control = BufferControl(buffer=swap_buf)
+    # Prompt-line above the swap input: which stage of the two-stage
+    # flow we're in + one-line hint. The stage prefix comes from
+    # ui.status_message, which the keybinds set as they transition.
+    swap_prompt_window = Window(
+        content=FormattedTextControl(
+            lambda: FormattedText([
+                ("fg:ansicyan bold", f" {ui.status_message}\n")])),
+        height=Dimension(min=1, max=1, preferred=1))
+    swap_input_window = Window(
+        content=swap_control,
+        height=Dimension(min=1, max=1, preferred=1))
+
     confirm_window = Window(content=FormattedTextControl(
         lambda: FormattedText([
             ("fg:ansiyellow bold",
@@ -467,6 +554,11 @@ def build_review_app(controller: AnnotationReviewController,
                                       edit_input_window]),
                               filter=Condition(
                                   lambda: ui.mode == "edit")),
+        ConditionalContainer(HSplit([swap_prompt_window,
+                                      swap_input_window]),
+                              filter=Condition(
+                                  lambda: ui.mode in ("swap_pattern",
+                                                       "swap_replace"))),
         ConditionalContainer(confirm_window,
                               filter=Condition(
                                   lambda: ui.mode == "confirm_abort")),
