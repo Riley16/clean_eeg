@@ -115,6 +115,9 @@ SUMMARY_SKIP_CHECKS = frozenset({
     # still runs, still lands in edf_audit.json, and still contributes
     # to overall_status (so a FAIL is still visible at the top).
     "annotation_phi_scan",
+    # annotation_review_state is a state summary (always status="pass");
+    # its content is reported by _always_print_warnings as a ✓ / ~ line.
+    "annotation_review_state",
 })
 
 
@@ -185,16 +188,39 @@ def _print_annotations(subject_dir: Path,
 
 
 def _print_unique_header_values(audit: dict, out=None) -> None:
+    """Dump every free-text field in the EDF main header, grouped by
+    unique value. The EDF+ spec has exactly four such fields
+    (see [print_edf_header.py:42-45](../print_edf_header.py#L42-L45)):
+
+        patient_id     80-byte subject/sex/birthdate/name subfield string
+        recording_id   80-byte startdate/admin/technician/equipment string
+        startdate      DD.MM.YY
+        starttime      HH.MM.SS
+
+    All four can carry residual PHI if the pipeline missed a field, so
+    the operator needs eyes on the unique values across every file.
+    Grouping by unique value keeps the dump compact for uniform
+    subject dirs (usually 1 patient_id + 1 recording_id + N distinct
+    startdates + N distinct starttimes).
+    """
     out = out or sys.stdout
     residue = audit["checks"].get("header_phi_residue", {})
     pids = set(residue.get("patient_ids_by_file", {}).values())
     startdates = set(residue.get("startdates_by_file", {}).values())
+    starttimes = set(residue.get("starttimes_by_file", {}).values())
+    recording_ids = set(residue.get("recording_ids_by_file", {}).values())
     print("\n--- Unique main-header values ---", file=out)
     print(f"  patient_id ({len(pids)} unique):", file=out)
     for v in sorted(pids):
         print(f"    {v!r}", file=out)
+    print(f"  recording_id ({len(recording_ids)} unique):", file=out)
+    for v in sorted(recording_ids):
+        print(f"    {v!r}", file=out)
     print(f"  startdate ({len(startdates)} unique):", file=out)
     for v in sorted(startdates):
+        print(f"    {v!r}", file=out)
+    print(f"  starttime ({len(starttimes)} unique):", file=out)
+    for v in sorted(starttimes):
         print(f"    {v!r}", file=out)
 
 
@@ -438,11 +464,65 @@ def _print_failed_deid_headers(audit: dict, subject_dir: Path,
             print(f"    ERROR while reading header: {e}", file=out)
 
 
-def _always_print_warnings(audit: dict, out=None) -> None:
+def _always_print_warnings(audit: dict, out=None, *,
+                           show_annotation_flags: bool = False,
+                           hide_annotation_flags: bool = False) -> None:
     """Always echo name-dictionary matches and any pipeline redactions
     into annotations, even under --quiet — these are the load-bearing
-    PHI signals the auditor cares about most."""
+    PHI signals the auditor cares about most.
+
+    When manual annotation review is complete (``annotation_review_state
+    == 'complete'``) both sections are suppressed by default and replaced
+    with a single ✓ line, because the operator has already inspected
+    every annotation and any remaining matches are known-safe. Pass
+    ``show_annotation_flags=True`` to render them anyway (useful when
+    re-auditing a subject whose review may have been done against an
+    older whitelist).
+
+    ``hide_annotation_flags`` unconditionally suppresses the phi-scan
+    matches block AND the pipeline annotation-redactions block, even
+    when review state is "none" or "partial". Used by the cleaner's
+    end-of-run auto-audit when it's about to launch the TUI: listing
+    the flagged annotations in the audit output is redundant with the
+    TUI, which the operator is about to open on the exact same file.
+    Wins over ``show_annotation_flags`` if both are True (the caller
+    asked twice for suppression, so honor it).
+    """
     out = out or sys.stdout
+    review = audit["checks"].get("annotation_review_state", {})
+    review_state = review.get("state", "none")
+    suppress = (hide_annotation_flags
+                or (review_state == "complete" and not show_annotation_flags))
+
+    if suppress:
+        if review_state == "complete":
+            # Standalone re-audit after review: celebrate the completed
+            # review + tell operators how to see the flags anyway.
+            print(f"\n[✓] Manual annotation review complete: "
+                  f"{review.get('n_reviewed', 0)} file(s) reviewed, "
+                  f"{review.get('n_edits_applied', 0)} edit(s) applied across "
+                  f"{review.get('n_applied_sessions', 0)} session(s). "
+                  f"Flagged-annotation section suppressed — pass "
+                  f"--show-annotation-flags to render it.", file=out)
+        else:
+            # hide_annotation_flags forced (pre-TUI auto-audit from the
+            # cleaner). Different message — a review has NOT happened
+            # yet; we're just not repeating what the TUI is about to
+            # show verbatim.
+            print(f"\n[i] Annotation flags suppressed for this render "
+                  f"(--hide-annotation-flags). The TUI you're about to "
+                  f"open shows every annotation directly; re-run "
+                  f"audit-subject-eeg after review to see the flag "
+                  f"summary with the review-complete banner.", file=out)
+        return
+
+    if review_state == "partial":
+        n_r = review.get("n_reviewed", 0)
+        n_c = review.get("n_annotation_carriers", 0)
+        print(f"\n[~] Manual annotation review in progress: "
+              f"{n_r}/{n_c} file(s) reviewed. Flagged annotations below "
+              f"may already be resolved for the reviewed files.", file=out)
+
     scan = audit["checks"].get("annotation_phi_scan", {})
     matches = scan.get("matched_tokens", {})
     if matches:
@@ -600,7 +680,9 @@ def _run_one_subject(subject_dir: Path, args,
         _print_summary(audit,
                        print_subject_header=not printed_banner,
                        show_passes=args.verbose >= 1)
-    _always_print_warnings(audit)  # never suppressed
+    _always_print_warnings(audit,  # never suppressed by --quiet
+                           show_annotation_flags=args.show_annotation_flags,
+                           hide_annotation_flags=args.hide_annotation_flags)
     # Read-only header dump for every file the pipeline failed on.
     # NEVER attempts to re-run the cleaner — the operator inspects
     # the header and decides what to do (repair, exclude, escalate).
@@ -735,6 +817,26 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vocab-whitelist", type=Path,
                    default=DEFAULT_VOCAB_WHITELIST,
                    help="JSON list of tokens to exempt from the name scan.")
+    p.add_argument("--show-annotation-flags", "--show_annotation_flags",
+                   dest="show_annotation_flags", action="store_true",
+                   help="Render the annotation name-dictionary matches and "
+                        "pipeline-redaction blocks even when the manual "
+                        "annotation review is complete. Default hides them "
+                        "in that case (a ✓ line is printed instead) since "
+                        "the operator has already inspected every "
+                        "annotation. Use when re-auditing a subject whose "
+                        "review may have been done against an older "
+                        "vocab / boilerplate whitelist.")
+    p.add_argument("--hide-annotation-flags", "--hide_annotation_flags",
+                   dest="hide_annotation_flags", action="store_true",
+                   help="Unconditionally suppress the annotation flag "
+                        "blocks (phi-scan matches + pipeline redactions), "
+                        "even when review state is 'none' or 'partial'. "
+                        "Used by the cleaner's end-of-run auto-audit when "
+                        "it's about to launch the TUI: the TUI shows every "
+                        "annotation directly, so listing flagged ones in "
+                        "the audit output is redundant. Wins over "
+                        "--show-annotation-flags if both are passed.")
     return p
 
 

@@ -231,3 +231,94 @@ def check_annotation_phi_scan(edf_paths: Iterable[str | Path],
         "dictionary_size": len(name_set),
         "issues": issues,
     }
+
+
+def check_annotation_review_state(subject_dir: str | Path,
+                                  annotation_carriers: Iterable[str | Path],
+                                  ) -> dict:
+    """Summarize the manual-annotation-review state for a subject.
+
+    Reads two on-disk artifacts written by ``annotation_review``:
+      - ``.annotation_reviewed_tracker`` — one JSONL line per fully-
+        reviewed EDF (see [journal.py](../annotation_review/journal.py)).
+      - ``.annotation_review/applied/session_*.jsonl`` — every session
+        whose edits landed in the EDFs.
+
+    ``state`` values:
+      - ``"none"``: no tracker, no applied sessions. Manual review has
+        not started. ``annotation_phi_scan`` output is authoritative.
+      - ``"partial"``: tracker exists but does not cover every
+        annotation carrier. ``annotation_phi_scan`` still worth
+        rendering — some flagged files may not have been reviewed yet.
+      - ``"complete"``: every annotation carrier is in the tracker.
+        The operator has looked at every non-boilerplate annotation.
+        Downstream renderers (``_always_print_warnings``, notebook)
+        may hide the phi-scan block by default.
+
+    ``status`` is always ``"pass"`` — this is a state summary, not a
+    correctness check. A partial-review isn't a failure; it's just
+    where the operator paused.
+    """
+    from clean_eeg.annotation_review.journal import (
+        APPLIED_SUBDIR,
+        REVIEWED_TRACKER_NAME,
+        SESSION_SUBDIR,
+        ReviewedTracker,
+    )
+    import json as _json
+
+    subject_dir = Path(subject_dir)
+    carriers = [Path(p) for p in annotation_carriers]
+    carrier_names = {p.name for p in carriers}
+    tracker_path = subject_dir / REVIEWED_TRACKER_NAME
+    tracker_present = tracker_path.exists()
+
+    reviewed_paths: set[str] = set()
+    if tracker_present:
+        try:
+            reviewed_paths = ReviewedTracker(subject_dir).reviewed_paths()
+        except (OSError, _json.JSONDecodeError):
+            reviewed_paths = set()
+
+    # Tracker stores absolute paths; compare by basename against the
+    # audited annotation carriers so that a subject-dir move / rename
+    # doesn't invalidate the state.
+    reviewed_names = {Path(p).name for p in reviewed_paths}
+    reviewed_carriers = carrier_names & reviewed_names
+    n_reviewed = len(reviewed_carriers)
+    n_carriers = len(carrier_names)
+
+    applied_dir = subject_dir / SESSION_SUBDIR / APPLIED_SUBDIR
+    applied_sessions: list[str] = []
+    n_edits_applied = 0
+    if applied_dir.is_dir():
+        for f in sorted(applied_dir.glob("session_*.jsonl")):
+            applied_sessions.append(f.name)
+            try:
+                for line in f.read_text().splitlines():
+                    line = line.strip()
+                    if line:
+                        n_edits_applied += 1
+            except OSError:
+                continue
+
+    if not tracker_present and not applied_sessions:
+        state = "none"
+    elif n_carriers > 0 and n_reviewed >= n_carriers:
+        state = "complete"
+    else:
+        state = "partial"
+
+    return {
+        "check": "annotation_review_state",
+        "status": "pass",
+        "state": state,
+        "tracker_present": tracker_present,
+        "n_reviewed": n_reviewed,
+        "n_annotation_carriers": n_carriers,
+        "unreviewed_carriers": sorted(carrier_names - reviewed_carriers),
+        "n_applied_sessions": len(applied_sessions),
+        "applied_sessions": applied_sessions,
+        "n_edits_applied": n_edits_applied,
+        "issues": [],
+    }

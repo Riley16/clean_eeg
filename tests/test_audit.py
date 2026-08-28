@@ -335,6 +335,53 @@ def test_residue_pass_cleaned_subject(tmp_path):
     assert result["issues"] == []
 
 
+def test_residue_collects_starttimes_and_recording_ids_by_file(tmp_path):
+    """Every free-text field in the EDF main header (patient_id,
+    recording_id, startdate, starttime) must be captured for display
+    by _print_unique_header_values. Missing any of these means the
+    operator can't visually verify that field was scrubbed of PHI."""
+    _write_edf_stub(tmp_path / "a.edf", startdate="01.01.85",
+                    starttime="10.00.00", recording_id="Startdate 01-JAN-1985 X X X")
+    _write_edf_stub(tmp_path / "b.edf", startdate="01.01.85",
+                    starttime="11.30.00", recording_id="Startdate 01-JAN-1985 X X X")
+
+    result = check_header_phi_residue(sorted(tmp_path.glob("*.edf")))
+
+    assert set(result["starttimes_by_file"].keys()) == {"a.edf", "b.edf"}
+    assert result["starttimes_by_file"]["a.edf"] == "10.00.00"
+    assert result["starttimes_by_file"]["b.edf"] == "11.30.00"
+    # recording_ids_by_file also present (pre-existing key, guard it).
+    assert set(result["recording_ids_by_file"].keys()) == {"a.edf", "b.edf"}
+
+
+def test_print_unique_header_values_dumps_all_four_free_text_fields(capsys):
+    """_print_unique_header_values must surface all four free-text
+    main-header fields (patient_id, recording_id, startdate, starttime)
+    so the operator can visually confirm every one was cleaned. The
+    EDF+ spec has exactly these four -- any PHI residue in the main
+    header would be in one of them."""
+    from clean_eeg.audit.cli import _print_unique_header_values
+    audit = {"checks": {"header_phi_residue": {
+        "patient_ids_by_file": {"a.edf": "R1755J X 01-JAN-1900 X X",
+                                "b.edf": "R1755J X 01-JAN-1900 X X"},
+        "recording_ids_by_file": {"a.edf": "Startdate 01-JAN-1985 X X X",
+                                   "b.edf": "Startdate 01-JAN-1985 X X X"},
+        "startdates_by_file": {"a.edf": "01.01.85", "b.edf": "01.01.85"},
+        "starttimes_by_file": {"a.edf": "10.00.00", "b.edf": "11.30.00"},
+    }}}
+    _print_unique_header_values(audit)
+    out = capsys.readouterr().out
+    assert "patient_id (1 unique)" in out
+    assert "'R1755J X 01-JAN-1900 X X'" in out
+    assert "recording_id (1 unique)" in out
+    assert "'Startdate 01-JAN-1985 X X X'" in out
+    assert "startdate (1 unique)" in out
+    assert "'01.01.85'" in out
+    assert "starttime (2 unique)" in out
+    assert "'10.00.00'" in out
+    assert "'11.30.00'" in out
+
+
 def test_residue_fail_leaked_name_in_patient_id(tmp_path):
     _write_edf_stub(tmp_path / "clean.edf")
     _write_edf_stub(tmp_path / "leaked.edf",
@@ -1375,7 +1422,7 @@ def test_e2e_audit_pass_on_clean_subject(tmp_path):
         "subject_code_consistency", "filename_convention", "header_phi_residue",
         "recording_gaps", "byte_geometry", "annotation_pairing",
         "signal_header_uniformity", "annotation_phi_scan",
-        "transfer_integrity", "log_file",
+        "transfer_integrity", "log_file", "annotation_review_state",
     }
     assert set(audit["checks"]) == expected_checks
     # log has no WARNING/ERROR/redactions → pass; everything else pass.
@@ -1420,7 +1467,8 @@ def test_e2e_audit_annotation_only_skips_other_checks(tmp_path):
     audit = audit_subject(subject_dir, name_dictionary={"nonexistent"},
                           annotation_only=True)
     assert audit["mode"] == "annotation_only"
-    assert set(audit["checks"]) == {"transfer_integrity", "annotation_phi_scan"}
+    assert set(audit["checks"]) == {
+        "transfer_integrity", "annotation_phi_scan", "annotation_review_state"}
 
 
 def test_e2e_audit_detects_bit_rot_on_second_run(tmp_path):
@@ -1802,6 +1850,229 @@ def test_cli_annotation_redaction_block_absent_when_none(capsys):
     out = capsys.readouterr().out
     # No annotation redactions → no block at all (keeps output tight).
     assert "Pipeline redacted" not in out
+
+
+# --- annotation-review-state check -----------------------------------------
+
+
+def _write_tracker(subject_dir: Path, reviewed_files: list[Path]) -> None:
+    """Emit a valid .annotation_reviewed_tracker JSONL for the given files."""
+    import json as _json
+    with open(subject_dir / ".annotation_reviewed_tracker", "a") as f:
+        for p in reviewed_files:
+            f.write(_json.dumps({
+                "file_path": str(p),
+                "reviewed_at": "2026-01-01T00:00:00+00:00",
+                "n_annotations": 3,
+                "n_edited": 0,
+            }) + "\n")
+
+
+def _write_applied_session(subject_dir: Path, n_edits: int,
+                           name: str = "session_20260101T000000Z.jsonl") -> None:
+    applied = subject_dir / ".annotation_review" / "applied"
+    applied.mkdir(parents=True, exist_ok=True)
+    (applied / name).write_text("\n".join(['{"edit":' + str(i) + '}'
+                                            for i in range(n_edits)]) + "\n")
+
+
+def test_annotation_review_state_none_when_no_artifacts(tmp_path):
+    from clean_eeg.audit.annotations import check_annotation_review_state
+    for name in ("a.edf", "b.edf"):
+        (tmp_path / name).touch()
+    carriers = sorted(tmp_path.glob("*.edf"))
+    r = check_annotation_review_state(tmp_path, carriers)
+    assert r["state"] == "none"
+    assert r["status"] == "pass"
+    assert r["n_reviewed"] == 0
+    assert r["n_annotation_carriers"] == 2
+    assert r["unreviewed_carriers"] == ["a.edf", "b.edf"]
+    assert r["n_applied_sessions"] == 0
+    assert r["n_edits_applied"] == 0
+
+
+def test_annotation_review_state_partial_when_some_reviewed(tmp_path):
+    from clean_eeg.audit.annotations import check_annotation_review_state
+    for name in ("a.edf", "b.edf", "c.edf"):
+        (tmp_path / name).touch()
+    carriers = sorted(tmp_path.glob("*.edf"))
+    _write_tracker(tmp_path, [tmp_path / "a.edf"])
+    r = check_annotation_review_state(tmp_path, carriers)
+    assert r["state"] == "partial"
+    assert r["n_reviewed"] == 1
+    assert r["unreviewed_carriers"] == ["b.edf", "c.edf"]
+
+
+def test_annotation_review_state_complete_when_all_reviewed(tmp_path):
+    from clean_eeg.audit.annotations import check_annotation_review_state
+    for name in ("a.edf", "b.edf"):
+        (tmp_path / name).touch()
+    carriers = sorted(tmp_path.glob("*.edf"))
+    _write_tracker(tmp_path, list(carriers))
+    _write_applied_session(tmp_path, n_edits=5)
+    r = check_annotation_review_state(tmp_path, carriers)
+    assert r["state"] == "complete"
+    assert r["n_reviewed"] == 2
+    assert r["unreviewed_carriers"] == []
+    assert r["n_applied_sessions"] == 1
+    assert r["n_edits_applied"] == 5
+
+
+def test_annotation_review_state_matches_by_basename_not_absolute_path(tmp_path):
+    """Subject-dir rename / move must not invalidate review state — the
+    tracker's absolute paths won't match, but basenames still will."""
+    from clean_eeg.audit.annotations import check_annotation_review_state
+    for name in ("a.edf", "b.edf"):
+        (tmp_path / name).touch()
+    carriers = sorted(tmp_path.glob("*.edf"))
+    # Tracker paths point at a DIFFERENT parent dir — simulates a move.
+    _write_tracker(tmp_path, [Path("/somewhere/else") / p.name for p in carriers])
+    r = check_annotation_review_state(tmp_path, carriers)
+    assert r["state"] == "complete"
+    assert r["n_reviewed"] == 2
+
+
+def test_cli_suppresses_phi_scan_when_review_complete(capsys):
+    from clean_eeg.audit.cli import _always_print_warnings
+    audit = {"checks": {
+        "annotation_phi_scan": {
+            "matched_tokens": {"smith": [{"text": "seen by smith",
+                                          "file": "a.edf", "onset": 1.0}]},
+        },
+        "log_file": {"redactions": [
+            {"line_number": 42, "field": "annotation",
+             "redacted_value": "seen by <REDACTED>"},
+        ]},
+        "annotation_review_state": {
+            "state": "complete", "n_reviewed": 3,
+            "n_edits_applied": 5, "n_applied_sessions": 1,
+        },
+    }}
+    _always_print_warnings(audit)
+    out = capsys.readouterr().out
+    # Positive: ✓ line printed with counts.
+    assert "Manual annotation review complete" in out
+    assert "3 file(s) reviewed" in out
+    assert "5 edit(s) applied" in out
+    # Negative: phi-scan and redaction sections suppressed.
+    assert "'smith'" not in out
+    assert "Pipeline redacted" not in out
+    assert "log line 42" not in out
+
+
+def test_cli_show_annotation_flags_overrides_suppression(capsys):
+    from clean_eeg.audit.cli import _always_print_warnings
+    audit = {"checks": {
+        "annotation_phi_scan": {
+            "matched_tokens": {"smith": [{"text": "seen by smith",
+                                          "file": "a.edf", "onset": 1.0}]},
+        },
+        "log_file": {"redactions": [
+            {"line_number": 42, "field": "annotation",
+             "redacted_value": "seen by <REDACTED>"},
+        ]},
+        "annotation_review_state": {
+            "state": "complete", "n_reviewed": 3,
+            "n_edits_applied": 5, "n_applied_sessions": 1,
+        },
+    }}
+    _always_print_warnings(audit, show_annotation_flags=True)
+    out = capsys.readouterr().out
+    # ✓ line NOT printed (override active).
+    assert "Manual annotation review complete" not in out
+    # Sections restored.
+    assert "'smith'" in out
+    assert "Pipeline redacted 1 annotation" in out
+
+
+def test_cli_partial_review_prints_progress_line_and_still_shows_flags(capsys):
+    from clean_eeg.audit.cli import _always_print_warnings
+    audit = {"checks": {
+        "annotation_phi_scan": {
+            "matched_tokens": {"smith": [{"text": "seen by smith",
+                                          "file": "a.edf", "onset": 1.0}]},
+        },
+        "log_file": {"redactions": []},
+        "annotation_review_state": {
+            "state": "partial", "n_reviewed": 1, "n_annotation_carriers": 3,
+        },
+    }}
+    _always_print_warnings(audit)
+    out = capsys.readouterr().out
+    # Progress line + phi-scan section both present.
+    assert "review in progress: 1/3" in out
+    assert "'smith'" in out
+
+
+def test_cli_missing_review_state_falls_back_to_none_behavior(capsys):
+    """Backward-compat: audits generated before this feature don't carry
+    the annotation_review_state key. Renderer must not crash and must
+    behave as if state == 'none' (i.e. show the phi-scan block)."""
+    from clean_eeg.audit.cli import _always_print_warnings
+    audit = {"checks": {
+        "annotation_phi_scan": {
+            "matched_tokens": {"smith": [{"text": "seen by smith",
+                                          "file": "a.edf", "onset": 1.0}]},
+        },
+        "log_file": {"redactions": []},
+        # NOTE: no 'annotation_review_state' key
+    }}
+    _always_print_warnings(audit)
+    out = capsys.readouterr().out
+    assert "'smith'" in out
+    assert "Manual annotation review" not in out
+
+
+def test_cli_hide_annotation_flags_suppresses_even_when_review_state_none(capsys):
+    """The cleaner's end-of-run auto-audit passes --hide-annotation-flags
+    because the TUI is about to open on the same annotations. The phi-scan
+    matches + pipeline-redaction blocks MUST be suppressed regardless of
+    review state (which is 'none' at that moment)."""
+    from clean_eeg.audit.cli import _always_print_warnings
+    audit = {"checks": {
+        "annotation_phi_scan": {
+            "matched_tokens": {"smith": [{"text": "seen by smith",
+                                          "file": "a.edf", "onset": 1.0}]},
+        },
+        "log_file": {"redactions": [
+            {"line_number": 42, "field": "annotation",
+             "redacted_value": "seen by <REDACTED>"},
+        ]},
+        "annotation_review_state": {
+            "state": "none", "n_reviewed": 0, "n_annotation_carriers": 2,
+        },
+    }}
+    _always_print_warnings(audit, hide_annotation_flags=True)
+    out = capsys.readouterr().out
+    # Blocks suppressed.
+    assert "'smith'" not in out
+    assert "Pipeline redacted" not in out
+    # Explanatory line printed so operator knows why the block is missing.
+    assert "--hide-annotation-flags" in out
+    # NOT the review-complete banner (review isn't complete yet).
+    assert "Manual annotation review complete" not in out
+
+
+def test_cli_hide_annotation_flags_wins_over_show(capsys):
+    """If both --hide-annotation-flags and --show-annotation-flags are
+    passed (unusual but plausible), hide wins -- the caller has asked
+    for suppression twice, honor it."""
+    from clean_eeg.audit.cli import _always_print_warnings
+    audit = {"checks": {
+        "annotation_phi_scan": {
+            "matched_tokens": {"smith": [{"text": "seen by smith",
+                                          "file": "a.edf", "onset": 1.0}]},
+        },
+        "log_file": {"redactions": []},
+        "annotation_review_state": {
+            "state": "complete", "n_reviewed": 2,
+            "n_edits_applied": 3, "n_applied_sessions": 1,
+        },
+    }}
+    _always_print_warnings(audit, show_annotation_flags=True,
+                            hide_annotation_flags=True)
+    out = capsys.readouterr().out
+    assert "'smith'" not in out
 
 
 # --- annotation stub pairing -----------------------------------------------

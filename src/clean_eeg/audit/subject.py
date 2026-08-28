@@ -22,7 +22,10 @@ from pathlib import Path
 from typing import Callable
 
 from clean_eeg.annotation_boilerplate import BoilerplateWhitelist
-from clean_eeg.audit.annotations import check_annotation_phi_scan
+from clean_eeg.audit.annotations import (
+    check_annotation_phi_scan,
+    check_annotation_review_state,
+)
 from clean_eeg.audit.checks import (
     check_annotation_pairing,
     check_byte_geometry,
@@ -277,6 +280,10 @@ def audit_subject(subject_dir: str | Path,
                        boilerplate_whitelist=boilerplate_whitelist,
                        site_code=None),
                    progress)
+        _run_check(checks, timings, "annotation_review_state",
+                   lambda: check_annotation_review_state(
+                       subject_dir, annotation_carriers),
+                   progress)
     else:
         _run_check(checks, timings, "subject_code_consistency",
                    lambda: check_subject_code_consistency(edf_files), progress)
@@ -308,6 +315,10 @@ def audit_subject(subject_dir: str | Path,
                    lambda: check_log_file(
                        subject_dir / LOG_FILENAME
                        if (subject_dir / LOG_FILENAME).exists() else None),
+                   progress)
+        _run_check(checks, timings, "annotation_review_state",
+                   lambda: check_annotation_review_state(
+                       subject_dir, annotation_carriers),
                    progress)
 
     subject_code = checks.get("subject_code_consistency", {}).get("subject_code")

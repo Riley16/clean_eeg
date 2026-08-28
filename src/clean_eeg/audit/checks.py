@@ -118,6 +118,7 @@ def check_header_phi_residue(edf_paths: Iterable[str | Path],
     per_file: dict[str, dict] = {}
     unexpected_tokens_by_file: dict[str, list[str]] = {}
     startdates_by_file: dict[str, str] = {}
+    starttimes_by_file: dict[str, str] = {}
     recording_ids_by_file: dict[str, str] = {}
     recording_id_years_by_file: dict[str, int | None] = {}
     parsed_startdates: dict[str, date] = {}
@@ -138,12 +139,22 @@ def check_header_phi_residue(edf_paths: Iterable[str | Path],
         if sd is not None:
             parsed_startdates[p.name] = sd
 
+        # starttime is not part of the PHI-residue verdict (the pipeline
+        # anchors it via BASE_START_DATE but doesn't itself check the
+        # value here), but capturing it lets _print_unique_header_values
+        # surface it so operators can visually confirm no residue in the
+        # main-header time field.
+        st_raw = header.get("starttime", "")
+        st_raw = st_raw if isinstance(st_raw, str) else str(st_raw)
+        starttimes_by_file[p.name] = st_raw
+
         rid_raw = header.get("recording_id", "")
         rid_raw = rid_raw if isinstance(rid_raw, str) else str(rid_raw)
         recording_ids_by_file[p.name] = rid_raw
         recording_id_years_by_file[p.name] = _extract_recording_id_year(rid_raw)
 
         per_file[p.name] = {"patient_id": pid, "startdate": sd_raw,
+                             "starttime": st_raw,
                              "recording_id": rid_raw}
 
     issues: list[str] = []
@@ -203,6 +214,7 @@ def check_header_phi_residue(edf_paths: Iterable[str | Path],
         "expected_year_range": [year_lo, year_hi],
         "earliest_startdate": earliest.isoformat() if earliest else None,
         "startdates_by_file": startdates_by_file,
+        "starttimes_by_file": starttimes_by_file,
         "recording_ids_by_file": recording_ids_by_file,
         "recording_id_years_by_file": recording_id_years_by_file,
         "patient_ids_by_file": {name: v["patient_id"] for name, v in per_file.items()},
