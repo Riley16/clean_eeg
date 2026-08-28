@@ -57,11 +57,33 @@ class PreflightFailure(RuntimeError):
     print a targeted error instead of a generic traceback."""
 
 
+ANNOTATION_SIDECAR_SUFFIX = "_annotations.edf"
+
+
+def _pick_annotation_carrier(main_edf: Path) -> Path:
+    """Return the file that actually carries this recording's redacted
+    annotations. In-place cleaning ([clean_subject_eeg.py:498-513](
+    ../clean_subject_eeg.py#L498-L513)) writes annotations into a
+    ``<base>_annotations.edf`` sidecar (~KB) and ZEROES the main EDF's
+    annotation channel, so on in-place output the main EDF is empty
+    and the sidecar is canonical. Rewrite mode leaves annotations
+    inline in the main EDF (no sidecar exists). Prefer the sidecar
+    when present; else fall back to the main file.
+
+    Reading the sidecar in in-place mode also drops per-file review
+    I/O from GB to KB — the entire file is annotation channel plus
+    a few header bytes, so on network storage (Box FS, NFS) it's
+    orders of magnitude faster than mmap-scanning the full recording.
+    """
+    sidecar = main_edf.parent / (main_edf.stem + ANNOTATION_SIDECAR_SUFFIX)
+    return sidecar if sidecar.exists() else main_edf
+
+
 def preflight_subject_for_review(subject_dir: Path,
                                   subfolder: str = "clinical_eeg"
                                   ) -> list[Path]:
     """Confirm the subject dir is ready for manual annotation review
-    and return the list of EDF files to review.
+    and return the list of files to review (one per recording).
 
     Gates:
       1. ``<subject_dir>/<subfolder>`` exists (otherwise there's no
@@ -70,12 +92,16 @@ def preflight_subject_for_review(subject_dir: Path,
          the cleaning pipeline finished on this subject; annotations
          should be redacted, so manually reading them for review
          won't surface PHI on the screen).
-      3. At least one .edf file exists to review.
+      3. At least one recording (non-sidecar .edf) exists to review.
 
     Fails LOUDLY on each gate rather than silently skipping -- the
     operator should never start reviewing something that isn't ready.
-    Sidecar ``*_annotations.edf`` files are excluded from the returned
-    list; the inline annotations in the main EDFs are canonical.
+
+    For each recording, returns the annotation carrier -- the sidecar
+    ``<base>_annotations.edf`` if it exists (in-place cleaning
+    output), else the main EDF (rewrite mode). Downstream code
+    (``iter_annotations``, ``apply_pending_edits``) targets whatever
+    path is returned here, so edits land in the right file.
     """
     subject_dir = Path(subject_dir)
     inner = subject_dir / subfolder
@@ -92,13 +118,13 @@ def preflight_subject_for_review(subject_dir: Path,
             f"may still contain PHI). Run clean-batch-eeg on this "
             f"subject first, then re-launch review.")
 
-    edfs = sorted(p for p in inner.rglob("*.edf")
-                  if not p.name.endswith("_annotations.edf"))
-    if not edfs:
+    main_edfs = sorted(p for p in inner.rglob("*.edf")
+                       if not p.name.endswith(ANNOTATION_SIDECAR_SUFFIX))
+    if not main_edfs:
         raise PreflightFailure(
             f"{subject_dir}: no .edf files under {inner}. Nothing "
             f"to review.")
-    return edfs
+    return [_pick_annotation_carrier(p) for p in main_edfs]
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +141,12 @@ class DisplayLine:
     toggle. ``is_edited`` marks annotations that have a pending edit
     queued in this session -- shown so the operator sees their own
     in-flight changes distinctly from the on-disk state.
+
+    ``display_text`` is what the renderer should print. When an edit is
+    pending, this is the edit's ``new_text``; otherwise it's the raw
+    annotation text. Kept as a separate field (rather than making the
+    renderer look up ``_pending`` itself) so the render is a pure
+    function of the DisplayLine list -- easy to snapshot / test.
     """
     file_index: int
     annotation_index: int
@@ -123,6 +155,7 @@ class DisplayLine:
     is_current: bool
     is_whitelisted: bool
     is_edited: bool
+    display_text: str
 
 
 # ---------------------------------------------------------------------------
@@ -485,24 +518,46 @@ class AnnotationReviewController:
         """Persist an edit for the current annotation. Overwrites
         any previous pending edit for the same annotation. Returns
         the created record, or None if there's no current annotation
-        (empty file). Same-text 'edits' still record so the operator
-        can see confirmed no-ops in the approval gate."""
+        (empty file), or None if the submission is a no-op re-save of
+        an already-pending edit with identical ``new_text`` (avoids
+        flooding the journal + status counter when the operator
+        accidentally hits Enter twice or re-enters the same edit)."""
         ann = self.current_annotation()
         if ann is None:
             return None
+        key = (self.file_cursor, self.annotation_cursor)
+        # No-op detection: if a pending edit already covers this key
+        # with the identical new_text, do NOT append to the journal.
+        # Prevents duplicate journal lines from Enter-mashing and
+        # keeps the [N pending edit(s)] status counter honest.
+        existing = self._pending.get(key)
+        if existing is not None and existing.new_text == new_text:
+            return existing
         record = EditRecord.new(
             file_path=str(self.current_file()),
             record_index=ann.record_index,
             byte_offset_in_record=ann.byte_offset_in_record,
             onset_s=ann.onset_s,
             orig_text=ann.text, new_text=new_text)
-        key = (self.file_cursor, self.annotation_cursor)
         self._pending[key] = record
         self._journal.append(record)
         return record
 
     def is_current_edited(self) -> bool:
         return (self.file_cursor, self.annotation_cursor) in self._pending
+
+    def current_display_text(self) -> str | None:
+        """Text the operator should see when opening the current
+        annotation for edit. Returns the pending edit's ``new_text``
+        if one exists (so the operator can build on their previous
+        change), else the raw annotation text. Returns None if there
+        is no current annotation (empty file)."""
+        ann = self.current_annotation()
+        if ann is None:
+            return None
+        key = (self.file_cursor, self.annotation_cursor)
+        pending = self._pending.get(key)
+        return pending.new_text if pending is not None else ann.text
 
     # ---- rendering ----
 
@@ -519,6 +574,9 @@ class AnnotationReviewController:
         out: list[DisplayLine] = []
         for i in range(self.annotation_cursor, end):
             a = anns[i]
+            key = (self.file_cursor, i)
+            pending = self._pending.get(key)
+            display_text = pending.new_text if pending is not None else a.text
             out.append(DisplayLine(
                 file_index=self.file_cursor,
                 annotation_index=i,
@@ -526,7 +584,8 @@ class AnnotationReviewController:
                 annotation=a,
                 is_current=(i == self.annotation_cursor),
                 is_whitelisted=self.is_whitelisted(a),
-                is_edited=(self.file_cursor, i) in self._pending,
+                is_edited=pending is not None,
+                display_text=display_text,
             ))
         return out
 
@@ -543,6 +602,39 @@ class AnnotationReviewController:
             file_path=self.current_file(),
             n_annotations=len(anns),
             n_edited=n_edited))
+
+    def unreviewed_reviewable_files(self) -> list[Path]:
+        """Reviewable files (i.e. files the TUI would let the operator
+        cursor into) that are NOT yet in the tracker. Used by the CLI's
+        end-of-session prompt to ask the operator "mark these as
+        reviewed?"; if empty, nothing to prompt about."""
+        reviewed = self._tracker.reviewed_paths()
+        return [self._edfs[i] for i in self._file_indices
+                if str(self._edfs[i]) not in reviewed]
+
+    def mark_all_reviewable_files_reviewed(self) -> list[Path]:
+        """Bulk-mark every reviewable file as reviewed. Returns the
+        list of files newly marked (i.e. files that weren't already
+        in the tracker). Used by the CLI's end-of-session "operator
+        looked at everything and quit" flow -- see the design note in
+        annotation_review_cli.main().
+
+        Iterates in file_index order so the tracker entries land in
+        a deterministic order (helps operators reading the tracker
+        file by hand)."""
+        reviewed = self._tracker.reviewed_paths()
+        newly_marked: list[Path] = []
+        for i in self._file_indices:
+            path = self._edfs[i]
+            if str(path) in reviewed:
+                continue
+            anns = self._load_annotations_for_index(i)
+            n_edited = sum(1 for k in self._pending if k[0] == i)
+            self._tracker.mark_reviewed(ReviewedFile.new(
+                file_path=path, n_annotations=len(anns),
+                n_edited=n_edited))
+            newly_marked.append(path)
+        return newly_marked
 
     # ---- close-out ----
 

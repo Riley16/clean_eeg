@@ -72,6 +72,30 @@ def _prompt_apply(pending: list[EditRecord]) -> bool:
     return resp in ("y", "yes")
 
 
+def _prompt_mark_all_reviewed(unreviewed: list[Path]) -> bool:
+    """Interactive Y/n with default YES. The operator who quits the
+    TUI usually did so because they finished looking at everything --
+    "no edits" and "unreviewed" should not be conflated. Default YES
+    honors that intent; a fat-finger empty return marks reviewed
+    (which is easily reversible: delete the tracker entries or use
+    --include-reviewed on a re-run)."""
+    n = len(unreviewed)
+    filenames = ", ".join(p.name for p in unreviewed[:5])
+    if n > 5:
+        filenames += f", ... (+{n - 5} more)"
+    print(f"\n{n} file(s) were reviewable but not explicitly marked "
+          f"reviewed via 'n' during the session:")
+    print(f"  {filenames}")
+    resp = input(
+        f"Mark all {n} as reviewed (they'll be skipped on future "
+        f"annotation-review-eeg runs of this subject)? [Y/n]: "
+    ).strip().lower()
+    # Default YES: empty response is affirmative. Only an explicit 'n'
+    # or 'no' rejects. This matches the operator's typical mental
+    # model of "I quit because I'm done."
+    return resp not in ("n", "no")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="annotation-review-eeg",
@@ -142,6 +166,25 @@ def main(argv: list[str] | None = None) -> int:
         app.run()
     finally:
         controller.close()
+
+    # Bulk-mark reviewed prompt: the operator quit -- typically that
+    # means "I'm done looking at this subject", not "I only care about
+    # files I explicitly pressed 'n' on". Prompting here closes the
+    # gap where a review with zero edits (nothing needed changing)
+    # would otherwise leave state=none in the audit. Default YES.
+    # --auto-apply also implies auto-mark-reviewed for scripted runs.
+    unreviewed = controller.unreviewed_reviewable_files()
+    if unreviewed:
+        should_mark = args.auto_apply or _prompt_mark_all_reviewed(unreviewed)
+        if should_mark:
+            marked = controller.mark_all_reviewable_files_reviewed()
+            print(f"[ok] marked {len(marked)} file(s) as reviewed in the "
+                  f"tracker.")
+        else:
+            print(f"[info] {len(unreviewed)} file(s) left unmarked in the "
+                  f"tracker. Re-run annotation-review-eeg to revisit "
+                  f"(or delete .annotation_reviewed_tracker to force "
+                  f"a fresh pass).")
 
     pending = controller.pending_edits()
     if not pending:

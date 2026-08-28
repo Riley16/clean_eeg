@@ -97,7 +97,11 @@ def _render_scroll(controller: AnnotationReviewController) -> FormattedText:
         marker = f"{marker:<3s}"
 
         onset = f"{line.annotation.onset_s:>8.2f}s"
-        text = line.annotation.text
+        # display_text reflects the pending edit's new_text when
+        # is_edited, else the raw on-disk annotation. The renderer must
+        # NOT read line.annotation.text directly -- that would show the
+        # pre-edit value and mask the operator's in-flight change.
+        text = line.display_text
         # Truncate long texts to keep the scroll compact; full text
         # visible in EDIT mode
         if len(text) > 200:
@@ -320,11 +324,16 @@ def build_review_app(controller: AnnotationReviewController,
 
     @kb.add("e", filter=in_review)
     def _(event):
-        ann = controller.current_annotation()
-        if ann is None:
+        # Pre-fill the edit buffer with what the operator SEES in the
+        # scroll view, not the raw on-disk text. If a pending edit
+        # exists on this annotation, current_display_text returns its
+        # new_text so re-editing lets the operator build on the last
+        # change instead of starting over from the original.
+        current_text = controller.current_display_text()
+        if current_text is None:
             ui.status_message = "no annotation to edit"
             return
-        edit_buf.text = ann.text
+        edit_buf.text = current_text
         edit_buf.cursor_position = len(edit_buf.text)
         ui.mode = "edit"
         ui.status_message = ""

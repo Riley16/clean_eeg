@@ -118,11 +118,12 @@ def test_preflight_fails_on_no_edfs(tmp_path):
         preflight_subject_for_review(subj)
 
 
-def test_preflight_excludes_annotation_sidecars(tmp_path):
-    """Sidecar '*_annotations.edf' files are the inplace-mode
-    annotation stubs -- their annotations are already surfaced via
-    the main EDF, so including them in the review list would double-
-    count everything."""
+def test_preflight_prefers_sidecar_when_present(tmp_path):
+    """In-place cleaning zeros the main EDF's annotation channel and
+    writes annotations into a '<base>_annotations.edf' sidecar. The
+    reviewer must read from the sidecar in that case -- reading the
+    main EDF would show zero annotations. Also drops per-file I/O
+    from GB (main EDF) to KB (sidecar), critical on Box/NFS."""
     subj = tmp_path / "R1755A"
     inner = subj / "clinical_eeg"
     inner.mkdir(parents=True)
@@ -130,7 +131,38 @@ def test_preflight_excludes_annotation_sidecars(tmp_path):
     _write_edf(inner / "R1755A.edf", ["real"])
     _write_edf(inner / "R1755A_annotations.edf", ["sidecar"])
     edfs = preflight_subject_for_review(subj)
+    # Sidecar picked over main EDF.
+    assert [p.name for p in edfs] == ["R1755A_annotations.edf"]
+
+
+def test_preflight_falls_back_to_main_edf_when_no_sidecar(tmp_path):
+    """Rewrite mode (--copy_path) leaves annotations inline in the main
+    EDF and writes no sidecar. Reviewer must read from the main EDF."""
+    subj = tmp_path / "R1755A"
+    inner = subj / "clinical_eeg"
+    inner.mkdir(parents=True)
+    (inner / "deidentify.json").write_text("{}")
+    _write_edf(inner / "R1755A.edf", ["real"])
+    edfs = preflight_subject_for_review(subj)
     assert [p.name for p in edfs] == ["R1755A.edf"]
+
+
+def test_preflight_mixes_modes_per_recording(tmp_path):
+    """A subject dir could plausibly contain some recordings cleaned
+    in-place (sidecar exists) and some in rewrite mode (no sidecar).
+    The picker is per-recording so each one gets the right file."""
+    subj = tmp_path / "R1755A"
+    inner = subj / "clinical_eeg"
+    inner.mkdir(parents=True)
+    (inner / "deidentify.json").write_text("{}")
+    _write_edf(inner / "R1755A_a.edf", ["main-a"])
+    _write_edf(inner / "R1755A_a_annotations.edf", ["sidecar-a"])
+    _write_edf(inner / "R1755A_b.edf", ["main-b"])   # no sidecar
+    edfs = preflight_subject_for_review(subj)
+    assert [p.name for p in edfs] == [
+        "R1755A_a_annotations.edf",
+        "R1755A_b.edf",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +272,53 @@ def test_queue_edit_second_time_overwrites_first(tmp_path):
     assert len(SessionJournal(subj).read_all()) == 2
 
 
+def test_queue_edit_dedups_identical_repeat_submission(tmp_path):
+    """Enter-mashing or re-saving the same text must NOT append duplicate
+    journal lines or inflate the pending-count. Same key + same new_text
+    is a no-op; the returned record is the existing one."""
+    subj = _make_subject(tmp_path, "R1755A", {"a.edf": ["orig"]})
+    c = AnnotationReviewController(subj)
+    first = c.queue_edit("redacted")
+    second = c.queue_edit("redacted")  # identical text -- no-op
+    third = c.queue_edit("redacted")   # identical again -- no-op
+    assert first is second, "second submission should return existing record"
+    assert first is third, "third submission should return existing record"
+    assert len(c.pending_edits()) == 1
+    # Journal has exactly 1 entry, not 3.
+    assert len(SessionJournal(subj).read_all()) == 1
+
+
+def test_current_display_text_returns_pending_edit_new_text(tmp_path):
+    """Regression: pressing 'e' after an edit must show the OPERATOR'S
+    current text (their previous edit), not the original on-disk text.
+    current_display_text is what the tui.py `e` handler pre-fills into
+    the edit buffer."""
+    subj = _make_subject(tmp_path, "R1755A", {"a.edf": ["dr. smith noted"]})
+    c = AnnotationReviewController(subj)
+    assert c.current_display_text() == "dr. smith noted"
+    c.queue_edit("<REDACTED> noted")
+    assert c.current_display_text() == "<REDACTED> noted", (
+        "must return the pending edit's new_text so re-editing lets "
+        "the operator build on their change instead of starting over"
+    )
+
+
+def test_visible_lines_shows_pending_edit_text(tmp_path):
+    """Regression: after an edit, the scroll view must render the
+    OPERATOR'S new text -- not the original -- so they get immediate
+    visual confirmation the edit registered."""
+    subj = _make_subject(tmp_path, "R1755A", {"a.edf": ["orig text"]})
+    c = AnnotationReviewController(subj)
+    c.queue_edit("edited text")
+    lines = c.visible_lines()
+    assert len(lines) == 1
+    line = lines[0]
+    assert line.is_edited is True
+    assert line.display_text == "edited text"
+    # Original still on the raw Annotation for audit / apply-time matching.
+    assert line.annotation.text == "orig text"
+
+
 # ---------------------------------------------------------------------------
 # Whitelist filtering (view state)
 # ---------------------------------------------------------------------------
@@ -330,6 +409,73 @@ def test_mark_current_file_reviewed_persists_to_disk(tmp_path):
     assert entries[0].n_annotations == 2
     # n_edited counts only edits to THIS file
     assert entries[0].n_edited >= 0   # (edit at cursor 0 was 'y-redacted')
+
+
+def test_unreviewed_reviewable_files_returns_untracked(tmp_path):
+    """Anything reviewable that's NOT in the tracker is returned so the
+    CLI knows what to prompt about on quit."""
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["x"], "b.edf": ["y"], "c.edf": ["z"]})
+    c = AnnotationReviewController(subj)
+    # None marked yet -> all three are unreviewed.
+    assert len(c.unreviewed_reviewable_files()) == 3
+    # Mark just 'a' -> only b, c remain.
+    c.mark_current_file_reviewed()
+    unreviewed = c.unreviewed_reviewable_files()
+    assert sorted(p.name for p in unreviewed) == ["b.edf", "c.edf"]
+
+
+def test_mark_all_reviewable_files_reviewed_bulk_marks_and_dedups(tmp_path):
+    """The end-of-session bulk-mark path: operator quits after looking at
+    everything (or after only marking one via 'n'), and the CLI's prompt
+    on quit calls this to close out the tracker. Every previously-
+    unmarked reviewable file gets an entry; already-marked files are
+    skipped (idempotent)."""
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["x"], "b.edf": ["y"], "c.edf": ["z"]})
+    c = AnnotationReviewController(subj)
+    # Pre-mark 'a' via the explicit-per-file path.
+    c.mark_current_file_reviewed()
+    assert len(ReviewedTracker(subj).read_all()) == 1
+    newly = c.mark_all_reviewable_files_reviewed()
+    # Only b and c are newly marked; a was already tracked.
+    assert sorted(p.name for p in newly) == ["b.edf", "c.edf"]
+    entries = ReviewedTracker(subj).read_all()
+    # Tracker now has entries for all three files (1 pre-existing + 2 new).
+    assert sorted({e.file_path for e in entries}) == sorted(
+        [str(subj / "clinical_eeg" / n) for n in ("a.edf", "b.edf", "c.edf")])
+
+
+def test_mark_all_reviewable_files_reviewed_is_idempotent(tmp_path):
+    """Second call after everything's marked adds no new entries --
+    important because the CLI might call this after auto-mark-all-
+    whitelisted has already run inside --preload-all."""
+    subj = _make_subject(tmp_path, "R1755A", {"a.edf": ["x"], "b.edf": ["y"]})
+    c = AnnotationReviewController(subj)
+    first = c.mark_all_reviewable_files_reviewed()
+    assert len(first) == 2
+    second = c.mark_all_reviewable_files_reviewed()
+    assert second == [], "no files should be newly marked on second call"
+
+
+def test_mark_all_reviewable_files_reviewed_captures_pending_edit_counts(
+        tmp_path):
+    """Each ReviewedFile entry records how many edits landed on that
+    file. Bulk-mark must correctly attribute pending edits by file so
+    the audit trail is honest even for files marked reviewed without
+    the operator ever pressing 'n' on them."""
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["x", "y"], "b.edf": ["z"]})
+    c = AnnotationReviewController(subj)
+    c.queue_edit("x-redacted")   # edit on a.edf (file_cursor=0, ann=0)
+    c.move_cursor(+1)
+    c.queue_edit("y-redacted")   # edit on a.edf (file_cursor=0, ann=1)
+    c.mark_all_reviewable_files_reviewed()
+    entries = {e.file_path: e for e in ReviewedTracker(subj).read_all()}
+    a_entry = entries[str(subj / "clinical_eeg" / "a.edf")]
+    b_entry = entries[str(subj / "clinical_eeg" / "b.edf")]
+    assert a_entry.n_edited == 2, f"a.edf should have 2 edits: {a_entry}"
+    assert b_entry.n_edited == 0, f"b.edf should have 0 edits: {b_entry}"
 
 
 # ---------------------------------------------------------------------------
