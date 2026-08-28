@@ -305,6 +305,19 @@ def build_review_app(controller: AnnotationReviewController,
 
     @kb.add("n", filter=in_review)
     def _(event):
+        # Refuse to mark-and-advance unless the operator has actually
+        # scrolled to the last annotation of this file. Prevents the
+        # common footgun: pressing 'n' mid-file, silently marking every
+        # annotation past the cursor as reviewed. If the operator
+        # really wants to skip the rest, they must jump to end first
+        # (press 'G'), which is a deliberate two-keystroke gesture.
+        if not controller.on_last_annotation_of_file():
+            ui.status_message = ("cannot advance -- press 'G' first to "
+                                 "scroll through the remaining annotations "
+                                 "(refuses to mark reviewed until the "
+                                 "cursor reaches the last one)")
+            on_bell()
+            return
         controller.mark_current_file_reviewed()
         moved = controller.next_file()
         if moved:

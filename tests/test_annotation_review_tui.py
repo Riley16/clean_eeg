@@ -363,7 +363,10 @@ def test_tui_n_marks_current_file_reviewed(tmp_path):
     """Press 'n': current file's entry lands in
     .annotation_reviewed_tracker on disk. Regression guard against
     'n' advancing without persisting the mark (would break the
-    restart-skips-reviewed-files behavior)."""
+    restart-skips-reviewed-files behavior).
+
+    Single-annotation file: cursor is at position 0 which IS the last
+    (and only) annotation, so the n-gate is satisfied immediately."""
     subj = _make_subject(tmp_path, files={"a.edf": [(0.5, "x")]})
     controller = AnnotationReviewController(subj)
 
@@ -373,3 +376,126 @@ def test_tui_n_marks_current_file_reviewed(tmp_path):
     entries = ReviewedTracker(subj).read_all()
     assert len(entries) == 1
     assert entries[0].file_path.endswith("a.edf")
+
+
+def test_cli_auto_locates_standard_whitelist_when_not_specified(
+        tmp_path, monkeypatch, capsys):
+    """Regression: `annotation-review-eeg` without --whitelist-path
+    must auto-locate data/annotation_boilerplate_whitelist.json and
+    load it. Previously the TUI ran with an EMPTY whitelist by default,
+    silently showing every '*Mark' / boilerplate annotation.
+
+    Approach: patch AnnotationReviewController to capture the
+    whitelist_path it was constructed with, run main() through argv,
+    assert the path points at the tracked standard whitelist."""
+    from clean_eeg import annotation_review_cli as _cli
+    from clean_eeg.paths import ANNOTATION_BOILERPLATE_WHITELIST_PATH
+
+    captured: dict = {}
+
+    class _StubController:
+        def __init__(self, subject_dir, *, subfolder=None, whitelist_path=None,
+                      respect_reviewed_tracker=True, preload_all=False):
+            captured["whitelist_path"] = whitelist_path
+            self.num_files_to_review = 0    # short-circuits main() early
+            self.num_files = 0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_cli, "AnnotationReviewController", _StubController)
+    subj = tmp_path / "R1651J"
+    (subj / "clinical_eeg").mkdir(parents=True)
+
+    # Args: no --whitelist-path, no --no-whitelist. Must auto-locate.
+    _cli.main(["--subject-dir", str(subj), "--subfolder", "clinical_eeg"])
+
+    assert captured.get("whitelist_path") == ANNOTATION_BOILERPLATE_WHITELIST_PATH, (
+        f"expected auto-located standard whitelist path, got "
+        f"{captured.get('whitelist_path')!r}"
+    )
+    err = capsys.readouterr().err
+    assert "applying whitelist" in err, (
+        f"expected loud stderr banner confirming auto-locate: {err!r}")
+
+
+def test_cli_no_whitelist_flag_disables_auto_load(tmp_path, monkeypatch):
+    """--no-whitelist explicitly opts out of the auto-load. Controller
+    receives whitelist_path=None (i.e. empty BoilerplateWhitelist)."""
+    from clean_eeg import annotation_review_cli as _cli
+
+    captured: dict = {}
+
+    class _StubController:
+        def __init__(self, subject_dir, *, subfolder=None, whitelist_path=None,
+                      respect_reviewed_tracker=True, preload_all=False):
+            captured["whitelist_path"] = whitelist_path
+            self.num_files_to_review = 0
+            self.num_files = 0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_cli, "AnnotationReviewController", _StubController)
+    subj = tmp_path / "R1651J"
+    (subj / "clinical_eeg").mkdir(parents=True)
+
+    _cli.main(["--subject-dir", str(subj), "--no-whitelist"])
+    assert captured.get("whitelist_path") is None
+
+
+def test_tui_n_refuses_when_cursor_not_at_last_annotation(tmp_path):
+    """Press 'n' before scrolling to the last annotation: the mark
+    must be REFUSED. The file must stay UNMARKED in the tracker AND
+    the cursor stays put -- neither an advance nor a silent skip.
+
+    Guards against the mistake the operator called out: hitting 'n'
+    partway through a file and marking un-scrolled annotations as
+    'reviewed' when they were never actually seen."""
+    subj = _make_subject(tmp_path, files={
+        "a.edf": [(0.5, "first"), (1.5, "middle"), (2.5, "last")]})
+    controller = AnnotationReviewController(subj)
+    assert controller.annotation_cursor == 0
+
+    _drive_tui(controller, "nq")   # 'n' immediately -> should REFUSE
+
+    # File NOT marked reviewed
+    from clean_eeg.annotation_review.journal import ReviewedTracker
+    entries = ReviewedTracker(subj).read_all()
+    assert entries == [], (
+        f"'n' before reaching end of file must NOT mark reviewed; "
+        f"got tracker entries {entries}")
+    # Cursor did NOT advance (n neither marked nor moved to next file)
+    assert controller.file_cursor == 0
+
+
+def test_tui_n_succeeds_after_G_jumps_to_end(tmp_path):
+    """Press 'G' (jump to end), then 'n': the gate lets us through
+    because the cursor is now at the last annotation. This is the
+    intended workaround for 'I've decided to skip the rest without
+    scrolling one-by-one' -- a deliberate two-keystroke gesture."""
+    subj = _make_subject(tmp_path, files={
+        "a.edf": [(0.5, "first"), (1.5, "middle"), (2.5, "last")]})
+    controller = AnnotationReviewController(subj)
+
+    _drive_tui(controller, "Gnq")
+
+    from clean_eeg.annotation_review.journal import ReviewedTracker
+    entries = ReviewedTracker(subj).read_all()
+    assert len(entries) == 1, (
+        f"'G' then 'n' must mark reviewed; got {entries}")
+
+
+def test_tui_n_succeeds_after_scrolling_j_to_last(tmp_path):
+    """Same as above but reached via arrow-key scrolling (`jjj` walks
+    the cursor to position 2 which is the last of the 3 annotations).
+    The gate cares about the cursor position, not HOW we got there."""
+    subj = _make_subject(tmp_path, files={
+        "a.edf": [(0.5, "first"), (1.5, "middle"), (2.5, "last")]})
+    controller = AnnotationReviewController(subj)
+
+    _drive_tui(controller, "jjnq")  # 'j'*2 -> cursor at position 2 (last)
+
+    from clean_eeg.annotation_review.journal import ReviewedTracker
+    entries = ReviewedTracker(subj).read_all()
+    assert len(entries) == 1

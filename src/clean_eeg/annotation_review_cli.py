@@ -116,7 +116,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="Boilerplate whitelist JSON (per-site regex "
                         "fullmatch). Whitelisted annotations are "
                         "greyed in the scroll view. Press 'w' during "
-                        "review to append the current annotation.")
+                        "review to append the current annotation. "
+                        "Default: auto-locate the standard whitelist "
+                        "at data/annotation_boilerplate_whitelist.json. "
+                        "Pass --no-whitelist to disable auto-load "
+                        "entirely (empty whitelist).")
+    p.add_argument("--no-whitelist", action="store_true",
+                   help="Disable auto-loading the standard whitelist. "
+                        "Use when you want to see every annotation "
+                        "including known-boilerplate.")
     p.add_argument("--include-reviewed", action="store_true",
                    help="Include files listed in "
                         "<subject>/.annotation_reviewed_tracker. "
@@ -138,11 +146,30 @@ def main(argv: list[str] | None = None) -> int:
                         "up-front pause.")
     args = p.parse_args(argv)
 
+    # Resolve whitelist path: explicit --whitelist-path wins; else
+    # auto-locate the standard tracked whitelist unless --no-whitelist
+    # disables. Was previously None-by-default -- meaning the TUI ran
+    # with an EMPTY whitelist unless the operator remembered to pass
+    # --whitelist-path, silently showing every '*Mark' / boilerplate
+    # annotation the whitelist was supposed to hide.
+    if args.whitelist_path is not None:
+        resolved_wl_path = args.whitelist_path
+    elif args.no_whitelist:
+        resolved_wl_path = None
+    else:
+        from clean_eeg.paths import ANNOTATION_BOILERPLATE_WHITELIST_PATH
+        resolved_wl_path = ANNOTATION_BOILERPLATE_WHITELIST_PATH
+        # Loud visual confirmation so operators can see the auto-locate
+        # is doing what they expect. Matches the pattern established by
+        # count_annotations / sample_annotations.
+        print(f"[TUI] applying whitelist: {resolved_wl_path}",
+              file=sys.stderr)
+
     try:
         controller = AnnotationReviewController(
             args.subject_dir,
             subfolder=args.subfolder,
-            whitelist_path=args.whitelist_path,
+            whitelist_path=resolved_wl_path,
             respect_reviewed_tracker=not args.include_reviewed,
             preload_all=args.preload_all)
     except PreflightFailure as e:
