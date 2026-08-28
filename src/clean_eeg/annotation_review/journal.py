@@ -161,3 +161,43 @@ class ReviewedTracker:
         """Deduplicated set of paths that have been reviewed at least
         once. Callers filter their file list against this set."""
         return {e.file_path for e in self.read_all()}
+
+
+# ---------------------------------------------------------------------------
+# reset_review_state: full-reset helper for --rerun-annot-review
+# ---------------------------------------------------------------------------
+
+def reset_review_state(subject_inner: Path) -> dict:
+    """Reset the per-subject review state so the TUI treats every file
+    as fresh on the next launch. Called by annotation-review-eeg's
+    --rerun-annot-review flag.
+
+    Deletes:
+      - ``.annotation_reviewed_tracker``: the per-file "seen" record
+        (drops files from the reviewable set on next launch).
+      - ``.annotation_review/session.jsonl``: the pending-edit buffer
+        (any un-applied edits from the aborted session).
+
+    PRESERVES:
+      - ``.annotation_review/applied/session_*.jsonl``: audit trail of
+        edits that already landed on disk in a prior session. Deleting
+        this would lose the compliance record even though the actual
+        edited text is already in the sidecar EDFs.
+      - ``.annotation_review/discarded/session_*.jsonl``: audit trail
+        of edits the operator explicitly discarded. Same reasoning.
+
+    Returns a dict describing what was deleted (empty when nothing to
+    reset) so the CLI can print a clear "reset X and Y" message.
+    ``subject_inner`` is the directory that CONTAINS the tracker file
+    and .annotation_review/ dir (typically ``<subject>/clinical_eeg/``).
+    """
+    deleted: dict[str, str] = {}
+    tracker = subject_inner / REVIEWED_TRACKER_NAME
+    if tracker.exists():
+        tracker.unlink()
+        deleted["tracker"] = str(tracker)
+    session_jsonl = subject_inner / SESSION_SUBDIR / SESSION_JSONL_NAME
+    if session_jsonl.exists():
+        session_jsonl.unlink()
+        deleted["pending_session"] = str(session_jsonl)
+    return deleted

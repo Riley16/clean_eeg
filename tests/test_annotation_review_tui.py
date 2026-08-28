@@ -422,6 +422,141 @@ def test_tui_n_marks_current_file_reviewed(tmp_path):
     assert entries[0].file_path.endswith("a.edf")
 
 
+def test_reset_review_state_deletes_tracker_and_pending_session(tmp_path):
+    """reset_review_state removes the tracker + pending session.jsonl
+    (the two artifacts that carry 'aborted-mid-review' state) so the
+    next TUI launch treats every file as fresh."""
+    from clean_eeg.annotation_review.journal import (
+        reset_review_state,
+        REVIEWED_TRACKER_NAME, SESSION_SUBDIR, SESSION_JSONL_NAME,
+    )
+    inner = tmp_path / "R1755J" / "clinical_eeg"
+    inner.mkdir(parents=True)
+    tracker = inner / REVIEWED_TRACKER_NAME
+    tracker.write_text('{"file_path":"/tmp/a.edf","reviewed_at":"2026","n_annotations":1,"n_edited":0}\n')
+    session_dir = inner / SESSION_SUBDIR
+    session_dir.mkdir()
+    session = session_dir / SESSION_JSONL_NAME
+    session.write_text('{"file_path":"/tmp/a.edf","record_index":0,"byte_offset_in_record":0,"onset_s":0.5,"orig_text":"x","new_text":"y","edited_at":"2026"}\n')
+
+    deleted = reset_review_state(inner)
+
+    assert not tracker.exists()
+    assert not session.exists()
+    assert "tracker" in deleted
+    assert "pending_session" in deleted
+
+
+def test_reset_review_state_preserves_applied_audit_trail(tmp_path):
+    """Applied-session archive files (edits that already landed on
+    disk) MUST survive reset -- they're the compliance record of what
+    changed and when. Same for discarded/. Deleting either would
+    silently lose PHI-review provenance."""
+    from clean_eeg.annotation_review.journal import (
+        reset_review_state,
+        SESSION_SUBDIR, APPLIED_SUBDIR, DISCARDED_SUBDIR,
+    )
+    inner = tmp_path / "R1755J" / "clinical_eeg"
+    inner.mkdir(parents=True)
+    (inner / ".annotation_reviewed_tracker").write_text("{}\n")
+    session_dir = inner / SESSION_SUBDIR
+    (session_dir / APPLIED_SUBDIR).mkdir(parents=True)
+    applied_archive = session_dir / APPLIED_SUBDIR / "session_20260101T000000Z.jsonl"
+    applied_archive.write_text('{"edit":"landed"}\n')
+    (session_dir / DISCARDED_SUBDIR).mkdir()
+    discarded_archive = session_dir / DISCARDED_SUBDIR / "session_20260102T000000Z.jsonl"
+    discarded_archive.write_text('{"edit":"rejected"}\n')
+
+    reset_review_state(inner)
+
+    assert applied_archive.exists(), (
+        "applied-session archive must survive reset (compliance record)")
+    assert discarded_archive.exists(), (
+        "discarded-session archive must survive reset (compliance record)")
+
+
+def test_reset_review_state_noop_when_nothing_to_reset(tmp_path):
+    """Fresh subject dir (never reviewed) -> reset is a safe no-op,
+    returns empty dict. Regression against a reset that crashes on
+    missing files instead of just skipping them."""
+    from clean_eeg.annotation_review.journal import reset_review_state
+    inner = tmp_path / "R1755J" / "clinical_eeg"
+    inner.mkdir(parents=True)
+
+    deleted = reset_review_state(inner)
+    assert deleted == {}
+
+
+def test_cli_rerun_annot_review_calls_reset_before_controller(monkeypatch,
+                                                                tmp_path,
+                                                                capsys):
+    """--rerun-annot-review must run reset_review_state BEFORE the
+    controller is instantiated -- otherwise the controller would
+    read the stale tracker + register the un-applied edits as
+    'pending', defeating the reset."""
+    from clean_eeg import annotation_review_cli as _cli
+
+    # Set up subject with prior review state.
+    subj = tmp_path / "R1755J"
+    inner = subj / "clinical_eeg"
+    inner.mkdir(parents=True)
+    tracker = inner / ".annotation_reviewed_tracker"
+    tracker.write_text('{"file_path":"/tmp/a.edf","reviewed_at":"2026","n_annotations":1,"n_edited":0}\n')
+
+    # Capture what the controller sees when it's instantiated: the
+    # tracker must be gone by then.
+    tracker_exists_at_controller_init: dict[str, bool] = {}
+
+    class _StubController:
+        def __init__(self, subject_dir, *, subfolder=None, whitelist_path=None,
+                      respect_reviewed_tracker=True, preload_all=False):
+            tracker_exists_at_controller_init["value"] = tracker.exists()
+            self.num_files_to_review = 0
+            self.num_files = 0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_cli, "AnnotationReviewController", _StubController)
+    _cli.main(["--subject-dir", str(subj), "--rerun-annot-review"])
+
+    assert tracker_exists_at_controller_init.get("value") is False, (
+        "tracker must be deleted BEFORE controller init when "
+        "--rerun-annot-review is passed")
+    err = capsys.readouterr().err
+    assert "[rerun]" in err
+    assert "reset" in err
+
+
+def test_cli_rerun_annot_review_noop_message_when_nothing_to_reset(
+        monkeypatch, tmp_path, capsys):
+    """Fresh subject with --rerun-annot-review -> prints 'nothing to
+    reset' hint but STILL launches (doesn't error out). This is the
+    ergonomic default: the flag is safe to include unconditionally
+    in scripts even for subjects that haven't been reviewed yet."""
+    from clean_eeg import annotation_review_cli as _cli
+
+    subj = tmp_path / "R1755J"
+    (subj / "clinical_eeg").mkdir(parents=True)
+
+    class _StubController:
+        def __init__(self, subject_dir, *, subfolder=None, whitelist_path=None,
+                      respect_reviewed_tracker=True, preload_all=False):
+            self.num_files_to_review = 0
+            self.num_files = 0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_cli, "AnnotationReviewController", _StubController)
+    rc = _cli.main(["--subject-dir", str(subj), "--rerun-annot-review"])
+    err = capsys.readouterr().err
+    assert "nothing to reset" in err
+    # Non-fatal: the CLI still launches (falls through to normal path,
+    # which the stub short-circuits via num_files_to_review == 0).
+    assert rc == 0
+
+
 def test_cli_auto_locates_standard_whitelist_when_not_specified(
         tmp_path, monkeypatch, capsys):
     """Regression: `annotation-review-eeg` without --whitelist-path

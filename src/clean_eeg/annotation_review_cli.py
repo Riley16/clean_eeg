@@ -144,7 +144,37 @@ def main(argv: list[str] | None = None) -> int:
                         "the operator reads faster than files load "
                         "lazily -- turns per-file wait into one "
                         "up-front pause.")
+    p.add_argument("--rerun-annot-review", action="store_true",
+                   help="Reset this subject's review state before "
+                        "launching: deletes the reviewed-files tracker "
+                        "and any pending-edit journal from a prior "
+                        "aborted session, so the TUI treats every file "
+                        "as fresh. PRESERVES the applied/ and "
+                        "discarded/ audit trails inside .annotation_review/ "
+                        "-- those record edits that already landed on disk "
+                        "(applied) or were explicitly rejected "
+                        "(discarded) in prior sessions. Use when you "
+                        "aborted a review partway through and want to "
+                        "restart cleanly from the first file.")
     args = p.parse_args(argv)
+
+    # --rerun-annot-review: reset per-subject review state so the TUI
+    # treats every file as fresh. Deletes tracker + pending-edit
+    # journal; preserves applied/ + discarded/ audit trails inside
+    # .annotation_review/. Runs BEFORE controller construction so the
+    # controller sees the clean state.
+    if args.rerun_annot_review:
+        from clean_eeg.annotation_review.journal import reset_review_state
+        inner = args.subject_dir / args.subfolder
+        deleted = reset_review_state(inner)
+        if not deleted:
+            print(f"[rerun] {inner}: nothing to reset (no prior tracker "
+                  f"or pending-edit journal). Proceeding with normal launch.",
+                  file=sys.stderr)
+        else:
+            summary = ", ".join(f"{k} ({v})" for k, v in deleted.items())
+            print(f"[rerun] {inner}: reset {summary}. Applied + discarded "
+                  f"audit trails preserved.", file=sys.stderr)
 
     # Resolve whitelist path: explicit --whitelist-path wins; else
     # auto-locate the standard tracked whitelist unless --no-whitelist
