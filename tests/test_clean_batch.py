@@ -16,6 +16,7 @@ import pytest
 
 from clean_eeg.clean_batch import (
     CsvSchemaError,
+    SubjectOutcome,
     SubjectRow,
     _default_clean_argv_prefix,
     audit_one_subject,
@@ -25,6 +26,7 @@ from clean_eeg.clean_batch import (
     main,
     parse_subjects_csv,
     run_batch,
+    run_review_phase,
 )
 
 
@@ -429,6 +431,18 @@ def test_default_argv_prefix_uses_module_form():
     assert prefix[2] == "clean_eeg.clean_subject_eeg"
 
 
+def test_default_argv_prefix_forwards_no_launch_review():
+    """The single-subject CLI auto-launches audit + TUI at end-of-clean
+    by default. Batch runs the audit + TUI in a single post-batch pass
+    instead (see run_review_phase), so every per-subject subprocess
+    MUST get --no-launch-review to avoid launching mid-batch."""
+    prefix = _default_clean_argv_prefix()
+    assert "--no-launch-review" in prefix, (
+        f"batch's per-subject invocation must suppress the cleaner's "
+        f"end-of-run TUI launch: {prefix}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # --only-subjects: subject-picker filter
 # ---------------------------------------------------------------------------
@@ -777,3 +791,203 @@ def test_main_only_subjects_file_returns_nonzero_when_no_match(
     rc = main(["--subjects-csv", str(csv_path), "--quiet-child-output",
                "--only-subjects-file", str(filter_path)])
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# run_review_phase: post-batch audit + TUI loop
+# ---------------------------------------------------------------------------
+
+
+def _outcome(subject_code: str, output_path: str, *,
+             succeeded: bool = True) -> SubjectOutcome:
+    """A SubjectOutcome shaped like run_batch would produce."""
+    return SubjectOutcome(
+        row_index=1, subject_code=subject_code,
+        input_path=f"/in/{subject_code}", output_path=output_path,
+        exit_code=0 if succeeded else 1, elapsed_s=1.0,
+        error_message=None if succeeded else "clean_subject_eeg exited 1")
+
+
+def test_review_phase_skips_when_no_tty(monkeypatch, capsys, tmp_path):
+    """Headless invocations (nohup, cron, SSH-without-PTY) have no
+    TTY -- run_review_phase must NOT try to launch the TUI (would
+    hang) and must print the per-subject manual-run commands so the
+    operator can resume later.
+    """
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    outcomes = [_outcome("R1755J", str(tmp_path / "R1755J" / "clinical_eeg"))]
+    run_review_phase(outcomes)
+    out = capsys.readouterr().out
+    assert "no TTY" in out
+    # Per-subject fallback command printed with the right subject_dir /
+    # subfolder split.
+    assert "annotation-review-eeg --subject-dir" in out
+    assert "--subfolder clinical_eeg" in out
+
+
+def test_review_phase_skips_failed_clean(monkeypatch, capsys, tmp_path):
+    """Only successfully-cleaned subjects have output worth reviewing;
+    subjects whose clean failed have nothing on disk to audit or open
+    in the TUI. Loop must skip them entirely (no subprocess launched)."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "clean_eeg.clean_batch.audit_one_subject",
+        lambda output_path, **kw: (calls.append(["audit", output_path]) or
+                                    (0, 0.1, None)))
+    monkeypatch.setattr(
+        "clean_eeg.clean_batch.subprocess.run",
+        lambda argv, **kw: (calls.append(argv) or
+                             type("R", (), {"returncode": 0})()))
+
+    good = _outcome("R1755J", str(tmp_path / "R1755J" / "clinical_eeg"))
+    bad = _outcome("R1755K", str(tmp_path / "R1755K" / "clinical_eeg"),
+                    succeeded=False)
+    run_review_phase([good, bad])
+
+    # Two calls: audit + TUI, both for the successful subject only.
+    subject_codes_touched = {
+        arg for c in calls for arg in c if isinstance(arg, str)
+        and "R1755" in arg
+    }
+    assert any("R1755J" in s for s in subject_codes_touched)
+    assert not any("R1755K" in s for s in subject_codes_touched), (
+        f"failed-clean subject leaked into review phase: {calls}"
+    )
+
+
+def test_review_phase_launches_tui_with_correct_subfolder(monkeypatch, tmp_path):
+    """Verify the TUI subprocess argv splits output_path into
+    (subject_dir, subfolder) correctly -- this is what the TUI's
+    preflight expects. Regression against silently launching the TUI
+    against the wrong parent dir (which would fail preflight)."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    captured_tui_argv: list[list[str]] = []
+
+    def _fake_audit(output_path, **kw):
+        return 0, 0.1, None
+
+    def _fake_run(argv, **kw):
+        captured_tui_argv.append(list(argv))
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr("clean_eeg.clean_batch.audit_one_subject", _fake_audit)
+    monkeypatch.setattr("clean_eeg.clean_batch.subprocess.run", _fake_run)
+
+    out = str(tmp_path / "R1755J" / "clinical_eeg")
+    run_review_phase([_outcome("R1755J", out)])
+    assert len(captured_tui_argv) == 1
+    argv = captured_tui_argv[0]
+    assert "--subject-dir" in argv
+    sd = argv[argv.index("--subject-dir") + 1]
+    assert sd == str(tmp_path / "R1755J"), (
+        f"subject-dir should be the parent of output_path: {argv}"
+    )
+    assert "--subfolder" in argv
+    sf = argv[argv.index("--subfolder") + 1]
+    assert sf == "clinical_eeg", f"subfolder wrong: {argv}"
+    assert "--preload-all" in argv
+
+
+def test_review_phase_audit_argv_includes_header_visibility_flags(
+        monkeypatch, tmp_path):
+    """The audit-CLI invocation in the review phase must expose the
+    header info the operator needs to visually confirm the clean
+    (unique patient_id / startdate values, plus header_phi_residue
+    check status). Without -v the summary hides passing checks; without
+    --print-edf-header the actual values never render. Regression
+    against a bug where the operator saw no header info at all."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    captured_audit_argv: list[list[str]] = []
+
+    def _fake_audit_one_subject(output_path, *, argv_prefix=None,
+                                 stream_output=True):
+        captured_audit_argv.append(
+            (argv_prefix or []) + [output_path])
+        return 0, 0.1, None
+
+    monkeypatch.setattr(
+        "clean_eeg.clean_batch.audit_one_subject",
+        _fake_audit_one_subject)
+    monkeypatch.setattr(
+        "clean_eeg.clean_batch.subprocess.run",
+        lambda *a, **kw: type("R", (), {"returncode": 0})())
+
+    out = str(tmp_path / "R1755J" / "clinical_eeg")
+    run_review_phase([_outcome("R1755J", out)])
+    assert len(captured_audit_argv) == 1
+    argv = captured_audit_argv[0]
+    assert "-v" in argv, (
+        "review phase must pass -v so passing checks (including "
+        f"header_phi_residue) appear in the summary: {argv}")
+    assert "--print-edf-header" in argv, (
+        "review phase must dump every unique main-header value so the "
+        f"operator visually confirms all free-text fields were cleaned: {argv}")
+    assert "--print-edf-signal-header" in argv, (
+        "review phase must dump signal-header signatures so operator "
+        f"can spot PHI in channel labels / transducer / prefilter: {argv}")
+    assert "--hide-annotation-flags" in argv
+    assert "--no-notebook" in argv
+
+
+def test_review_phase_continues_on_tui_error(monkeypatch, capsys, tmp_path):
+    """A per-subject TUI failure (non-zero exit, or a launch exception)
+    must not abort the whole review phase -- the operator wants to work
+    through remaining subjects even if one is misconfigured."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    monkeypatch.setattr(
+        "clean_eeg.clean_batch.audit_one_subject",
+        lambda output_path, **kw: (0, 0.1, None))
+    n_calls = {"count": 0}
+
+    def _run_fail_then_ok(argv, **kw):
+        n_calls["count"] += 1
+        rc = 1 if n_calls["count"] == 1 else 0
+        return type("R", (), {"returncode": rc})()
+
+    monkeypatch.setattr(
+        "clean_eeg.clean_batch.subprocess.run", _run_fail_then_ok)
+
+    outs = [_outcome("R1755J", str(tmp_path / "R1755J" / "clinical_eeg")),
+            _outcome("R1755K", str(tmp_path / "R1755K" / "clinical_eeg"))]
+    run_review_phase(outs)
+    err = capsys.readouterr().out
+    assert "TUI for R1755J exited 1" in err
+    # Both subjects' TUI subprocesses were attempted.
+    assert n_calls["count"] == 2, "loop stopped after first subject"
+
+
+def test_review_phase_bails_on_keyboard_interrupt(monkeypatch, capsys, tmp_path):
+    """Ctrl-C at the batch-loop level (as opposed to inside a TUI, which
+    the TUI itself intercepts) means the operator wants to bail on the
+    whole review phase -- must exit cleanly, print a friendly message,
+    and not attempt subsequent subjects."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(
+        "clean_eeg.clean_batch.audit_one_subject",
+        lambda output_path, **kw: (0, 0.1, None))
+
+    def _run_raises(argv, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("clean_eeg.clean_batch.subprocess.run", _run_raises)
+
+    outs = [_outcome("R1755J", str(tmp_path / "R1755J" / "clinical_eeg")),
+            _outcome("R1755K", str(tmp_path / "R1755K" / "clinical_eeg"))]
+    run_review_phase(outs)
+    out = capsys.readouterr().out
+    assert "aborted by operator" in out
+    assert "R1755J" in out
+    # Second subject should NOT have started.
+    assert "R1755K" not in out or "aborted" in out.split("R1755K", 1)[0]

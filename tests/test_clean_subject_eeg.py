@@ -1,6 +1,7 @@
 import numpy as np
 import os
 import shutil
+import sys
 import pytest
 
 from clean_eeg.clean_subject_eeg import remove_gendered_pronouns, _GENDERED_PRONOUNS, BASE_START_DATE,\
@@ -1947,3 +1948,110 @@ def test_recording_gaps_prompt_still_fires_without_bypass(monkeypatch, tmp_path)
     # At least the gap prompt should have been shown; other prompts may fire too.
     gap_prompts = [p for p in prompt_called if "Continue?" in p]
     assert gap_prompts, "gap prompt should have fired when 'recording-gaps' not in approved"
+
+
+# ---------------------------------------------------------------------------
+# --launch-review / _run_audit_and_launch_review
+# ---------------------------------------------------------------------------
+
+
+def test_run_audit_and_launch_review_skips_when_no_tty(monkeypatch, capsys,
+                                                        tmp_path):
+    """SSH-without-PTY, nohup, cron: launching a TUI in a non-TTY
+    context would hang forever (or crash on stdin EOF). The helper
+    MUST short-circuit and print the exact manual re-run commands so
+    the operator can resume in an interactive session."""
+    from clean_eeg.clean_subject_eeg import _run_audit_and_launch_review
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    # Guard: if the helper accidentally reached the subprocess line
+    # despite the no-TTY check, this fake would fire and we'd see it
+    # in stdout. Absence == correctly short-circuited.
+    monkeypatch.setattr(
+        "clean_eeg.clean_subject_eeg.subprocess.run",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("subprocess.run must not be called without TTY")))
+
+    out_path = str(tmp_path / "R1755J" / "clinical_eeg")
+    (tmp_path / "R1755J" / "clinical_eeg").mkdir(parents=True)
+    _run_audit_and_launch_review(out_path)
+    out = capsys.readouterr().out
+    assert "no TTY" in out
+    assert "audit-subject-eeg" in out
+    assert "annotation-review-eeg" in out
+    assert "--subfolder clinical_eeg" in out
+
+
+def test_clean_subject_edf_files_launch_review_defaults_off(monkeypatch, capsys,
+                                                             tmp_path):
+    """Programmatic callers (tests, integration harness, batch
+    subprocess) must NOT get an unexpected TUI-launch — the kwarg
+    defaults to False. This guards against a future default flip
+    silently breaking non-interactive callers."""
+    import inspect
+    from clean_eeg.clean_subject_eeg import clean_subject_edf_files
+    sig = inspect.signature(clean_subject_edf_files)
+    assert sig.parameters["launch_review"].default is False, (
+        "launch_review must default False so programmatic callers don't "
+        "have a TUI pop up unexpectedly; the CLI's main() flips it on."
+    )
+
+
+def test_run_audit_and_launch_review_subprocesses_full_audit_cli(monkeypatch,
+                                                                  capsys,
+                                                                  tmp_path):
+    """The audit is invoked as `python -m clean_eeg.audit.cli` so the
+    operator sees the SAME output they'd see from a direct
+    audit-subject-eeg call (critical banner, header residue, failed-
+    deid dumps, per-check summary). Regression against the earlier
+    in-process partial render which hid header info."""
+    from clean_eeg.clean_subject_eeg import _run_audit_and_launch_review
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        "clean_eeg.clean_subject_eeg.subprocess.run",
+        lambda argv, **kw: (captured.append(list(argv)) or
+                             type("R", (), {"returncode": 0})()))
+
+    out_path = str(tmp_path / "R1755J" / "clinical_eeg")
+    (tmp_path / "R1755J" / "clinical_eeg").mkdir(parents=True)
+    _run_audit_and_launch_review(out_path)
+
+    # Two subprocess calls: audit + TUI. Both use `python -m <module>`.
+    assert len(captured) == 2, f"expected 2 subprocess calls, got {captured}"
+
+    audit_argv = captured[0]
+    assert audit_argv[0] == sys.executable
+    assert audit_argv[1] == "-m"
+    assert audit_argv[2] == "clean_eeg.audit.cli", (
+        "audit must run via the standard CLI so operator sees the full "
+        "standard rendering (critical banner, header info, etc.)"
+    )
+    # Flags required for the auto-launch context:
+    #   --no-notebook            skip ~10 s ipynb render (operator can invoke later)
+    #   --hide-annotation-flags  TUI is about to show them directly
+    #   -v                       show every check status (passing ones too),
+    #                            so operator sees header_phi_residue etc.
+    #                            in the summary
+    #   --print-edf-header       dump unique patient_id / startdate values
+    #                            so operator visually confirms the clean
+    assert "--no-notebook" in audit_argv
+    assert "--hide-annotation-flags" in audit_argv
+    assert "-v" in audit_argv, (
+        "auto-launch must pass -v so passing checks (including "
+        "header_phi_residue) appear in the summary")
+    assert "--print-edf-header" in audit_argv, (
+        "auto-launch must dump every unique main-header value so the "
+        "operator visually confirms all free-text header fields "
+        "(patient_id, recording_id, startdate, starttime) were cleaned")
+    assert "--print-edf-signal-header" in audit_argv, (
+        "auto-launch must dump signal-header signatures so operator "
+        "can spot PHI leaks in channel labels / transducer / prefilter")
+    # output_path is the last positional arg to the audit CLI.
+    assert audit_argv[-1] == out_path
+
+    tui_argv = captured[1]
+    assert "clean_eeg.annotation_review_cli" in tui_argv
+    assert "--preload-all" in tui_argv

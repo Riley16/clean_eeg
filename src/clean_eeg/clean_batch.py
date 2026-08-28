@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import subprocess
 import sys
 import time
@@ -156,8 +157,17 @@ def parse_subjects_csv(path: Path) -> list[SubjectRow]:
 def _default_clean_argv_prefix() -> list[str]:
     """The command that runs one subject. Uses ``python -m`` so the
     wrapper works in any env where ``clean_eeg`` is importable, without
-    depending on the ``clean-subject-eeg`` console script being on PATH."""
-    return [sys.executable, "-m", "clean_eeg.clean_subject_eeg"]
+    depending on the ``clean-subject-eeg`` console script being on PATH.
+
+    Forwards ``--no-launch-review`` so the per-subject cleaner does NOT
+    auto-launch its end-of-run audit + TUI. Batch mode aggregates the
+    review phase into a single post-batch pass (see :func:`run_review_phase`)
+    so the operator can complete every clean first, then work through
+    every subject's review back-to-back without being interrupted mid-
+    batch.
+    """
+    return [sys.executable, "-m", "clean_eeg.clean_subject_eeg",
+            "--no-launch-review"]
 
 
 def clean_one_subject(row: SubjectRow, *, extra_argv: list[str] | None = None,
@@ -322,6 +332,106 @@ def run_batch(rows: list[SubjectRow], *,
     return outcomes
 
 
+def run_review_phase(outcomes: list[SubjectOutcome]) -> None:
+    """Post-batch pass: for each successfully-cleaned subject, run the
+    audit + launch the annotation-review TUI. Runs sequentially so the
+    operator handles one subject at a time. Skipped in headless
+    environments (no TTY) with a per-subject hint for manual re-run.
+
+    Subjects that failed to clean are skipped (they have no cleaned
+    output to review). Errors in audit/TUI are printed and the loop
+    continues -- no single subject aborts the whole review phase.
+    """
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(f"\n[!] Skipping post-batch audit + review-TUI phase — no TTY.",
+              flush=True)
+        print(f"    Re-run per subject manually, e.g.:")
+        for o in outcomes:
+            if o.succeeded:
+                print(f"      audit-subject-eeg {o.output_path}  &&  "
+                      f"annotation-review-eeg --subject-dir "
+                      f"{os.path.dirname(o.output_path.rstrip('/'))} "
+                      f"--subfolder {os.path.basename(o.output_path.rstrip('/'))} "
+                      f"--preload-all")
+        return
+
+    reviewable = [o for o in outcomes if o.succeeded]
+    n_skipped = len(outcomes) - len(reviewable)
+    if not reviewable:
+        print(f"\n[review-phase] No successfully-cleaned subjects to review.",
+              flush=True)
+        return
+
+    print(f"\n{'=' * 72}", flush=True)
+    print(f"[review-phase] audit + TUI for {len(reviewable)} subject(s) "
+          f"({n_skipped} skipped due to clean failure)", flush=True)
+    print(f"{'=' * 72}", flush=True)
+
+    for i, o in enumerate(reviewable, 1):
+        print(f"\n{'-' * 72}", flush=True)
+        print(f"[review-phase {i}/{len(reviewable)}] {o.subject_code}  "
+              f"({o.output_path})", flush=True)
+        print(f"{'-' * 72}", flush=True)
+
+        # ---- audit (subprocess so failures don't taint the batch process).
+        # Same flag choices as the single-subject auto-launch (see
+        # clean_subject_eeg._run_audit_and_launch_review):
+        #   --no-notebook            skip ~10 s ipynb/html render
+        #   --hide-annotation-flags  TUI shows every annotation
+        #   -v                       show every check status, not just
+        #                            fails -- operator wants to confirm
+        #                            header_phi_residue etc. passed
+        #   --print-edf-header       dump unique patient_id / startdate
+        #                            so operator visually verifies the
+        #                            header was cleaned + dates anchored
+        try:
+            audit_argv_prefix = _default_audit_argv_prefix() + [
+                "--no-notebook", "--hide-annotation-flags",
+                "-v", "--print-edf-header", "--print-edf-signal-header"]
+            audit_rc, _elapsed, _err = audit_one_subject(
+                o.output_path,
+                argv_prefix=audit_argv_prefix,
+                stream_output=True)
+            if audit_rc != 0:
+                print(f"[!] audit for {o.subject_code} exited {audit_rc}; "
+                      f"continuing to TUI anyway.", flush=True)
+        except Exception as e:
+            print(f"[!] audit for {o.subject_code} failed ({type(e).__name__}"
+                  f": {e}); continuing to TUI anyway.", flush=True)
+
+        # ---- TUI (subprocess inherits stdin/stdout so the terminal
+        # actually reaches the reviewer). Preflight expects
+        # <subject_dir>/<subfolder>/deidentify.json; the output_path IS
+        # that inner dir, so subject_dir = its parent.
+        out_norm = o.output_path.rstrip("/")
+        subject_dir = os.path.dirname(out_norm) or "."
+        subfolder = os.path.basename(out_norm)
+        tui_argv = [sys.executable, "-m", "clean_eeg.annotation_review_cli",
+                    "--subject-dir", subject_dir,
+                    "--subfolder", subfolder,
+                    "--preload-all"]
+        try:
+            proc = subprocess.run(tui_argv)
+            if proc.returncode != 0:
+                print(f"[!] TUI for {o.subject_code} exited "
+                      f"{proc.returncode}. Re-run manually with: "
+                      f"{' '.join(tui_argv)}", flush=True)
+        except KeyboardInterrupt:
+            # Ctrl-C at the batch-loop level (as opposed to inside the
+            # TUI, which the TUI intercepts) means the operator wants
+            # to bail on the whole review phase.
+            print(f"\n[review-phase] aborted by operator at "
+                  f"{o.subject_code}. Remaining subjects can be reviewed "
+                  f"later per-subject.", flush=True)
+            return
+        except Exception as e:
+            print(f"[!] TUI launch failed for {o.subject_code} "
+                  f"({type(e).__name__}: {e}). Re-run manually with: "
+                  f"{' '.join(tui_argv)}", flush=True)
+
+    print(f"\n[review-phase] complete.", flush=True)
+
+
 def _print_summary(outcomes: list[SubjectOutcome]) -> None:
     n_ok = sum(1 for o in outcomes if o.succeeded)
     n_fail = len(outcomes) - n_ok
@@ -395,6 +505,18 @@ def _build_parser() -> argparse.ArgumentParser:
                          "audit-subject-eeg against the output_path. "
                          "Audit failures roll up into the subject's "
                          "outcome and count against the batch exit code."))
+    p.add_argument("--no-review-after-batch", "--no_review_after_batch",
+                   dest="no_review_after_batch", action="store_true",
+                   help=("Suppress the post-batch review phase (default: "
+                         "on). Normally, after every subject has finished "
+                         "cleaning, the batch iterates successfully-"
+                         "cleaned subjects one at a time running "
+                         "audit-subject-eeg then launching the "
+                         "annotation-review TUI. Skipped automatically "
+                         "when stdin/stdout aren't TTYs (nohup, cron, "
+                         "SSH-without-PTY); this flag lets you also "
+                         "suppress it interactively (e.g. if you want to "
+                         "hand the reviews off to a colleague later)."))
     return p
 
 
@@ -440,6 +562,10 @@ def main(argv: list[str] | None = None) -> int:
         stream_output=not args.quiet_child_output,
         audit_after_clean=args.audit_after_clean)
     _print_summary(outcomes)
+
+    if not args.no_review_after_batch:
+        run_review_phase(outcomes)
+
     return 0 if all(o.succeeded for o in outcomes) else 1
 
 

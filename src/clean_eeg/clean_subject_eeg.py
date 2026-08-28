@@ -2,6 +2,8 @@ import random
 import re
 import os
 import shutil
+import subprocess
+import sys
 import traceback
 import numpy as np
 import pyedflib
@@ -324,6 +326,7 @@ def clean_subject_edf_files(
     quiet_gap_check: bool = False,
     skip_if_already_cleaned: bool = False,
     fail_on_name_mismatch: bool = False,
+    launch_review: bool = False,
 ):
     if approve_confirmations is None:
         approve_confirmations = set()
@@ -686,6 +689,13 @@ def clean_subject_edf_files(
             "transfer-subject-eeg on this subject.\n"
         )
 
+    # Optionally launch audit + annotation-review TUI before the transfer
+    # prompt. Skipped by default so programmatic callers (tests, batch
+    # subprocesses) don't have a TUI pop up mid-flow -- the interactive
+    # CLI's main() opts in.
+    if launch_review:
+        _run_audit_and_launch_review(output_path)
+
     _prompt_ready_to_transfer(output_path, auto_response=auto_transfer_response)
 
 
@@ -759,6 +769,103 @@ def _print_review_block(events: list) -> None:
         for e in trunc:
             print(f"    {e.file}: {e.details.get('message')}")
     print("===========================\n")
+
+
+def _run_audit_and_launch_review(output_path: str) -> None:
+    """After a successful clean, run ``audit-subject-eeg`` and launch
+    the annotation-review TUI. Both are safe to invoke against an
+    already-audited/reviewed dir (idempotent), so re-runs just short-
+    circuit.
+
+    Skipped silently when stdin isn't a TTY -- the TUI cannot function
+    without a terminal, and callers running under nohup / cron / SSH-
+    without-PTY would see a hang or EOFError.
+
+    Both stages run as subprocesses so:
+      * The audit output is identical to what the operator would see
+        from a direct ``audit-subject-eeg`` invocation (critical
+        banner, failed-file header dumps, per-check summary, etc.) --
+        the previous in-process audit call skipped several rendering
+        blocks and hid header issues.
+      * The TUI's prompt_toolkit stack doesn't get imported into every
+        clean run.
+
+    ``--hide-annotation-flags`` is passed to the audit so the phi-scan
+    matches block is suppressed -- the TUI shows every annotation
+    directly, so listing flagged ones in the audit output is redundant.
+    Re-running ``audit-subject-eeg`` after the TUI (without that flag)
+    is what closes the loop with the ✓ review-complete banner.
+
+    Failures in either stage are surfaced but do NOT abort the caller:
+    the operator can always re-run audit-subject-eeg / annotation-
+    review-eeg by hand against the same output dir.
+    """
+    output_path_norm = output_path.rstrip("/")
+    subject_dir = os.path.dirname(output_path_norm) or "."
+    subfolder = os.path.basename(output_path_norm)
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(f"\n[!] Skipping auto-audit + review-TUI launch — no TTY. "
+              f"Run manually:\n"
+              f"    audit-subject-eeg {output_path}\n"
+              f"    annotation-review-eeg --subject-dir "
+              f"{subject_dir} --subfolder {subfolder} --preload-all")
+        return
+
+    # ---- Audit -------------------------------------------------------
+    # Subprocess to audit-subject-eeg for parity with what the operator
+    # sees when running it directly, plus a few flags tuned for the
+    # end-of-clean context:
+    #
+    #   --no-notebook            skip ~10 s ipynb/html render (operator
+    #                            can invoke a full audit later).
+    #   --hide-annotation-flags  the TUI is about to surface every
+    #                            annotation, so listing phi-scan matches
+    #                            here is redundant.
+    #   -v                       show every check status (not just
+    #                            failures/warnings). After a fresh
+    #                            clean the operator wants to confirm
+    #                            header_phi_residue etc. actually PASSED
+    #                            -- default rendering hides passes.
+    #   --print-edf-header       dump every free-text main-header field
+    #                            (patient_id, recording_id, startdate,
+    #                            starttime) grouped by unique value, so
+    #                            the operator visually confirms header
+    #                            PHI was cleaned and dates were anchored.
+    #   --print-edf-signal-header dump signal-header signatures (channel
+    #                            labels grouped by unique signature) so
+    #                            operator can spot PHI leaks in channel
+    #                            labels / transducer / prefilter strings.
+    print(f"\n[auto] Running audit on {output_path} ...")
+    audit_argv = [sys.executable, "-m", "clean_eeg.audit.cli",
+                  "--no-notebook", "--hide-annotation-flags",
+                  "-v", "--print-edf-header", "--print-edf-signal-header",
+                  output_path]
+    try:
+        subprocess.run(audit_argv, check=False)
+    except Exception as e:
+        print(f"[!] Auto-audit failed ({type(e).__name__}: {e}). "
+              f"Continuing to TUI launch. Re-run manually with: "
+              f"audit-subject-eeg {output_path}")
+
+    # ---- TUI ---------------------------------------------------------
+    # The TUI's preflight expects <subject_dir>/<subfolder>/deidentify.json;
+    # output_path is where the manifest was just written, so
+    # subject_dir=parent(output_path), subfolder=basename(output_path).
+    print(f"\n[auto] Launching annotation review TUI. Quit with 'q' when "
+          f"done -- the transfer prompt will fire next.")
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "clean_eeg.annotation_review_cli",
+             "--subject-dir", subject_dir,
+             "--subfolder", subfolder,
+             "--preload-all"],
+            check=False,
+        )
+    except Exception as e:
+        print(f"[!] TUI launch failed ({type(e).__name__}: {e}). "
+              f"Re-run manually: annotation-review-eeg --subject-dir "
+              f"{subject_dir} --subfolder {subfolder} --preload-all")
 
 
 def _prompt_ready_to_transfer(output_path: str,
@@ -1497,6 +1604,18 @@ def get_clean_eeg_cli_arguments():
                              "sessions of the same subject) — gaps are the pipeline's "
                              "primary signal for missing files, so silencing them "
                              "opens a real hole in the transfer-integrity check.")
+    parser.add_argument("--no-launch-review", "--no_launch_review",
+                        dest="no_launch_review", action="store_true",
+                        help="Suppress the end-of-cleaning auto-audit + "
+                             "annotation-review-TUI launch. Default is to run "
+                             "audit-subject-eeg + annotation-review-eeg "
+                             "automatically after a successful clean (only "
+                             "when stdin/stdout are TTYs -- headless "
+                             "invocations always skip). Batch runs "
+                             "(clean-batch-eeg) forward this flag to every "
+                             "per-subject subprocess so the per-subject "
+                             "cleanings don't stop mid-batch waiting for a "
+                             "reviewer.")
 
     args = parser.parse_args()
 
@@ -1641,6 +1760,11 @@ if __name__ == "__main__":
             quiet_gap_check=args.quiet_gap_check,
             skip_if_already_cleaned=args.skip_if_already_cleaned,
             fail_on_name_mismatch=args.fail_on_name_mismatch,
+            # Interactive CLI opts into the end-of-run TUI by default;
+            # --no-launch-review disables. The helper itself no-ops when
+            # stdin/stdout aren't TTYs, so SSH-without-PTY / nohup / cron
+            # invocations are safe.
+            launch_review=not args.no_launch_review,
         )
 
     except Exception:
