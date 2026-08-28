@@ -22,6 +22,9 @@ from clean_eeg.deidentify_manifest import (
     write_manifest,
 )
 from clean_eeg.load_eeg import load_edf, write_edf_pyedflib
+from clean_eeg.original_annotations import (
+    save_raw_annotations as _save_original_annotations,
+)
 from clean_eeg.log import logged_input, setup_logger, get_logger, close_logger
 from clean_eeg.modify_edf_inplace import (
     update_edf_header_inplace,
@@ -495,6 +498,17 @@ def clean_subject_edf_files(
             # deidentify_edf does not mutate signals (and no longer deep-copies
             # them), so the same array objects remain valid across the call.
             orig_signals = edf['signals'] if filename in audit_filenames else None
+
+            # Dump the RAW (pre-Presidio) annotations to a sibling
+            # directory so operators can audit what the pipeline actually
+            # touched without reasoning backwards from the redacted output.
+            # Contains PHI -- the transfer layer excludes this sibling
+            # dir explicitly (see clean_eeg.transfer.build_transfer_plan
+            # + preflight assertion in clean_eeg.original_annotations).
+            with bench.step("save_original_annotations", file=filename):
+                _save_original_annotations(output_path,
+                                            os.path.basename(filename),
+                                            edf['annotations'])
 
             with bench.step("deidentify_edf", file=filename):
                 edf = deidentify_edf(

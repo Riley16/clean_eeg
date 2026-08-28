@@ -468,11 +468,19 @@ def test_phi_safety_clean_files_never_get_excluded_when_no_failures(
     )
     assert hard == []
     assert results[0].succeeded
-    # Only quarantine/ exclude is allowed (built into build_transfer_plan)
+    # Only the built-in excludes are allowed (built into build_transfer_plan):
+    #  - quarantine/  (partial-run leftover files)
+    #  - *_original_annotations/  (raw pre-Presidio annotation dumps that
+    #    live at a sibling of the transfer source; belt-and-suspenders
+    #    against a refactor that changes the source path)
+    _BUILTIN_EXCLUDES = {
+        "--exclude=quarantine/",
+        "--exclude=*_original_annotations/",
+    }
     for argv in captured_argvs:
         per_file_excludes = [
             a for a in argv
-            if a.startswith("--exclude=") and a != "--exclude=quarantine/"
+            if a.startswith("--exclude=") and a not in _BUILTIN_EXCLUDES
         ]
         assert per_file_excludes == [], (
             f"clean subject leaked an --exclude=<name>: {per_file_excludes}")

@@ -253,9 +253,14 @@ def test_transfer_plan_rsync_no_exclusions_when_no_failed_files(tmp_path):
         use_rsync=True, remote_dir_override="/tmp/target",
         excluded_names=None,
     )
-    # Only the built-in quarantine exclusion; no per-file names
+    # Only the built-in exclusions (quarantine + the PHI-carrying
+    # raw-annotations sibling); no per-file failed-file names.
+    _BUILTIN_EXCLUDES = {
+        "--exclude=quarantine/",
+        "--exclude=*_original_annotations/",
+    }
     per_file = [a for a in plan.upload_argv
-                if a.startswith("--exclude=") and a != "--exclude=quarantine/"]
+                if a.startswith("--exclude=") and a not in _BUILTIN_EXCLUDES]
     assert per_file == [], per_file
 
 
@@ -505,3 +510,153 @@ def test_transfer_subject_background_flag_launches_detached(tmp_path,
     assert len(bg_calls) == 1
     assert plan.background_pid == 99999
     assert plan.background_log == out / "transfer.log"
+
+
+# ---------- raw-annotations dump: exclusion + defensive assertion ----------
+
+
+def test_rsync_argv_excludes_original_annotations_sibling(tmp_path):
+    """The raw-annotations dump lives at a SIBLING of the transfer
+    source (<subject>/clinical_eeg_original_annotations/). Rsync's
+    source is <subject>/clinical_eeg/, so the sibling is already
+    outside the sync scope structurally. The explicit --exclude flag
+    is belt-and-suspenders against a refactor that changes the source
+    path to the subject root -- verify the flag is emitted."""
+    out = _make_subject_dir(tmp_path)
+    plan = build_transfer_plan(
+        out, subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        ssh_user="testuser", use_rsync=True,
+        remote_dir_override="/tmp/e2e",
+    )
+    assert plan.transport == "rsync"
+    # Look for the wildcard exclude that catches any '*_original_annotations'
+    # directory at the top level of a hypothetical broader source.
+    exclude_flags = [a for a in plan.upload_argv if a.startswith("--exclude=")]
+    assert any("_original_annotations" in f for f in exclude_flags), (
+        f"rsync argv missing --exclude for original-annotations sibling: "
+        f"{exclude_flags}"
+    )
+
+
+def test_preflight_fails_when_raw_annotations_dump_inside_source(tmp_path):
+    """Defensive: if the raw-annotations dump ever lands INSIDE the
+    transfer source (via bad refactor / misplaced write / etc.),
+    preflight must fail LOUDLY. Simulate by creating the sibling
+    directory inside the transfer source rather than beside it."""
+    out = _make_subject_dir(tmp_path)
+    # Simulate: raw-annotations dump misplaced INSIDE the transfer
+    # source instead of at its sibling.
+    bad_dir = out / "clinical_eeg_original_annotations"
+    bad_dir.mkdir()
+    (bad_dir / "leak.json").write_text('{"text": "PHI here"}')
+
+    result = preflight_deidentified_output(out)
+    assert not result.passed, (
+        f"preflight must fail when raw-annotations dump is inside "
+        f"transfer source; got failures={result.failures}"
+    )
+    assert any("raw-annotations dump found INSIDE" in f
+                for f in result.failures), (
+        f"expected specific failure message; got {result.failures}"
+    )
+
+
+def test_preflight_passes_when_raw_annotations_dump_is_sibling(tmp_path):
+    """Positive control: raw-annotations dump BESIDE (not inside)
+    the transfer source is the intended layout -- preflight must
+    pass. Guards against the assertion being too aggressive."""
+    from clean_eeg.original_annotations import sibling_dir_for
+    out = _make_subject_dir(tmp_path)
+    # Create the sibling as the pipeline would.
+    sibling = sibling_dir_for(out)
+    sibling.mkdir()
+    (sibling / "raw.json").write_text('{"text": "PHI here"}')
+
+    result = preflight_deidentified_output(out)
+    assert result.passed, (
+        f"preflight must pass when raw-annotations dump is a proper "
+        f"sibling; got failures={result.failures}"
+    )
+
+
+# ---------- ssh-agent hint ----------
+
+
+def test_ssh_agent_check_prints_hint_when_no_keys_loaded(monkeypatch, capsys,
+                                                          tmp_path):
+    """When `ssh-add -l` exits 1 (no keys / no agent), transfer_subject
+    must print the ssh-agent setup hint and continue (non-fatal). Bulk
+    transfers otherwise prompt for the passphrase repeatedly."""
+    import clean_eeg.transfer as _tr
+
+    class _FakeProc:
+        returncode = 1
+        stdout = ""
+        stderr = "The agent has no identities.\n"
+
+    def _fake_run(argv, **kw):
+        if argv[:2] == ["ssh-add", "-l"]:
+            return _FakeProc()
+        # any OTHER subprocess in transfer_subject (rsync itself) shouldn't
+        # fire in dry_run mode, but stub just in case.
+        raise AssertionError(f"unexpected subprocess call: {argv}")
+
+    out = _make_subject_dir(tmp_path)
+    monkeypatch.setattr(_tr.subprocess, "run", _fake_run)
+
+    plan = _tr.transfer_subject(out, ssh_user="testuser", dry_run=True,
+                                 remote_dir_override="/tmp/dry")
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "ssh-agent has no keys loaded" in combined
+    assert "eval $(ssh-agent)" in combined
+    assert "ssh-add" in combined
+    # Non-fatal: plan was still returned.
+    assert plan is not None
+
+
+def test_ssh_agent_check_silent_when_keys_loaded(monkeypatch, capsys, tmp_path):
+    """Positive control: `ssh-add -l` exit 0 means keys are loaded;
+    the hint must NOT print (silent OK). Regression against a hint
+    that spams every invocation regardless of state."""
+    import clean_eeg.transfer as _tr
+
+    class _FakeProc:
+        returncode = 0
+        stdout = "2048 SHA256:abcd... user@host (ED25519)\n"
+        stderr = ""
+
+    def _fake_run(argv, **kw):
+        if argv[:2] == ["ssh-add", "-l"]:
+            return _FakeProc()
+        raise AssertionError(f"unexpected subprocess call: {argv}")
+
+    out = _make_subject_dir(tmp_path)
+    monkeypatch.setattr(_tr.subprocess, "run", _fake_run)
+
+    _tr.transfer_subject(out, ssh_user="testuser", dry_run=True,
+                          remote_dir_override="/tmp/dry")
+    combined = capsys.readouterr().out + capsys.readouterr().err
+    assert "ssh-agent has no keys loaded" not in combined, (
+        f"hint should be silent when keys loaded; got: {combined!r}"
+    )
+
+
+def test_ssh_agent_check_silent_when_ssh_add_missing(monkeypatch, tmp_path):
+    """If `ssh-add` isn't on PATH, don't hint -- we can't confidently
+    say the operator's SSH auth is broken (they might be on a
+    minimal system with different auth). Just proceed silently."""
+    import clean_eeg.transfer as _tr
+
+    def _fake_run(argv, **kw):
+        if argv[:2] == ["ssh-add", "-l"]:
+            raise FileNotFoundError("ssh-add not found")
+        raise AssertionError(f"unexpected subprocess call: {argv}")
+
+    out = _make_subject_dir(tmp_path)
+    monkeypatch.setattr(_tr.subprocess, "run", _fake_run)
+
+    # Must not raise -- silent fallthrough.
+    _tr.transfer_subject(out, ssh_user="testuser", dry_run=True,
+                          remote_dir_override="/tmp/dry")

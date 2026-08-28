@@ -268,6 +268,26 @@ def preflight_deidentified_output(output_path: str | Path,
     # 5. Spot-check hash on one file.
     _spot_check_hash(edfs, manifest, failures)
 
+    # 6. Defensive: the raw pre-Presidio annotation dump (created during
+    # cleaning at <subject>/<subfolder>_original_annotations/, sibling
+    # to output_path) contains PHI and MUST NOT be inside the transfer
+    # source. Under normal operation this dir is a SIBLING of
+    # output_path so it's outside the transfer scope by construction;
+    # this check catches any accidental refactor that puts the raw dump
+    # underneath the transfer source (rename, symlink, misplaced write,
+    # etc.). Fires BEFORE the rsync --exclude belt-and-suspenders
+    # kicks in, so the operator sees the failure loudly instead of
+    # trusting a silent rsync filter.
+    from clean_eeg.original_annotations import sibling_dir_inside
+    offender = sibling_dir_inside(output_path)
+    if offender is not None:
+        failures.append(
+            f"raw-annotations dump found INSIDE transfer source: "
+            f"{offender}. This directory contains PHI and MUST NOT "
+            f"be transferred. Move it out of the transfer source or "
+            f"delete it before rerunning transfer-subject-eeg."
+        )
+
     return PreflightResult(
         passed=not failures,
         failures=failures,
@@ -319,6 +339,15 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
         upload_argv = [
             "rsync", "-avzh", "--partial", "--progress",
             "--exclude=quarantine/",
+            # Belt-and-suspenders: the raw pre-Presidio annotation dump
+            # (clinical_eeg_original_annotations sibling of the transfer
+            # source) contains PHI and MUST NOT ship. It's already OUTSIDE
+            # the transfer source by design, so this --exclude is a defense
+            # against a future refactor that changes the source path to
+            # e.g. the subject root. The preflight assertion in
+            # preflight_deidentified_output catches the same failure mode
+            # at a different layer.
+            "--exclude=*_original_annotations/",
             *(f"--exclude={n}" for n in sorted(excluded_names)),
             f"{output_path}/",
             f"{ssh_user}@{SSH_HOST}:{remote_dir}/",
@@ -486,6 +515,48 @@ def execute_plan_background(plan: TransferPlan, output_path: Path,
     return proc.pid, script_path, log_path
 
 
+def _check_ssh_agent_loaded() -> None:
+    """Warn (non-fatal) if ssh-agent isn't running with any keys loaded.
+
+    Bulk transfers open many SSH connections in sequence. Without
+    ssh-agent, each one prompts for the key passphrase; on a 27-
+    subject batch that's ~54+ prompts. Users have gotten burned by
+    this; the check + hint saves them.
+
+    `ssh-add -l` semantics (per man page):
+      exit 0 -> keys are loaded
+      exit 1 -> agent running but no keys, OR agent not running
+                (message differs but exit code doesn't -- both
+                warrant the same hint)
+      exit 2 -> can't connect to agent
+
+    Non-fatal: some setups use host-based auth, ProxyJump chains, or
+    per-connection ControlPersist and don't need the agent. We print
+    a hint and continue. The transfer will still function if the
+    operator's setup handles auth differently.
+    """
+    import subprocess as _sp
+    try:
+        proc = _sp.run(["ssh-add", "-l"], capture_output=True,
+                        text=True, timeout=5)
+    except (FileNotFoundError, _sp.SubprocessError, OSError):
+        # No ssh-add binary or agent misconfigured -- can't hint
+        # confidently, don't spam.
+        return
+    if proc.returncode == 0:
+        return    # keys loaded -- silent OK
+    # exit 1 or 2 -- agent not usable
+    print(
+        "\n[transfer] hint: ssh-agent has no keys loaded (`ssh-add -l` "
+        f"exit {proc.returncode}). Bulk transfers may prompt for your "
+        "SSH passphrase repeatedly. To load your key once for this "
+        "shell session:\n"
+        "    eval $(ssh-agent)\n"
+        "    ssh-add ~/.ssh/id_ed25519      # enter passphrase once\n"
+        "Then re-run this transfer. Continuing anyway.",
+        flush=True)
+
+
 def transfer_subject(output_path: str | Path, *,
                      ssh_user: str | None = None,
                      dry_run: bool = False,
@@ -529,6 +600,17 @@ def transfer_subject(output_path: str | Path, *,
             "ssh_user is empty — set $USER or pass --user on the "
             "command line."
         )
+
+    # ssh-agent hint: bulk transfers open many SSH connections in
+    # sequence. Without ssh-agent, each one prompts for the key
+    # passphrase -- the operator would enter it hundreds of times.
+    # `ssh-add -l` lists loaded keys; exit-1 means "no keys" or
+    # "agent not running", exit-2 means "can't connect to agent".
+    # Non-fatal warning: the transfer still WORKS without agent, just
+    # painfully, and the check may spuriously fail (e.g. key-less
+    # setups using host-based auth or ProxyJump chains). Print a hint
+    # and continue.
+    _check_ssh_agent_loaded()
 
     plan = build_transfer_plan(
         output_path,
