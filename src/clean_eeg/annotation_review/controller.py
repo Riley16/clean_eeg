@@ -180,7 +180,8 @@ class AnnotationReviewController:
                  whitelist_path: Path | None = None,
                  respect_reviewed_tracker: bool = True,
                  external_prefetch_paths: list[Path] | None = None,
-                 preload_all: bool = False):
+                 preload_all: bool = False,
+                 hide_whitelisted: bool = True):
         """``external_prefetch_paths``: optional additional EDF paths
         (e.g. the FIRST N files of the NEXT subject) to warm the
         prefetch queue after this subject's own files are exhausted.
@@ -201,6 +202,13 @@ class AnnotationReviewController:
         self.subfolder = subfolder
         self.whitelist_path = whitelist_path
         self.respect_reviewed_tracker = respect_reviewed_tracker
+        # hide_whitelisted=True (default): whitelisted annotations are
+        # removed from the scroll view AND skipped by cursor navigation
+        # -- the operator only sees + interacts with annotations that
+        # actually need review. False: whitelisted annotations stay in
+        # the view greyed out (previous default). Toggled at CLI via
+        # --show-whitelisted.
+        self.hide_whitelisted = hide_whitelisted
 
         self._edfs: list[Path] = preflight_subject_for_review(
             self.subject_dir, subfolder=subfolder)
@@ -466,23 +474,58 @@ class AnnotationReviewController:
 
     # ---- cursor movement ----
 
+    def _visible_indices_in_current_file(self) -> list[int]:
+        """Indices into ``annotations_in_current_file()`` that the
+        cursor is allowed to land on. When ``hide_whitelisted`` is
+        True (default), whitelisted annotations are excluded so the
+        operator's cursor never rests on an invisible line. When
+        False, every annotation index is visible (matches the
+        pre-hide-mode behaviour).
+
+        Falls back to the full range when no annotation would be
+        visible under the filter -- keeps navigation methods
+        well-defined on 100%-whitelisted files (though such files
+        are auto-skipped by --preload-all in practice).
+        """
+        anns = self.annotations_in_current_file()
+        if not self.hide_whitelisted:
+            return list(range(len(anns)))
+        visible = [i for i, a in enumerate(anns)
+                   if not self.is_whitelisted(a)]
+        # Safety: on an all-whitelisted file the operator might still
+        # navigate in (e.g. without --preload-all). Fall back to full
+        # index range so move_cursor / jump_to_end don't lock up.
+        return visible if visible else list(range(len(anns)))
+
     def move_cursor(self, delta: int) -> None:
         """Move the annotation cursor by ``delta`` within the current
-        file. Clamped -- moving past the end doesn't wrap or advance
-        to the next file (the operator uses next_file() explicitly)."""
-        n = len(self.annotations_in_current_file())
-        if n == 0:
+        file's VISIBLE annotations (whitelisted lines are skipped when
+        ``hide_whitelisted`` is True). Clamped -- moving past the end
+        doesn't wrap or advance to the next file."""
+        anns = self.annotations_in_current_file()
+        if not anns:
             self.annotation_cursor = 0
             return
-        self.annotation_cursor = max(0, min(n - 1,
-                                             self.annotation_cursor + delta))
+        visible = self._visible_indices_in_current_file()
+        # Find the visible-slot the cursor is currently on (or nearest
+        # after it if the cursor happens to be on a whitelisted index).
+        current_slot = 0
+        for i, idx in enumerate(visible):
+            if idx >= self.annotation_cursor:
+                current_slot = i
+                break
+        else:
+            current_slot = len(visible) - 1
+        new_slot = max(0, min(len(visible) - 1, current_slot + delta))
+        self.annotation_cursor = visible[new_slot]
 
     def jump_to_start(self) -> None:
-        self.annotation_cursor = 0
+        visible = self._visible_indices_in_current_file()
+        self.annotation_cursor = visible[0] if visible else 0
 
     def jump_to_end(self) -> None:
-        n = len(self.annotations_in_current_file())
-        self.annotation_cursor = max(0, n - 1)
+        visible = self._visible_indices_in_current_file()
+        self.annotation_cursor = visible[-1] if visible else 0
 
     def next_file(self) -> bool:
         """Advance to the next reviewable file. Returns True if the
@@ -510,8 +553,16 @@ class AnnotationReviewController:
         return True
 
     def on_last_annotation_of_file(self) -> bool:
+        """True iff the cursor is on the LAST visible annotation of
+        this file. When hide_whitelisted is True the 'last visible'
+        may be well before the raw last annotation (which could be
+        whitelisted); the 'n'-gate should still fire correctly for
+        the operator's actual view of the file."""
         anns = self.annotations_in_current_file()
-        return bool(anns) and self.annotation_cursor >= len(anns) - 1
+        if not anns:
+            return False
+        visible = self._visible_indices_in_current_file()
+        return bool(visible) and self.annotation_cursor >= visible[-1]
 
     # ---- editing ----
 
@@ -623,17 +674,29 @@ class AnnotationReviewController:
 
     def visible_lines(self, context: int = 15) -> list[DisplayLine]:
         """Return the annotations to render for a git-log-style scroll
-        view: ``context`` lines below the current one (plus the
-        current line itself). Callers filter or grey-out whitelisted
-        entries based on operator preference.
+        view: ``context`` VISIBLE lines below the current cursor (plus
+        the current line).
+
+        When ``hide_whitelisted`` is True (default), whitelisted
+        annotations are excluded from the returned list -- the
+        operator only sees annotations that need review. When False,
+        every annotation is included; the renderer greys out
+        whitelisted ones (previous default behaviour).
         """
         anns = self.annotations_in_current_file()
         if not anns:
             return []
-        end = min(len(anns), self.annotation_cursor + context + 1)
+        # Walk forward from the cursor collecting up to context+1
+        # VISIBLE lines. Whitelisted lines are skipped when
+        # hide_whitelisted is True, so 'context' means what the
+        # operator actually sees rather than raw-index distance.
         out: list[DisplayLine] = []
-        for i in range(self.annotation_cursor, end):
+        want = context + 1
+        for i in range(self.annotation_cursor, len(anns)):
             a = anns[i]
+            is_whitelisted = self.is_whitelisted(a)
+            if self.hide_whitelisted and is_whitelisted:
+                continue
             key = (self.file_cursor, i)
             pending = self._pending.get(key)
             display_text = pending.new_text if pending is not None else a.text
@@ -643,10 +706,12 @@ class AnnotationReviewController:
                 file_path=self.current_file(),
                 annotation=a,
                 is_current=(i == self.annotation_cursor),
-                is_whitelisted=self.is_whitelisted(a),
+                is_whitelisted=is_whitelisted,
                 is_edited=pending is not None,
                 display_text=display_text,
             ))
+            if len(out) >= want:
+                break
         return out
 
     # ---- reviewed-file tracker ----

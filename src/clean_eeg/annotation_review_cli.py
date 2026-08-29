@@ -144,6 +144,13 @@ def main(argv: list[str] | None = None) -> int:
                         "the operator reads faster than files load "
                         "lazily -- turns per-file wait into one "
                         "up-front pause.")
+    p.add_argument("--show-whitelisted", action="store_true",
+                   help="Keep whitelisted annotations visible in the "
+                        "scroll view (greyed out, marked with '~'). "
+                        "Default hides them entirely -- the operator "
+                        "only sees + can navigate to annotations that "
+                        "need review. Use this flag when you want to "
+                        "audit what the whitelist is silencing.")
     p.add_argument("--rerun-annot-review", action="store_true",
                    help="Reset this subject's review state before "
                         "launching: deletes the reviewed-files tracker "
@@ -201,7 +208,8 @@ def main(argv: list[str] | None = None) -> int:
             subfolder=args.subfolder,
             whitelist_path=resolved_wl_path,
             respect_reviewed_tracker=not args.include_reviewed,
-            preload_all=args.preload_all)
+            preload_all=args.preload_all,
+            hide_whitelisted=not args.show_whitelisted)
     except PreflightFailure as e:
         print(f"[error] {e}", file=sys.stderr)
         return 2

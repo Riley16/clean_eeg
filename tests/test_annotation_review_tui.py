@@ -509,7 +509,8 @@ def test_cli_rerun_annot_review_calls_reset_before_controller(monkeypatch,
 
     class _StubController:
         def __init__(self, subject_dir, *, subfolder=None, whitelist_path=None,
-                      respect_reviewed_tracker=True, preload_all=False):
+                      respect_reviewed_tracker=True, preload_all=False,
+                      **_ignored):
             tracker_exists_at_controller_init["value"] = tracker.exists()
             self.num_files_to_review = 0
             self.num_files = 0
@@ -541,7 +542,8 @@ def test_cli_rerun_annot_review_noop_message_when_nothing_to_reset(
 
     class _StubController:
         def __init__(self, subject_dir, *, subfolder=None, whitelist_path=None,
-                      respect_reviewed_tracker=True, preload_all=False):
+                      respect_reviewed_tracker=True, preload_all=False,
+                      **_ignored):
             self.num_files_to_review = 0
             self.num_files = 0
 
@@ -574,7 +576,8 @@ def test_cli_auto_locates_standard_whitelist_when_not_specified(
 
     class _StubController:
         def __init__(self, subject_dir, *, subfolder=None, whitelist_path=None,
-                      respect_reviewed_tracker=True, preload_all=False):
+                      respect_reviewed_tracker=True, preload_all=False,
+                      **_ignored):
             captured["whitelist_path"] = whitelist_path
             self.num_files_to_review = 0    # short-circuits main() early
             self.num_files = 0
@@ -607,7 +610,8 @@ def test_cli_no_whitelist_flag_disables_auto_load(tmp_path, monkeypatch):
 
     class _StubController:
         def __init__(self, subject_dir, *, subfolder=None, whitelist_path=None,
-                      respect_reviewed_tracker=True, preload_all=False):
+                      respect_reviewed_tracker=True, preload_all=False,
+                      **_ignored):
             captured["whitelist_path"] = whitelist_path
             self.num_files_to_review = 0
             self.num_files = 0

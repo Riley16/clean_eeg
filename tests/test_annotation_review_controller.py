@@ -576,6 +576,103 @@ def test_mark_all_reviewable_files_reviewed_captures_pending_edit_counts(
 # git-log-style visible_lines rendering
 # ---------------------------------------------------------------------------
 
+def test_visible_lines_default_hides_whitelisted_annotations(tmp_path):
+    """Default hide_whitelisted=True: whitelisted annotations are
+    DROPPED from the scroll view. The operator only sees + interacts
+    with lines that need review. Motivated by the actual review
+    workflow: without hiding, every `+numeric.000`, `*Mark`,
+    `RhythmicBurst *` etc. shows greyed out and clutters the view."""
+    wl_path = _write_wl(tmp_path, {"A": ["boilerplate"]})
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["boilerplate", "real event 1", "boilerplate",
+                   "real event 2", "boilerplate"]})
+    c = AnnotationReviewController(subj, whitelist_path=wl_path)   # hide=True default
+    lines = c.visible_lines(context=10)
+    texts = [l.annotation.text for l in lines]
+    assert texts == ["real event 1", "real event 2"], (
+        f"whitelisted 'boilerplate' should be hidden by default; "
+        f"got {texts}"
+    )
+
+
+def test_visible_lines_show_whitelisted_keeps_them_visible(tmp_path):
+    """hide_whitelisted=False (--show-whitelisted opt-in) restores the
+    pre-fix behaviour: whitelisted lines stay in the scroll view with
+    is_whitelisted=True so the renderer can grey them out."""
+    wl_path = _write_wl(tmp_path, {"A": ["boilerplate"]})
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["boilerplate", "real event"]})
+    c = AnnotationReviewController(subj, whitelist_path=wl_path,
+                                    hide_whitelisted=False)
+    lines = c.visible_lines(context=5)
+    texts = [l.annotation.text for l in lines]
+    assert texts == ["boilerplate", "real event"]
+    assert lines[0].is_whitelisted is True
+    assert lines[1].is_whitelisted is False
+
+
+def test_move_cursor_skips_whitelisted_when_hidden(tmp_path):
+    """Cursor navigation must skip whitelisted annotations when they're
+    hidden -- otherwise the cursor could land on an invisible line and
+    the operator sees nothing selected."""
+    wl_path = _write_wl(tmp_path, {"A": ["skip"]})
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["real0", "skip", "skip", "real1", "skip", "real2"]})
+    c = AnnotationReviewController(subj, whitelist_path=wl_path)   # hide=True
+    assert c.annotation_cursor == 0    # starts at real0
+
+    c.move_cursor(+1)
+    assert c.annotation_cursor == 3, (
+        f"move_cursor(+1) should skip whitelisted 'skip' entries and "
+        f"land on real1 (idx 3); got {c.annotation_cursor}"
+    )
+
+    c.move_cursor(+1)
+    assert c.annotation_cursor == 5    # real2
+
+    # Moving back skips whitelisted the other direction too.
+    c.move_cursor(-1)
+    assert c.annotation_cursor == 3
+    c.move_cursor(-1)
+    assert c.annotation_cursor == 0
+
+
+def test_jump_to_end_lands_on_last_visible_annotation(tmp_path):
+    """`G` (jump-to-end) must land on the last VISIBLE annotation, not
+    the raw last annotation. Otherwise on a file ending with
+    whitelisted lines the operator would jump to an invisible cursor
+    and `on_last_annotation_of_file` would fire on a line they can't
+    see."""
+    wl_path = _write_wl(tmp_path, {"A": ["boilerplate"]})
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["real", "boilerplate", "boilerplate"]})
+    c = AnnotationReviewController(subj, whitelist_path=wl_path)
+    c.jump_to_end()
+    assert c.annotation_cursor == 0, (
+        f"jump_to_end should land on 'real' (idx 0), the only visible "
+        f"annotation; got {c.annotation_cursor}")
+
+
+def test_on_last_annotation_of_file_uses_visible_indices(tmp_path):
+    """The n-gate ('cannot advance until you scroll to last annotation')
+    must key off the last VISIBLE annotation, not the raw last. Under
+    hide_whitelisted=True, when the last non-whitelisted line is at
+    index K, the operator has completed review as soon as their cursor
+    reaches K -- even if there are whitelisted lines at K+1, K+2."""
+    wl_path = _write_wl(tmp_path, {"A": ["boilerplate"]})
+    subj = _make_subject(tmp_path, "R1755A", {
+        "a.edf": ["real0", "real1", "boilerplate", "boilerplate"]})
+    c = AnnotationReviewController(subj, whitelist_path=wl_path)
+
+    # At cursor=0, not on last visible.
+    assert c.on_last_annotation_of_file() is False
+    # Move to real1 (idx 1) -- last VISIBLE annotation. n-gate satisfied.
+    c.move_cursor(+1)
+    assert c.annotation_cursor == 1
+    assert c.on_last_annotation_of_file() is True, (
+        "cursor is on the last visible annotation -- n-gate must fire")
+
+
 def test_visible_lines_returns_current_plus_context_below(tmp_path):
     subj = _make_subject(tmp_path, "R1755A", {
         "a.edf": [f"ann{i}" for i in range(10)],
@@ -593,11 +690,17 @@ def test_visible_lines_marks_whitelisted_and_edited(tmp_path):
     """Positive regression: whitelisted + edited flags are surfaced
     so the TUI can render them distinctly (grey + strikethrough,
     say). Without these the operator can't tell what state each row
-    is in from the terminal."""
+    is in from the terminal.
+
+    Exercised under hide_whitelisted=False (the --show-whitelisted
+    CLI opt-in) since the default is to hide whitelisted lines
+    entirely. The flags are still populated in that mode -- the
+    renderer just doesn't need them when the lines are hidden."""
     subj = _make_subject(tmp_path, "R1755A", {
         "a.edf": ["PAT REF EEG", "seizure", "notes"]})
     wl_path = _write_wl(tmp_path, {"A": ["PAT REF EEG"]})
-    c = AnnotationReviewController(subj, whitelist_path=wl_path)
+    c = AnnotationReviewController(subj, whitelist_path=wl_path,
+                                    hide_whitelisted=False)
     c.move_cursor(+1)  # cursor at seizure
     c.queue_edit("SEIZURE")   # edit current
     lines = c.visible_lines(context=5)
