@@ -120,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         args.output_dir,
         subject_code=result.manifest["subject_code"],
         site_incoming_folder=result.manifest["site_incoming_folder"],
-        ssh_user=args.user or _default_user(),
+        ssh_user=args.user,
         ssh_host=args.ssh_host,
         remote_base=args.remote_base,
         remote_dir_override=per_subject_override,

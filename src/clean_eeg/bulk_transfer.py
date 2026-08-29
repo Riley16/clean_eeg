@@ -430,7 +430,7 @@ def _run_rsync_with_bwlimit_monitor(argv: list[str],
 
 
 def _run_subject_rsync(plan: SubjectPlan,
-                       ssh_user: str,
+                       ssh_user: str | None,
                        bwlimit_policy: "BwlimitPolicy",
                        rsync_timeout_s: int,
                        remote_dir_override: str | None,
@@ -489,7 +489,7 @@ def _run_subject_rsync(plan: SubjectPlan,
 
 
 def transfer_one_subject_with_retry(plan: SubjectPlan, *,
-                                    ssh_user: str,
+                                    ssh_user: str | None,
                                     bwlimit_policy: BwlimitPolicy,
                                     max_retries: int,
                                     rsync_timeout_s: int,
@@ -608,7 +608,7 @@ def _filter_plans_by_subject(plans: list[SubjectPlan],
 
 def run_bulk_transfer(subject_dirs: list[Path],
                       *,
-                      ssh_user: str,
+                      ssh_user: str | None,
                       bwlimit_policy: BwlimitPolicy,
                       parallel: int = DEFAULT_PARALLEL,
                       max_retries: int = DEFAULT_MAX_RETRIES,
@@ -671,25 +671,30 @@ def run_bulk_transfer(subject_dirs: list[Path],
         # guard rejects (None ssh_host AND None remote_dir_override).
         assert ssh_host is not None
         effective_host = ssh_host
+        # Same user-prefix rule as the plan composer: only prepend
+        # `user@` when the operator explicitly passed --user. Otherwise
+        # let ssh_config's User directive apply.
+        reach_target = (f"{ssh_user}@{effective_host}"
+                        if ssh_user else effective_host)
         reach_argv = [
             "ssh", "-o", "ConnectTimeout=10",
             "-o", "BatchMode=yes",  # never prompt for a password
-            f"{ssh_user}@{effective_host}", ":"]
+            reach_target, ":"]
         print(f"[transfer] checking reachability of "
-              f"{ssh_user}@{effective_host} (10s timeout)...", flush=True)
+              f"{reach_target} (10s timeout)...", flush=True)
         try:
             reach = subprocess.run(reach_argv, capture_output=True,
                                     text=True, timeout=15)
         except (subprocess.TimeoutExpired, OSError) as e:
             print(f"[transfer] ABORT: could not reach "
-                  f"{ssh_user}@{effective_host} "
+                  f"{reach_target} "
                   f"({type(e).__name__}: {e}). "
                   f"Fix the endpoint or pass --ssh-host <alias>.",
                   file=sys.stderr, flush=True)
             return [], []
         if reach.returncode != 0:
             err_tail = (reach.stderr or reach.stdout or "").strip()
-            print(f"[transfer] ABORT: ssh {ssh_user}@{effective_host} "
+            print(f"[transfer] ABORT: ssh {reach_target} "
                   f"exited {reach.returncode}. Fix credentials/tunnel "
                   f"and re-run.\n    stderr: {err_tail}",
                   file=sys.stderr, flush=True)
@@ -1101,7 +1106,13 @@ def main(argv: list[str] | None = None) -> int:
 
     results, hard_failures = run_bulk_transfer(
         subject_dirs,
-        ssh_user=args.user or getpass.getuser(),
+        # None -> defer to ssh_config's `User` directive for the given
+        # host alias (or SSH's own default). Prepending `$USER@` would
+        # OVERRIDE the config's User line, which is exactly what broke
+        # multi-user endpoints where the local username differs from
+        # the remote (e.g. rxd873 on Jefferson connecting as `dasha` on
+        # the Windows tunnel).
+        ssh_user=args.user,
         bwlimit_policy=bwlimit_policy,
         parallel=args.parallel, max_retries=args.max_retries,
         rsync_timeout_s=args.rsync_timeout,

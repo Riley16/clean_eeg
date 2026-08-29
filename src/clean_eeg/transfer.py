@@ -385,7 +385,7 @@ def preflight_deidentified_output(output_path: str | Path,
 
 
 def _build_transfer_plan(output_path: Path, *, subject_code: str,
-                         site_incoming_folder: str, ssh_user: str,
+                         site_incoming_folder: str, ssh_user: str | None,
                          ssh_host: str,
                          use_rsync: bool,
                          remote_dir_override: str | None = None,
@@ -422,10 +422,19 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
         subject_remote_dir = f"{site_parent_dir}/{subject_code}"
         remote_dir = f"{subject_remote_dir}/{SUBJECT_SUBFOLDER}"
 
+    # ssh_user prepended only when the operator explicitly asked for
+    # one. When None, ssh sees just `host` and picks up the User
+    # directive from ~/.ssh/config -- required for endpoints whose
+    # remote user differs from the local $USER (Windows tunnel, shared
+    # accounts, etc.). Prepending would override the config's User.
+    ssh_target = (f"{ssh_user}@{effective_host}"
+                  if ssh_user else effective_host)
+    rsync_target_prefix = f"{ssh_target}:"
+
     # umask 007 → newly-created intermediate dirs are group-rwx. Pre-existing
     # dirs are untouched.
     mkdir_argv = [
-        "ssh", f"{ssh_user}@{effective_host}",
+        "ssh", ssh_target,
         f'umask 007 && mkdir -p {remote_dir}',
     ]
 
@@ -457,7 +466,7 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
             "--exclude=*_original_annotations/",
             *(f"--exclude={n}" for n in sorted(excluded_names)),
             f"{output_path}/",
-            f"{ssh_user}@{effective_host}:{remote_dir}/",
+            f"{rsync_target_prefix}{remote_dir}/",
         ]
         transport = "rsync"
     else:
@@ -481,7 +490,7 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
             *sorted(str(p) for p in output_path.glob("*.edf")
                     if p.name not in excluded_names),
             *existing_sidecars,
-            f"{ssh_user}@{effective_host}:{remote_dir}/",
+            f"{rsync_target_prefix}{remote_dir}/",
         ]
         transport = "scp"
 
@@ -499,7 +508,7 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
         perms_argv: list[str] = []
     else:
         perms_argv = [
-            "ssh", f"{ssh_user}@{effective_host}",
+            "ssh", ssh_target,
             f"chgrp -R --reference={site_parent_dir} {subject_remote_dir}; "
             f"chmod -R g+rwX,o-rwx {subject_remote_dir}",
         ]
@@ -514,7 +523,7 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
 
 
 def build_transfer_plan(output_path: str | Path, *, subject_code: str,
-                        site_incoming_folder: str, ssh_user: str,
+                        site_incoming_folder: str, ssh_user: str | None,
                         ssh_host: str,
                         use_rsync: bool | None = None,
                         remote_dir_override: str | None = None,
@@ -876,13 +885,12 @@ def transfer_subject(output_path: str | Path, *,
     assert result.manifest is not None  # preflight guarantees this
     manifest = result.manifest
 
-    if ssh_user is None:
-        ssh_user = os.environ.get("USER", "")
-    if not ssh_user:
-        raise RuntimeError(
-            "ssh_user is empty — set $USER or pass --user on the "
-            "command line."
-        )
+    # ssh_user None -> defer to ssh_config's User directive (or SSH's
+    # own default). Only set from $USER if the operator explicitly
+    # asked for that fallback via passing the empty string as an
+    # override, which no CLI does today. Prior behaviour of implicitly
+    # using $USER broke endpoints whose remote user differed from the
+    # local login.
 
     # ssh-agent: bulk transfers open many SSH connections in sequence.
     # Without an agent, each prompts for the key passphrase -- on a

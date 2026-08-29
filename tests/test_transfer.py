@@ -814,6 +814,43 @@ def _stub_subprocess_run_for_ssh_agent(monkeypatch, *,
     return call_log
 
 
+def test_transfer_plan_omits_user_prefix_when_ssh_user_none(tmp_path):
+    """When --user isn't passed, the composed SSH target must be just
+    the hostname (no 'user@' prefix), so ssh_config's User directive
+    for the host alias applies. A prior version defaulted to $USER and
+    clobbered the config -- broke every endpoint whose remote user
+    differed from the local login (e.g. Jefferson `rxd873` connecting
+    as `dasha` on a Windows tunnel)."""
+    out = _make_subject_dir(tmp_path)
+    plan = build_transfer_plan(
+        out, subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        ssh_user=None,
+        ssh_host="my-ssh-alias",
+        use_rsync=True,
+        remote_dir_override="/tmp/target")
+    # mkdir_argv: ["ssh", <target>, "..."] -- position 1 is the target.
+    assert plan.mkdir_argv[1] == "my-ssh-alias", plan.mkdir_argv
+    # rsync destination: last token is <target>:<path>/
+    rsync_dest = plan.upload_argv[-1]
+    assert rsync_dest.startswith("my-ssh-alias:"), rsync_dest
+
+
+def test_transfer_plan_prepends_user_when_ssh_user_given(tmp_path):
+    """Positive control: when --user IS passed, the composed target
+    prepends `user@` as before."""
+    out = _make_subject_dir(tmp_path)
+    plan = build_transfer_plan(
+        out, subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        ssh_user="dasha",
+        ssh_host="my-ssh-alias",
+        use_rsync=True,
+        remote_dir_override="/tmp/target")
+    assert plan.mkdir_argv[1] == "dasha@my-ssh-alias", plan.mkdir_argv
+    assert plan.upload_argv[-1].startswith("dasha@my-ssh-alias:")
+
+
 def test_ensure_ssh_agent_reloads_when_agent_has_other_keys_but_not_this_one(
         monkeypatch, capsys, tmp_path):
     """Regression: the agent may have a github key (or similar) loaded
