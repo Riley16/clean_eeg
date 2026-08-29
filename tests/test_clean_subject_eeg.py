@@ -277,6 +277,47 @@ def test_clean_subject_edf_files_w_inconsistent_signal_headers(monkeypatch):
         assert False, 'RuntimeError was not raised for inconsistent signal headers'
 
 
+def test_signal_header_mismatch_auto_approved_via_approve_confirmations(
+        capsys, monkeypatch):
+    """--approve-confirmations signal-header-mismatch bypasses the
+    interactive prompt so batch runs don't hang on multi-montage EMU
+    subjects. Must NOT raise, must NOT prompt, must print a banner."""
+    from clean_eeg.clean_subject_eeg import _check_signal_header_consistency
+    # Two different signal-header signatures.
+    meta = {
+        "a.edf": {"data": {"signal_headers": [
+            {"label": "EEG A1"}, {"label": "EEG A2"}]}},
+        "b.edf": {"data": {"signal_headers": [
+            {"label": "EEG B1"}, {"label": "EEG B2"}, {"label": "EEG B3"}]}},
+    }
+    called = {"input": 0}
+    monkeypatch.setattr("builtins.input",
+                        lambda _: (called.__setitem__("input", called["input"] + 1)
+                                    or "should-not-be-called"))
+    # Should return without raising and without ever calling input().
+    _check_signal_header_consistency(
+        meta, approve_confirmations={"signal-header-mismatch"})
+    assert called["input"] == 0, (
+        "auto-approve must NOT reach the interactive prompt")
+    out = capsys.readouterr().out
+    assert "auto-approved" in out and "signal-header-mismatch" in out
+
+
+def test_signal_header_mismatch_still_prompts_without_approval(monkeypatch):
+    """Regression guard: without the approval bypass, the prompt still
+    fires (so the safety default hasn't silently changed)."""
+    from clean_eeg.clean_subject_eeg import _check_signal_header_consistency
+    meta = {
+        "a.edf": {"data": {"signal_headers": [{"label": "X"}]}},
+        "b.edf": {"data": {"signal_headers": [
+            {"label": "Y"}, {"label": "Z"}]}},
+    }
+    monkeypatch.setattr("builtins.input", lambda _: "no")
+    with pytest.raises(RuntimeError,
+                        match="inconsistent signal headers"):
+        _check_signal_header_consistency(meta, approve_confirmations=set())
+
+
 # --- _check_subject_name_consistency unit tests ---
 
 def _make_edf_meta(filenames_and_names: dict) -> dict:

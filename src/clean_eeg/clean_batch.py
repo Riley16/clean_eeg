@@ -178,17 +178,21 @@ def _default_clean_argv_prefix() -> list[str]:
                                 "Continue?" prompt (large inter-file gaps
                                 trigger a warning + prompt in interactive
                                 mode; batch can't stop for it).
-      --approve-confirmations recording-gaps in-place
+      --approve-confirmations recording-gaps in-place signal-header-mismatch
                                 Auto-approve the in-place de-identification
                                 warning (in-place is the only mode used
-                                for batch runs) and the recording-gaps
+                                for batch runs), the recording-gaps
                                 confirmation (belt + suspenders with
-                                --quiet-gap-check).
+                                --quiet-gap-check), and the multi-montage
+                                signal-header-mismatch prompt (common on
+                                EMU stays where a mid-stay montage change
+                                shows up as two signal-header signatures).
     """
     return [sys.executable, "-m", "clean_eeg.clean_subject_eeg",
             "--no-launch-review",
             "--quiet-gap-check",
-            "--approve-confirmations", "recording-gaps", "in-place"]
+            "--approve-confirmations", "recording-gaps", "in-place",
+            "signal-header-mismatch"]
 
 
 def clean_one_subject(row: SubjectRow, *, extra_argv: list[str] | None = None,

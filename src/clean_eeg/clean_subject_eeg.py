@@ -1377,7 +1377,9 @@ def _validate_EDF_meta_data(EDF_meta_data: dict, subject_name: Union[PersonalNam
         _check_subject_name_consistency(EDF_meta_data, command_line_subject_name=subject_name,
                                         verbosity=verbosity,
                                         fail_on_name_mismatch=fail_on_name_mismatch)
-    _check_signal_header_consistency(EDF_meta_data, verbosity=verbosity)
+    _check_signal_header_consistency(
+        EDF_meta_data, verbosity=verbosity,
+        approve_confirmations=approve_confirmations)
 
 
 def _check_recording_gaps(EDF_meta_data: dict, verbosity: int = 0,
@@ -1533,7 +1535,10 @@ def _check_subject_name_consistency(EDF_meta_data: dict, command_line_subject_na
             raise RuntimeError("Aborting EDF de-identification conversion due to inconsistent subject names.")
 
 
-def _check_signal_header_consistency(EDF_meta_data: dict, verbosity: int = 0):
+def _check_signal_header_consistency(EDF_meta_data: dict, verbosity: int = 0,
+                                      approve_confirmations: Union[set, None] = None):
+    if approve_confirmations is None:
+        approve_confirmations = set()
     signal_label_sets = dict()
     for filename, edf in EDF_meta_data.items():
         data = edf['data']
@@ -1560,6 +1565,14 @@ def _check_signal_header_consistency(EDF_meta_data: dict, verbosity: int = 0):
         print("Alternatively, this may be due to multiple recording montages during "
               "e.g., the same stay in the epilepsy monitoring unit.")
         print("Full labels are available via `audit-subject-eeg --print-edf-signal-header`.")
+        # Headless bypass: --approve-confirmations signal-header-mismatch
+        # skips the interactive prompt. Common on multi-montage EMU stays
+        # where the multiple signatures reflect a montage change mid-stay
+        # rather than a subject/data mixup.
+        if "signal-header-mismatch" in approve_confirmations:
+            print("[!] signal-header mismatch auto-approved via "
+                  "--approve-confirmations signal-header-mismatch.")
+            return
         continue_input = logged_input("Continue? (only continue if recordings have been confirmed as coming from the same subject and EMU stay for data integrity) yes/no: ")
         if continue_input.lower() not in ['yes', 'y']:
             raise RuntimeError("Aborting EDF de-identification conversion due to inconsistent signal headers.")
@@ -1681,13 +1694,15 @@ def get_clean_eeg_cli_arguments():
     parser.add_argument("--approve-confirmations", "--approve_confirmations",
                         dest="approve_confirmations", nargs="+", default=[],
                         choices=["wipe-annotations", "recording-gaps",
-                                  "in-place"],
+                                  "in-place", "signal-header-mismatch"],
                         help="List of destructive-operation or safety-check confirmation "
                              "prompts to auto-approve (for headless / non-interactive runs). "
                              "Each type must be listed explicitly — there is no global --yes. "
                              "New confirmation types must be added to `choices` explicitly, "
                              "forcing per-type opt-in. Available: 'wipe-annotations', "
-                             "'recording-gaps'.")
+                             "'recording-gaps', 'in-place', 'signal-header-mismatch' "
+                             "(auto-approves the multi-montage prompt on EMU subjects "
+                             "with more than one signal-header signature).")
     parser.add_argument("--fail-on-name-mismatch",
                         "--fail_on_name_mismatch",
                         dest="fail_on_name_mismatch", action="store_true",
