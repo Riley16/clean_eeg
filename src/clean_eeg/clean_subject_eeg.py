@@ -1800,7 +1800,17 @@ def get_clean_eeg_cli_arguments():
                              "(clean-batch-eeg) forward this flag to every "
                              "per-subject subprocess so the per-subject "
                              "cleanings don't stop mid-batch waiting for a "
-                             "reviewer.")
+                             "reviewer. Also implies --no-transfer-prompt "
+                             "since scripted contexts drive transfers via "
+                             "bulk-transfer-eeg separately.")
+    parser.add_argument("--no-transfer-prompt", "--no_transfer_prompt",
+                        dest="no_transfer_prompt", action="store_true",
+                        help="Skip the end-of-cleaning 'Ready to transfer "
+                             "de-identified files to the CML server? [y/N]:' "
+                             "prompt. Cleaning + audit still run; transfer "
+                             "is left for the operator to drive later with "
+                             "transfer-subject-eeg or bulk-transfer-eeg. "
+                             "Automatically enabled by --no-launch-review.")
     parser.add_argument("--audit-sample-files", "--audit_sample_files",
                         dest="audit_sample_files", type=int, default=None,
                         metavar="N",
@@ -1975,15 +1985,18 @@ if __name__ == "__main__":
             # stdin/stdout aren't TTYs, so SSH-without-PTY / nohup / cron
             # invocations are safe.
             launch_review=not args.no_launch_review,
-            # --no-launch-review is the batch/scripted signal: also
-            # skip the end-of-run "Ready to transfer to CML server?"
-            # prompt. Nothing in a headless batch context wants to
-            # answer that (transfers are driven by bulk-transfer-eeg
-            # separately). Without this, the batch stalled at subject
-            # N even after clean succeeded because the prompt blocked
-            # forever on a fresh subprocess stdin.
+            # Suppress the end-of-run "Ready to transfer to CML server?"
+            # prompt when either --no-transfer-prompt is set explicitly
+            # OR --no-launch-review is set (the batch/scripted signal).
+            # Nothing in a scripted context wants to answer that prompt
+            # -- transfers are driven by bulk-transfer-eeg separately.
+            # Without this, the batch stalled at subject N even after
+            # clean succeeded because the prompt blocked forever on
+            # each subprocess's fresh stdin.
             auto_transfer_response=(
-                "n" if args.no_launch_review else None),
+                "n" if (args.no_launch_review
+                        or args.no_transfer_prompt)
+                else None),
             audit_sample_files=args.audit_sample_files,
         )
 
