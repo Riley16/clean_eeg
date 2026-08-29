@@ -308,17 +308,15 @@ def _run_short(argv: list[str]) -> tuple[int, str]:
 
 
 class _PrefixedStreamReader(threading.Thread):
-    """Reader thread that pulls one line at a time from a subprocess
-    pipe and echoes it (line-buffered) to ``sys.stdout`` with a
-    per-subject prefix. Keeps the last ``keep_tail`` lines in memory so
-    the outer caller can surface them in the failure return value.
+    """Reader thread that pulls chunks from a subprocess pipe and
+    echoes them to ``sys.stdout`` with a per-subject prefix, splitting
+    on BOTH '\\n' and '\\r'.
 
-    Line-buffered semantics play well with rsync ``--progress``: rsync
-    emits '\\r'-only updates while a file is transferring (buffered
-    inside the pipe, not returned by readline) and a final '\\n' when
-    each file completes (readline returns the completion summary). The
-    result is one printed line per file completion, prefixed with the
-    subject code, live -- no more silent hours.
+    Why both: rsync ``--progress`` emits '\\r'-only mid-file updates
+    (percent complete, MB/s) that a plain readline() will buffer until
+    the file completes. On a 100+GB file that means silence for the
+    hour+ the transfer runs. Splitting on '\\r' unblocks those live
+    updates so the operator sees percent progress in near-real-time.
     """
     def __init__(self, fh, prefix: str, keep_tail: int = 20):
         super().__init__(daemon=True, name=f"stream-{prefix}")
@@ -327,12 +325,29 @@ class _PrefixedStreamReader(threading.Thread):
         self.tail = collections.deque(maxlen=keep_tail)
 
     def run(self) -> None:
+        buf = ""
         try:
-            for raw in iter(self.fh.readline, ""):
-                line = raw.rstrip("\n")
-                sys.stdout.write(f"[{self.prefix}] {line}\n")
+            while True:
+                # Read whatever the OS has for us. 1 char at a time is
+                # slow but robust across line-separator conventions;
+                # rsync's throughput here is trivial vs the network
+                # transfer this is monitoring.
+                ch = self.fh.read(1)
+                if ch == "":
+                    break  # EOF (process closed the pipe)
+                if ch in ("\n", "\r"):
+                    if buf:
+                        sys.stdout.write(f"[{self.prefix}] {buf}\n")
+                        sys.stdout.flush()
+                        self.tail.append(buf)
+                        buf = ""
+                else:
+                    buf += ch
+            # Flush any trailing content without a terminator.
+            if buf:
+                sys.stdout.write(f"[{self.prefix}] {buf}\n")
                 sys.stdout.flush()
-                self.tail.append(line)
+                self.tail.append(buf)
         except (OSError, ValueError):
             # ValueError: I/O op on closed file (parent .close()'d it)
             pass
@@ -968,6 +983,14 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="SSH user (default: $USER).")
     p.add_argument("--parallel", type=int, default=DEFAULT_PARALLEL,
                    help=f"Concurrent rsync workers (default: {DEFAULT_PARALLEL}).")
+    p.add_argument("--sequential", action="store_true",
+                   help="Force sequential transfer (one rsync at a "
+                        "time). Overrides --parallel. Useful when "
+                        "parallel workers interleave output badly or "
+                        "when the bottleneck is per-connection bandwidth "
+                        "and multiple streams thrash instead of adding "
+                        "throughput. Equivalent to --parallel 1 but "
+                        "explicit so it survives config copy-paste.")
     p.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES,
                    help=f"Per-subject retry count (default: {DEFAULT_MAX_RETRIES}).")
     p.add_argument("--rsync-timeout", type=int, default=DEFAULT_RSYNC_TIMEOUT_S,
@@ -1104,6 +1127,9 @@ def main(argv: list[str] | None = None) -> int:
                   f"{args.only_subjects_file}: {e}", file=sys.stderr)
             return 2
 
+    # --sequential wins over --parallel (explicit override so a config
+    # file that hardcodes --parallel N can still be dialled back to 1).
+    effective_parallel = 1 if args.sequential else args.parallel
     results, hard_failures = run_bulk_transfer(
         subject_dirs,
         # None -> defer to ssh_config's `User` directive for the given
@@ -1114,7 +1140,7 @@ def main(argv: list[str] | None = None) -> int:
         # the Windows tunnel).
         ssh_user=args.user,
         bwlimit_policy=bwlimit_policy,
-        parallel=args.parallel, max_retries=args.max_retries,
+        parallel=effective_parallel, max_retries=args.max_retries,
         rsync_timeout_s=args.rsync_timeout,
         backoff_base_s=args.backoff_base,
         remote_dir_override=args.remote_dir_override,
