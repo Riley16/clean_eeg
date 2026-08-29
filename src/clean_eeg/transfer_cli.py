@@ -50,6 +50,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("output_dir", type=Path,
                    help="Output directory produced by clean-subject-eeg "
                         "(contains deidentify.json + the *.edf files).")
+    p.add_argument("--ssh-host", type=str, required=True,
+                   help="SSH endpoint for the destination. Required "
+                        "(no code-level default -- accepts any hostname "
+                        "or ssh_config alias, including ProxyJump aliases "
+                        "that hop through a VPS).")
+    p.add_argument("--remote-base", type=str, default=None,
+                   help="Remote base directory. Combined with the "
+                        "manifest's site letter, subject code, and "
+                        "'all_clinical_eeg' subfolder to produce the "
+                        "full destination. Mutually exclusive with "
+                        "--remote-dir-override.")
+    p.add_argument("--remote-dir-override", type=str, default=None,
+                   help="Full remote destination path. Overrides the "
+                        "site-map derivation. Mutually exclusive with "
+                        "--remote-base.")
     p.add_argument("--dry-run", action="store_true",
                    help="Preflight + print composed commands without uploading.")
     p.add_argument("--user", type=str, default=None,
@@ -97,11 +112,18 @@ def main(argv: list[str] | None = None) -> int:
     # this line is what actually enforces it in the composed command.
     from clean_eeg.transfer import _failed_names_from_manifest
     excluded_names = _failed_names_from_manifest(result.manifest)
+    # Per-subject override template expansion.
+    per_subject_override = (
+        args.remote_dir_override.format(subject_code=result.manifest["subject_code"])
+        if args.remote_dir_override is not None else None)
     plan = build_transfer_plan(
         args.output_dir,
         subject_code=result.manifest["subject_code"],
         site_incoming_folder=result.manifest["site_incoming_folder"],
         ssh_user=args.user or _default_user(),
+        ssh_host=args.ssh_host,
+        remote_base=args.remote_base,
+        remote_dir_override=per_subject_override,
         use_rsync=shutil.which("rsync") is not None,
         excluded_names=excluded_names,
     )
@@ -131,6 +153,9 @@ def main(argv: list[str] | None = None) -> int:
         result = transfer_subject(
             args.output_dir,
             ssh_user=args.user,
+            ssh_host=args.ssh_host,
+            remote_base=args.remote_base,
+            remote_dir_override=per_subject_override,
             dry_run=False,
             background=args.background,
             ssh_key=args.ssh_key,

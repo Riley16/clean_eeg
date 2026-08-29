@@ -272,7 +272,7 @@ def test_preflight_all_files_transferred_when_no_failed_files(tmp_path):
 def test_transfer_plan_rsync_excludes_failed_files(tmp_path):
     """rsync mode must add --exclude=<name> for each failed file."""
     plan = build_transfer_plan(
-        tmp_path / "out", subject_code=SUBJECT_CODE,
+        tmp_path / "out", ssh_host="test.example.com", subject_code=SUBJECT_CODE,
         site_incoming_folder=SITE_INCOMING_FOLDER, ssh_user="alice",
         use_rsync=True, remote_dir_override="/tmp/target",
         excluded_names={"bad1.edf", "bad2.edf"},
@@ -288,7 +288,7 @@ def test_transfer_plan_rsync_no_exclusions_when_no_failed_files(tmp_path):
     clean files.
     """
     plan = build_transfer_plan(
-        tmp_path / "out", subject_code=SUBJECT_CODE,
+        tmp_path / "out", ssh_host="test.example.com", subject_code=SUBJECT_CODE,
         site_incoming_folder=SITE_INCOMING_FOLDER, ssh_user="alice",
         use_rsync=True, remote_dir_override="/tmp/target",
         excluded_names=None,
@@ -311,7 +311,7 @@ def test_transfer_plan_scp_filters_glob_by_excluded_names(tmp_path):
     (out / "ok_R1755A_01.01__10.00.00.edf").write_bytes(b"x")
     (out / "bad_file.edf").write_bytes(b"x")
     plan = build_transfer_plan(
-        out, subject_code=SUBJECT_CODE,
+        out, ssh_host="test.example.com", subject_code=SUBJECT_CODE,
         site_incoming_folder=SITE_INCOMING_FOLDER, ssh_user="alice",
         use_rsync=False, remote_dir_override="/tmp/target",
         excluded_names={"bad_file.edf"},
@@ -330,7 +330,7 @@ def test_transfer_plan_scp_no_filter_when_no_excluded(tmp_path):
     (out / "a_R1755A_01.01__10.00.00.edf").write_bytes(b"x")
     (out / "b_R1755A_01.01__11.00.00.edf").write_bytes(b"x")
     plan = build_transfer_plan(
-        out, subject_code=SUBJECT_CODE,
+        out, ssh_host="test.example.com", subject_code=SUBJECT_CODE,
         site_incoming_folder=SITE_INCOMING_FOLDER, ssh_user="alice",
         use_rsync=False, remote_dir_override="/tmp/target",
         excluded_names=None,
@@ -533,7 +533,7 @@ def test_preflight_review_gate_uses_sidecars_when_present(tmp_path):
 
 def test_transfer_plan_uses_rsync_when_available(tmp_path):
     out = _make_subject_dir(tmp_path)
-    plan = build_transfer_plan(out,
+    plan = build_transfer_plan(out, ssh_host="test.example.com",
                                 subject_code=SUBJECT_CODE,
                                 site_incoming_folder=SITE_INCOMING_FOLDER,
                                 ssh_user="testuser",
@@ -550,7 +550,7 @@ def test_transfer_plan_uses_rsync_when_available(tmp_path):
 def test_transfer_plan_falls_back_to_scp(tmp_path):
     out = _make_subject_dir(tmp_path)
     (out / "log.out").write_text("log")
-    plan = build_transfer_plan(out,
+    plan = build_transfer_plan(out, ssh_host="test.example.com",
                                 subject_code=SUBJECT_CODE,
                                 site_incoming_folder=SITE_INCOMING_FOLDER,
                                 ssh_user="testuser",
@@ -566,7 +566,7 @@ def test_transfer_plan_falls_back_to_scp(tmp_path):
 
 def test_transfer_plan_remote_dir_matches_site_folder(tmp_path):
     out = _make_subject_dir(tmp_path)
-    plan = build_transfer_plan(out,
+    plan = build_transfer_plan(out, ssh_host="test.example.com",
                                 subject_code=SUBJECT_CODE,
                                 site_incoming_folder=SITE_INCOMING_FOLDER,
                                 ssh_user="testuser",
@@ -576,7 +576,7 @@ def test_transfer_plan_remote_dir_matches_site_folder(tmp_path):
 
 def test_transfer_plan_mkdir_uses_umask_007(tmp_path):
     out = _make_subject_dir(tmp_path)
-    plan = build_transfer_plan(out,
+    plan = build_transfer_plan(out, ssh_host="test.example.com",
                                 subject_code=SUBJECT_CODE,
                                 site_incoming_folder=SITE_INCOMING_FOLDER,
                                 ssh_user="testuser",
@@ -588,7 +588,7 @@ def test_transfer_plan_mkdir_uses_umask_007(tmp_path):
 
 def test_transfer_plan_perms_uses_chgrp_reference(tmp_path):
     out = _make_subject_dir(tmp_path)
-    plan = build_transfer_plan(out,
+    plan = build_transfer_plan(out, ssh_host="test.example.com",
                                 subject_code=SUBJECT_CODE,
                                 site_incoming_folder=SITE_INCOMING_FOLDER,
                                 ssh_user="testuser",
@@ -606,7 +606,7 @@ def test_transfer_subject_dry_run_returns_plan_without_executing(tmp_path,
     called = []
     monkeypatch.setattr("clean_eeg.transfer.execute_plan",
                         lambda plan: called.append(plan))
-    plan = transfer_subject(out, ssh_user="testuser", dry_run=True)
+    plan = transfer_subject(out, ssh_host="test.example.com", ssh_user="testuser", dry_run=True)
     assert plan.transport in ("rsync", "scp")
     assert called == []  # dry_run must not execute
 
@@ -615,7 +615,7 @@ def test_transfer_subject_raises_on_preflight_failure(tmp_path):
     out = _make_subject_dir(tmp_path)
     (out / MANIFEST_FILENAME).unlink()
     with pytest.raises(RuntimeError, match="Preflight failed"):
-        transfer_subject(out, ssh_user="testuser", dry_run=True)
+        transfer_subject(out, ssh_host="test.example.com", ssh_user="testuser", dry_run=True)
 
 
 # ---------- background transfer ----------
@@ -627,7 +627,7 @@ def test_execute_plan_background_writes_script_and_log(tmp_path, monkeypatch):
     import clean_eeg.transfer as _tr
     out = _make_subject_dir(tmp_path)
     plan = build_transfer_plan(
-        out, subject_code=SUBJECT_CODE,
+        out, ssh_host="test.example.com", subject_code=SUBJECT_CODE,
         site_incoming_folder=SITE_INCOMING_FOLDER,
         ssh_user="testuser", use_rsync=True,
     )
@@ -677,7 +677,7 @@ def test_transfer_subject_background_flag_launches_detached(tmp_path,
         (99999, output_path / "transfer.sh", output_path / "transfer.log"),
     )
 
-    plan = transfer_subject(out, ssh_user="testuser", background=True)
+    plan = transfer_subject(out, ssh_host="test.example.com", ssh_user="testuser", background=True)
     assert fg_calls == [], "background=True must skip execute_plan"
     assert len(bg_calls) == 1
     assert plan.background_pid == 99999
@@ -696,7 +696,7 @@ def test_rsync_argv_excludes_original_annotations_sibling(tmp_path):
     path to the subject root -- verify the flag is emitted."""
     out = _make_subject_dir(tmp_path)
     plan = build_transfer_plan(
-        out, subject_code=SUBJECT_CODE,
+        out, ssh_host="test.example.com", subject_code=SUBJECT_CODE,
         site_incoming_folder=SITE_INCOMING_FOLDER,
         ssh_user="testuser", use_rsync=True,
         remote_dir_override="/tmp/e2e",
@@ -815,7 +815,7 @@ def test_ensure_ssh_agent_noop_when_keys_already_loaded(monkeypatch, capsys,
         monkeypatch, ssh_add_l_exit=0)
 
     out = _make_subject_dir(tmp_path)
-    transfer_subject(out, ssh_user="testuser", dry_run=True,
+    transfer_subject(out, ssh_host="test.example.com", ssh_user="testuser", dry_run=True,
                       remote_dir_override="/tmp/dry")
     combined = capsys.readouterr().out + capsys.readouterr().err
     assert "ssh-agent has no keys loaded" not in combined
@@ -849,7 +849,7 @@ def test_ensure_ssh_agent_auto_spawns_and_adds_key(monkeypatch, capsys, tmp_path
         ssh_add_exit=0)
 
     out = _make_subject_dir(tmp_path)
-    transfer_subject(out, ssh_user="testuser", dry_run=True,
+    transfer_subject(out, ssh_host="test.example.com", ssh_user="testuser", dry_run=True,
                       remote_dir_override="/tmp/dry",
                       ssh_key=fake_key)
 
@@ -884,7 +884,7 @@ def test_ensure_ssh_agent_no_tty_prints_manual_hint(monkeypatch, capsys,
         monkeypatch, ssh_add_l_exit=1, ssh_agent_stdout=agent_out)
 
     out = _make_subject_dir(tmp_path)
-    transfer_subject(out, ssh_user="testuser", dry_run=True,
+    transfer_subject(out, ssh_host="test.example.com", ssh_user="testuser", dry_run=True,
                       remote_dir_override="/tmp/dry",
                       ssh_key=fake_key)
     # ssh-add should NOT be called on the key (no TTY to prompt on),
@@ -911,7 +911,7 @@ def test_ensure_ssh_agent_auto_false_bypasses_setup(monkeypatch, capsys,
         monkeypatch, ssh_add_l_exit=1)
 
     out = _make_subject_dir(tmp_path)
-    transfer_subject(out, ssh_user="testuser", dry_run=True,
+    transfer_subject(out, ssh_host="test.example.com", ssh_user="testuser", dry_run=True,
                       remote_dir_override="/tmp/dry",
                       auto_ssh_agent=False)
     # Only the probe fired; no spawn attempted.
@@ -945,7 +945,7 @@ def test_ensure_ssh_agent_hints_when_ssh_tooling_completely_missing(
     monkeypatch.setattr(_tr.subprocess, "run", _run)
 
     # Must not raise -- hint is a warning, not an error.
-    transfer_subject(out, ssh_user="testuser", dry_run=True,
+    transfer_subject(out, ssh_host="test.example.com", ssh_user="testuser", dry_run=True,
                       remote_dir_override="/tmp/dry")
     combined = capsys.readouterr().out + capsys.readouterr().err
     assert "ssh-agent has no keys loaded" in combined

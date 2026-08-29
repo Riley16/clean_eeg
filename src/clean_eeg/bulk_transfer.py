@@ -449,6 +449,10 @@ def _run_subject_rsync(plan: SubjectPlan,
     """
     from clean_eeg.transfer import build_transfer_plan
 
+    # In test/scratch mode (remote_dir_override supplied without an
+    # explicit ssh_host), stand in a placeholder host -- the argv still
+    # gets composed but the subprocess is monkeypatched in tests.
+    effective_ssh_host = ssh_host or "test-scratch-host"
     tplan = build_transfer_plan(
         plan.subject_dir,
         subject_code=plan.subject_code,
@@ -456,7 +460,7 @@ def _run_subject_rsync(plan: SubjectPlan,
         ssh_user=ssh_user,
         remote_dir_override=remote_dir_override,
         excluded_names=plan.excluded_names,
-        ssh_host=ssh_host,
+        ssh_host=effective_ssh_host,
         remote_base=remote_base,
     )
 
@@ -636,11 +640,20 @@ def run_bulk_transfer(subject_dirs: list[Path],
     Prints periodic progress (subjects done / bytes done / ETA) and
     writes structured JSONL log entries alongside.
     """
+    # ssh_host is required for a real transfer. remote_dir_override
+    # is the escape hatch for test/scratch destinations that skip the
+    # SSH probe entirely, so it can stand in when ssh_host is None.
+    if not ssh_host and remote_dir_override is None:
+        print("[transfer] ABORT: --ssh-host is required (no code-level "
+              "default endpoint). Pass an ssh_config alias or "
+              "user-visible hostname.", file=sys.stderr, flush=True)
+        return [], []
+
     # Set up ssh-agent ONCE before the batch starts (passphrase entered
     # once, not per-subject). Every subprocess spawned below (mkdir,
     # rsync, perms per subject) inherits SSH_AUTH_SOCK from this
     # process, so they all reuse the same agent.
-    from clean_eeg.transfer import ensure_ssh_agent, SSH_HOST as _DEFAULT_SSH_HOST
+    from clean_eeg.transfer import ensure_ssh_agent
     ensure_ssh_agent(key_path=ssh_key, auto=auto_ssh_agent)
 
     # Reachability preflight. Rsync's own timeout is per-I/O and fires
@@ -654,7 +667,10 @@ def run_bulk_transfer(subject_dirs: list[Path],
     # test/scratch destination (local filesystem, mock, etc.) where the
     # SSH probe would falsely fail.
     if remote_dir_override is None:
-        effective_host = ssh_host or _DEFAULT_SSH_HOST
+        # ssh_host is guaranteed non-None here: the top-of-function
+        # guard rejects (None ssh_host AND None remote_dir_override).
+        assert ssh_host is not None
+        effective_host = ssh_host
         reach_argv = [
             "ssh", "-o", "ConnectTimeout=10",
             "-o", "BatchMode=yes",  # never prompt for a password

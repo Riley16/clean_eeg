@@ -38,8 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_HOST = "rhino2.psych.upenn.edu"
-DEFAULT_REMOTE_TMPDIR = "/tmp"    # writable + local to the CML server
+DEFAULT_REMOTE_TMPDIR = "/tmp"    # writable + local to the destination
 DEFAULT_SIZE_MB = 1000
 DEFAULT_ROUNDS = 3
 
@@ -172,9 +171,9 @@ def _cleanup_remote(ssh_user: str, host: str, remote_dir: str,
         print(f"    (cleanup: rm on remote failed: {e})")
 
 
-def run_bandwidth_test(size_mb: int = DEFAULT_SIZE_MB,
+def run_bandwidth_test(*, host: str,
+                       size_mb: int = DEFAULT_SIZE_MB,
                        rounds: int = DEFAULT_ROUNDS,
-                       host: str = DEFAULT_HOST,
                        ssh_user: str | None = None,
                        remote_dir: str = DEFAULT_REMOTE_TMPDIR,
                        ) -> BandwidthTestReport:
@@ -225,8 +224,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Per-round transfer size in MB (default: 1000 = 1 GB).")
     p.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS,
                    help="Number of rounds to average (default: 3).")
-    p.add_argument("--host", type=str, default=DEFAULT_HOST,
-                   help=f"SSH host (default: {DEFAULT_HOST}). "
+    p.add_argument("--host", type=str, required=True,
+                   help="SSH host (required; no code-level default). "
                         "Pass 'localhost' for a same-machine smoke test.")
     p.add_argument("--user", type=str, default=None,
                    help="SSH user (default: $USER).")

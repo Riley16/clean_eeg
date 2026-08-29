@@ -48,8 +48,10 @@ from clean_eeg.deidentify_manifest import (
 )
 
 
-SSH_HOST = "rhino2.psych.upenn.edu"
-REMOTE_BASE = "/data10/RAM/incoming"
+# Transfer endpoint is deliberately UNCONFIGURED at the code level -- no
+# institutional hostnames or paths hardcoded. Callers must supply
+# ssh_host + (remote_base or remote_dir_override) explicitly. Keeps the
+# public repo free of any specific site's storage layout.
 SUBJECT_SUBFOLDER = "all_clinical_eeg"
 
 # Matches the de-identified filename pattern produced by
@@ -384,22 +386,25 @@ def preflight_deidentified_output(output_path: str | Path,
 
 def _build_transfer_plan(output_path: Path, *, subject_code: str,
                          site_incoming_folder: str, ssh_user: str,
+                         ssh_host: str,
                          use_rsync: bool,
                          remote_dir_override: str | None = None,
+                         remote_base: str | None = None,
                          skip_perms: bool = False,
                          excluded_names: set[str] | None = None,
-                         ssh_host: str | None = None,
-                         remote_base: str | None = None,
                          ) -> TransferPlan:
-    # SSH endpoint + remote base are overridable so a batch can target
-    # something other than the default rhino/CML pair. Common case: a
-    # personal ssh_config alias (e.g. 'eeg-transfer-endpoint') that
-    # ProxyJumps through a VPS to a Windows/WSL box, with the target
-    # dir on an external drive. Overrides are additive with
-    # --remote-dir-override so the caller can pin one, two, or all
-    # three axes without changing the others.
-    effective_host = ssh_host or SSH_HOST
-    effective_base = remote_base or REMOTE_BASE
+    # ssh_host is required (no default in the code -- keeps the public
+    # repo free of institutional hostnames). Callers can supply
+    # remote_base (composes <base>/<site>/<subject>/all_clinical_eeg via
+    # the site-map layout) OR remote_dir_override (full per-subject path,
+    # supports the {subject_code} placeholder). Neither is enforced at
+    # this layer -- the CLIs enforce that a real target is supplied;
+    # callers who skip it get a placeholder path that would fail the
+    # rsync step loudly (safer than silently defaulting to some
+    # institution's storage layout).
+    if not ssh_host:
+        raise ValueError("ssh_host is required (no code-level default)")
+    effective_host = ssh_host
     if remote_dir_override is not None:
         # Test/scratch mode: caller supplies the full remote path
         # directly and (by default) opts out of the site-group perms
@@ -408,6 +413,11 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
         subject_remote_dir = remote_dir
         site_parent_dir = str(Path(remote_dir).parent)
     else:
+        # No remote_dir_override -- fall back to site-map layout with
+        # the (required) remote_base. When remote_base is also None
+        # (only tests reach here; production CLIs enforce a real value)
+        # we use a placeholder that would fail loudly if actually rsynced.
+        effective_base = remote_base or "/UNCONFIGURED-REMOTE-BASE"
         site_parent_dir = f"{effective_base}/{site_incoming_folder}"
         subject_remote_dir = f"{site_parent_dir}/{subject_code}"
         remote_dir = f"{subject_remote_dir}/{SUBJECT_SUBFOLDER}"
@@ -505,12 +515,12 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
 
 def build_transfer_plan(output_path: str | Path, *, subject_code: str,
                         site_incoming_folder: str, ssh_user: str,
+                        ssh_host: str,
                         use_rsync: bool | None = None,
                         remote_dir_override: str | None = None,
+                        remote_base: str | None = None,
                         skip_perms: bool = False,
                         excluded_names: set[str] | None = None,
-                        ssh_host: str | None = None,
-                        remote_base: str | None = None,
                         ) -> TransferPlan:
     """Public helper — resolves ``use_rsync`` from ``shutil.which`` if
     not supplied. Exposed so tests can inspect the composed commands
@@ -765,11 +775,13 @@ def ensure_ssh_agent(key_path: Path | None = None,
 
 
 def transfer_subject(output_path: str | Path, *,
+                     ssh_host: str,
                      ssh_user: str | None = None,
                      dry_run: bool = False,
                      use_rsync: bool | None = None,
                      site_map: dict[str, str] | None = None,
                      remote_dir_override: str | None = None,
+                     remote_base: str | None = None,
                      skip_perms: bool = False,
                      background: bool = False,
                      ssh_key: Path | None = None,
@@ -826,8 +838,10 @@ def transfer_subject(output_path: str | Path, *,
         subject_code=manifest["subject_code"],
         site_incoming_folder=manifest["site_incoming_folder"],
         ssh_user=ssh_user,
+        ssh_host=ssh_host,
         use_rsync=use_rsync,
         remote_dir_override=remote_dir_override,
+        remote_base=remote_base,
         skip_perms=skip_perms,
     )
     if dry_run:

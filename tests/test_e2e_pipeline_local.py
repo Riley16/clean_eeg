@@ -197,6 +197,7 @@ def test_e2e_pipeline_local(tmp_path, monkeypatch):
     monkeypatch.setenv("USER", "e2e-tester")
     plan = transfer_subject(subject_dir, dry_run=True,
                             ssh_user="e2e-tester",
+                            ssh_host="test.example.com",
                             remote_dir_override="/tmp/e2e-dry-run")
     # rsync syncs at directory level (source = subject_dir/ with trailing
     # slash), so the whole subject dir uploads as a single unit --

@@ -14,9 +14,9 @@ without further interaction.
 
 Behavior:
   - No site code  → transfer into
-    ``/scratch/<LOGIN>/edf_transfer_test/<FAKE_CODE>/``
+    ``${CLEAN_EEG_TEST_REMOTE_BASE:-/scratch/<LOGIN>}/edf_transfer_test/<FAKE_CODE>/``
   - Site code given → transfer into
-    ``/data10/RAM/incoming/<SITE_FOLDER>/edf_transfer_test/<FAKE_CODE>/``
+    ``${CLEAN_EEG_TEST_REMOTE_BASE:-/scratch/<LOGIN>}/<SITE_FOLDER>/edf_transfer_test/<FAKE_CODE>/``
 
 Remote destination is created if missing; on completion the remote
 files are LEFT IN PLACE (the operator can delete them by hand, or the
@@ -48,7 +48,13 @@ from clean_eeg.clean_subject_eeg import (
 from clean_eeg.deidentify_manifest import MANIFEST_FILENAME, read_manifest
 from clean_eeg.log import close_logger, setup_logger
 from clean_eeg.provenance import log_environment_provenance
-from clean_eeg.transfer import SSH_HOST, transfer_subject
+from clean_eeg.transfer import transfer_subject
+
+# Integration-test endpoint. No code-level default -- set the
+# CLEAN_EEG_TEST_SSH_HOST env var to the destination hostname (or
+# ssh_config alias) you want to hammer. Left empty on CI / general
+# checkout; the tests that need it skip themselves.
+SSH_HOST = os.environ.get("CLEAN_EEG_TEST_SSH_HOST", "")
 
 
 # Same PATIENT_NAME shape as the unit tests use, so operators inspecting
@@ -115,8 +121,10 @@ def _prompt_credentials() -> tuple[str, str | None]:
     print()
     print("Optional hospital site code — determines the remote parent dir.")
     print("Site letters (leave blank to use /scratch/<login>/ instead):")
+    remote_base = os.environ.get("CLEAN_EEG_TEST_REMOTE_BASE",
+                                   "/scratch")
     for letter, folder in sorted(SITE_CODE_TO_INCOMING_FOLDER.items()):
-        print(f"  {letter}: /data10/RAM/incoming/{folder}/")
+        print(f"  {letter}: {remote_base}/{folder}/")
     site_raw = input("  Site letter (Enter to skip): ").strip().upper()
     site = site_raw or None
     if site is not None and site not in SITE_CODE_TO_INCOMING_FOLDER:
@@ -133,13 +141,15 @@ def _resolve_destination(login: str, site: str | None) -> tuple[str, str]:
     accept it; the trailing letter picks a valid site (A when the
     operator didn't specify one — arbitrary because the scratch path
     doesn't route by site)."""
+    remote_base = os.environ.get("CLEAN_EEG_TEST_REMOTE_BASE",
+                                   f"/scratch/{login}")
     if site is None:
         fake_code = "R1000A"
-        remote_dir = f"/scratch/{login}/edf_transfer_test/{fake_code}"
+        remote_dir = f"{remote_base}/edf_transfer_test/{fake_code}"
     else:
         fake_code = f"R1000{site}"
         site_folder = SITE_CODE_TO_INCOMING_FOLDER[site]
-        remote_dir = (f"/data10/RAM/incoming/{site_folder}/"
+        remote_dir = (f"{remote_base}/{site_folder}/"
                       f"edf_transfer_test/{fake_code}")
     return fake_code, remote_dir
 
@@ -164,6 +174,11 @@ def test_clean_transfer_and_roundtrip(tmp_path, monkeypatch, capsys,
     with scp (fallback path for systems without rsync). Leaves the
     remote copy in place for manual inspection / re-runs; cleans the
     local scratch."""
+    if not SSH_HOST:
+        pytest.skip(
+            "CLEAN_EEG_TEST_SSH_HOST not set — integration test needs "
+            "an SSH endpoint. Export the env var to the destination "
+            "hostname (or ssh_config alias) you want to hammer.")
     if transport == "scp" and shutil.which("scp") is None:
         pytest.skip("scp not on PATH")
     if transport == "rsync" and shutil.which("rsync") is None:
@@ -236,6 +251,7 @@ def test_clean_transfer_and_roundtrip(tmp_path, monkeypatch, capsys,
     plan = transfer_subject(
         input_dir,
         ssh_user=login,
+        ssh_host=SSH_HOST,
         remote_dir_override=remote_dir,
         use_rsync=(transport == "rsync"),
     )

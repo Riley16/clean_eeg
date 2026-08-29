@@ -1044,16 +1044,16 @@ def _prompt_ready_to_transfer(output_path: str,
 
 
 def _invoke_transfer(output_path: str) -> None:
-    """Thin wrapper so tests can monkeypatch a single seam. Errors are
-    caught here so a transfer failure does not tear down the log file
-    close-out in ``__main__``."""
-    from clean_eeg.transfer import transfer_subject
-    try:
-        transfer_subject(output_path)
-    except RuntimeError as e:
-        print(f"\nTransfer failed: {e}")
-        print(f"Re-run `transfer-subject-eeg {output_path}` after "
-              "resolving the issue above.")
+    """Auto-transfer from the 'Skip to transfer?' prompt used to fire
+    transfer_subject with implicit defaults; those defaults have been
+    removed so the operator can't accidentally upload to a stale
+    institutional endpoint. Print a hint telling them to invoke
+    transfer-subject-eeg with an explicit --ssh-host / target instead.
+    """
+    print(f"\n[transfer] auto-transfer disabled -- the endpoint is no "
+          f"longer hardcoded. Re-run manually with your endpoint:")
+    print(f"    transfer-subject-eeg --ssh-host <alias-or-host> "
+          f"--remote-base <path> {output_path}")
 
 
 QUARANTINE_SUFFIX = ".QUARANTINED-DO-NOT-USE"
