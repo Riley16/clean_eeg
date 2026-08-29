@@ -76,11 +76,35 @@ def _write_deidentified_edf(path: Path, *,
         f.writeAnnotation(0.5, -1, "START")
 
 
+def _mark_all_reviewed(out: Path) -> None:
+    """Write a tracker entry for every EDF in ``out`` so the transfer
+    preflight's "review complete" gate passes. Isolated helper so tests
+    that want to exercise the un-reviewed failure mode can skip it."""
+    from clean_eeg.annotation_review.journal import (
+        REVIEWED_TRACKER_NAME,
+        ReviewedTracker,
+    )
+    from clean_eeg.annotation_review.models import ReviewedFile
+    from clean_eeg.print_edf_header import ANNOTATION_STUB_SUFFIX
+    edfs = sorted(out.glob("*.edf"))
+    stubs = [p for p in edfs if p.name.endswith(ANNOTATION_STUB_SUFFIX)]
+    carriers = stubs if stubs else [
+        p for p in edfs if not p.name.endswith(ANNOTATION_STUB_SUFFIX)]
+    tracker = ReviewedTracker(out)
+    for c in carriers:
+        tracker.mark_reviewed(ReviewedFile.new(
+            file_path=c, n_annotations=1, n_edited=0))
+    assert (out / REVIEWED_TRACKER_NAME).exists()
+
+
 def _make_subject_dir(tmp_path: Path,
                        filename: str = "ok_R1755A_01.01__10.00.00.edf",
+                       mark_reviewed: bool = True,
                        **edf_kwargs) -> Path:
     """Populate a subject dir with one de-identified EDF and a matching
-    manifest. Returns the dir."""
+    manifest. ``mark_reviewed=True`` (default) also writes a valid
+    ``.annotation_reviewed_tracker`` so preflight's review-complete gate
+    passes; tests that need the un-reviewed failure mode pass False."""
     out = tmp_path / "out"
     out.mkdir()
     edf_path = out / filename
@@ -98,6 +122,8 @@ def _make_subject_dir(tmp_path: Path,
         n_files_quarantined=0,
     )
     write_manifest(out, manifest)
+    if mark_reviewed:
+        _mark_all_reviewed(out)
     return out
 
 
@@ -356,6 +382,66 @@ def test_preflight_fails_when_directory_empty(tmp_path):
     result = preflight_deidentified_output(out)
     assert not result.passed
     assert any("no .edf files" in f for f in result.failures)
+
+
+# ---------- preflight: annotation-review-complete gate ----------
+
+def test_preflight_fails_when_review_not_complete(tmp_path):
+    """A cleaned subject whose annotations have NOT been manually
+    reviewed must not transfer. PHI is only proven redacted after the
+    review pass; the operator has explicitly asked for this gate so
+    an accidental rsync of a cleaned-but-not-reviewed subject can't
+    happen."""
+    out = _make_subject_dir(tmp_path, mark_reviewed=False)
+    result = preflight_deidentified_output(out)
+    assert not result.passed
+    assert any("annotation review not complete" in f
+               for f in result.failures), result.failures
+
+
+def test_preflight_review_gate_names_the_subject_and_progress(tmp_path):
+    """The failure message must include the subject code AND the
+    reviewed/total count so an operator sifting through a batch
+    log can prioritise: 'the R1653J entry is at 0/3, the R1654J
+    entry is at 3/3 but somehow still failing, so I know which one
+    to look at.'"""
+    out = _make_subject_dir(tmp_path, mark_reviewed=False)
+    result = preflight_deidentified_output(out)
+    msg = next(f for f in result.failures
+               if "annotation review not complete" in f)
+    assert SUBJECT_CODE in msg
+    assert "0/1" in msg
+
+
+def test_preflight_review_gate_uses_sidecars_when_present(tmp_path):
+    """In-place cleaning writes annotations to a `*_annotations.edf`
+    sidecar. The review gate must count SIDECARS (not the paired main
+    EDFs) — that's what the TUI reviews and what the tracker records."""
+    from clean_eeg.annotation_review.journal import ReviewedTracker
+    from clean_eeg.annotation_review.models import ReviewedFile
+
+    # Two EDFs: one main + one sidecar. Manually construct so we can
+    # control which one gets marked reviewed.
+    out = tmp_path / "out"
+    out.mkdir()
+    main = out / "ok_R1755A_01.01__10.00.00.edf"
+    sidecar = out / "ok_R1755A_01.01__10.00.00_annotations.edf"
+    _write_deidentified_edf(main)
+    _write_deidentified_edf(sidecar)
+    manifest = build_manifest(
+        subject_code=SUBJECT_CODE, site_code=SITE_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        input_path=str(tmp_path / "in"), output_path=str(out),
+        inplace=True, output_edf_paths=[main, sidecar],
+        n_files_deidentified=1, n_files_failed=0, n_files_quarantined=0)
+    write_manifest(out, manifest)
+
+    # Mark ONLY the sidecar reviewed. Preflight should pass -- carrier
+    # coverage is 1/1, not 1/2.
+    ReviewedTracker(out).mark_reviewed(ReviewedFile.new(
+        file_path=sidecar, n_annotations=1, n_edited=0))
+    result = preflight_deidentified_output(out)
+    assert result.passed, result.summary()
 
 
 # ---------- plan composition (dry_run) ----------
