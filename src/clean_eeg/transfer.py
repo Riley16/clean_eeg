@@ -132,36 +132,74 @@ def _failed_names_from_manifest(manifest: dict) -> set[str]:
             if isinstance(entry, dict) and entry.get("filename")}
 
 
+# patient_id and recording_id are space-separated per EDF+ spec:
+#   patient_id   = "<mrn> <sex> <birthdate> <name...>"
+#   recording_id = "Startdate <DD-MMM-YYYY> <admin> <technician> <equipment>"
+# The de-identified pipeline writes canonical tokens for each field, so
+# preflight verifies against those tokens directly on the raw header
+# bytes -- no need to open the file as an EDF.
+_DEIDENTIFIED_BIRTHDATE_TOKEN = "01-JAN-1900"
+_DEIDENTIFIED_YEAR_TOKEN = "1985"
+# Name may consist of multiple space-separated tokens; each must be X.
+_NAME_TOKEN_RE = re.compile(r"^[Xx]+$")
+
+
 def _check_edf_headers(edf_paths: Iterable[Path], subject_code: str,
                        failures: list[str]) -> None:
+    """Verify the 4 de-identification invariants (patientname redacted,
+    patientcode == subject_code, birthdate anonymised, startdate.year
+    anchored) using ONLY the first 256 bytes of each EDF. Prior version
+    opened every file via pyedflib.EdfReader, which parsed the full
+    signal-header structure and cost network round-trips per file on
+    NFS-mounted storage. Raw byte reads finish preflight in seconds
+    instead of minutes on 100+ file Jefferson subjects."""
+    from clean_eeg.print_edf_header import read_main_header
     for p in edf_paths:
         try:
-            with pyedflib.EdfReader(str(p)) as f:
-                header = f.getHeader()
-                startdate = f.getStartdatetime()
+            hdr = read_main_header(str(p))
         except OSError as e:
-            failures.append(f"{p.name}: pyedflib cannot open — {e}")
+            failures.append(f"{p.name}: cannot read main header — {e}")
             continue
-        if not _PATIENTNAME_X_RE.match(str(header.get("patientname", ""))):
+        if hdr.get("_truncated_main_header"):
             failures.append(
-                f"{p.name}: patientname is not fully redacted "
-                f"(expected X-pattern, got {header.get('patientname')!r})"
-            )
-        if header.get("patientcode") != subject_code:
+                f"{p.name}: file shorter than 256-byte EDF main header")
+            continue
+
+        patient_id = str(hdr.get("patient_id", "")).strip()
+        parts = patient_id.split()
+        # EDF+ layout: mrn sex birthdate name[+]. Anything shorter means
+        # the pipeline never wrote a proper de-identified header.
+        if len(parts) < 4:
             failures.append(
-                f"{p.name}: patientcode {header.get('patientcode')!r} "
-                f"!= manifest subject_code {subject_code!r}"
-            )
-        if str(header.get("birthdate", "")).strip().lower() != _DEIDENTIFIED_BIRTHDATE:
+                f"{p.name}: patient_id {patient_id!r} does not have "
+                f"the 4-field de-identified layout "
+                f"'<mrn> <sex> <birthdate> <name>'")
+            continue
+        mrn, _sex, birthdate, *name_parts = parts
+
+        if mrn != subject_code:
             failures.append(
-                f"{p.name}: birthdate {header.get('birthdate')!r} "
-                f"!= {_DEIDENTIFIED_BIRTHDATE!r}"
-            )
-        if startdate.year != _DEIDENTIFIED_YEAR:
+                f"{p.name}: patient_id MRN {mrn!r} != "
+                f"manifest subject_code {subject_code!r}")
+        if not all(_NAME_TOKEN_RE.match(tok) for tok in name_parts):
             failures.append(
-                f"{p.name}: startdate.year {startdate.year} "
-                f"!= {_DEIDENTIFIED_YEAR} (BASE_START_DATE anchor)"
-            )
+                f"{p.name}: patient_id name field {' '.join(name_parts)!r} "
+                f"is not fully redacted (expected all-X tokens)")
+        if birthdate.upper() != _DEIDENTIFIED_BIRTHDATE_TOKEN:
+            failures.append(
+                f"{p.name}: patient_id birthdate {birthdate!r} != "
+                f"{_DEIDENTIFIED_BIRTHDATE_TOKEN!r}")
+
+        # recording_id: 'Startdate <DD-MMM-YYYY> ...' -- the year is the
+        # last 4 chars of the second whitespace-token when present.
+        recording_id = str(hdr.get("recording_id", "")).strip()
+        rec_parts = recording_id.split()
+        year_token = rec_parts[1][-4:] if len(rec_parts) >= 2 else ""
+        if year_token != _DEIDENTIFIED_YEAR_TOKEN:
+            failures.append(
+                f"{p.name}: recording_id startdate year "
+                f"{year_token!r} != {_DEIDENTIFIED_YEAR_TOKEN!r} "
+                f"(BASE_START_DATE anchor; recording_id={recording_id!r})")
 
 
 def _spot_check_hash(edf_paths: list[Path], manifest: dict,
@@ -305,8 +343,13 @@ def preflight_deidentified_output(output_path: str | Path,
                 "— did this file skip the rename step?"
             )
 
-    # 6. Per-file header expectations (only for the transfer-eligible set).
-    _check_edf_headers(edfs, subject_code, failures)
+    # 6. Per-file header expectations. Only checks the main recordings
+    # (sidecars carry a stub header with an empty patient_id, since they
+    # only exist to hold annotations and share the parent recording's
+    # provenance -- validated indirectly via the paired main EDF).
+    recordings = [p for p in edfs
+                  if not p.name.endswith(ANNOTATION_STUB_SUFFIX)]
+    _check_edf_headers(recordings, subject_code, failures)
 
     # 7. Spot-check hash on one file.
     _spot_check_hash(edfs, manifest, failures)

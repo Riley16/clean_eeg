@@ -167,14 +167,19 @@ def test_preflight_fails_when_patientname_not_x(tmp_path):
     out = _make_subject_dir(tmp_path, patientname="John")
     result = preflight_deidentified_output(out)
     assert not result.passed
-    assert any("patientname" in f for f in result.failures)
+    # New message speaks in terms of the raw patient_id "name field" now
+    # that preflight parses the 4 EDF+ patient_id tokens directly rather
+    # than deferring to pyedflib's re-labelled 'patientname' key.
+    assert any("name field" in f or "patientname" in f
+               for f in result.failures), result.failures
 
 
 def test_preflight_fails_when_patientcode_mismatches(tmp_path):
     out = _make_subject_dir(tmp_path, patientcode="R9999X")
     result = preflight_deidentified_output(out)
     assert not result.passed
-    assert any("patientcode" in f for f in result.failures)
+    assert any("MRN" in f or "patientcode" in f
+               for f in result.failures), result.failures
 
 
 def test_preflight_fails_when_birthdate_wrong(tmp_path):
@@ -421,30 +426,31 @@ def test_preflight_review_gate_names_the_subject_and_progress(tmp_path):
     assert "0/1" in msg
 
 
-def test_preflight_review_gate_short_circuits_before_pyedflib(
+def test_preflight_review_gate_short_circuits_before_header_reads(
         tmp_path, monkeypatch):
     """Perf-critical ordering: when review isn't complete, preflight
-    must return BEFORE opening EDFs via pyedflib. This makes the
+    must return BEFORE reading any EDF header bytes. This makes the
     unreviewed-subject case cheap even on network storage where every
-    EDF open costs a round-trip. Monkey-patches EdfReader to detect any
-    accidental re-ordering that reintroduces the slow path."""
-    import pyedflib
+    EDF open costs a round-trip. Monkey-patches the raw header reader
+    to detect any accidental re-ordering that reintroduces the slow
+    header-check pass."""
+    from clean_eeg import print_edf_header as _peh
     calls = {"n": 0}
-    real_reader = pyedflib.EdfReader
+    real_reader = _peh.read_main_header
 
-    class _CountingReader(real_reader):
-        def __init__(self, *a, **kw):
-            calls["n"] += 1
-            super().__init__(*a, **kw)
+    def _counting(path):
+        calls["n"] += 1
+        return real_reader(path)
 
-    monkeypatch.setattr(pyedflib, "EdfReader", _CountingReader)
+    monkeypatch.setattr(
+        "clean_eeg.print_edf_header.read_main_header", _counting)
     out = _make_subject_dir(tmp_path, mark_reviewed=False)
     result = preflight_deidentified_output(out)
     assert not result.passed
     assert calls["n"] == 0, (
-        f"review-not-complete preflight opened {calls['n']} EDF(s) via "
-        f"pyedflib -- ordering regression. Should short-circuit before "
-        f"the header-check pass.")
+        f"review-not-complete preflight opened {calls['n']} EDF header(s) "
+        f"-- ordering regression. Should short-circuit before the "
+        f"header-check pass.")
 
 
 def test_tui_written_tracker_is_read_by_transfer_preflight(tmp_path):
