@@ -184,6 +184,8 @@ _FATAL_CONFIG_ERROR_SUBSTRINGS = (
     "permission denied (publickey",                          # SSH auth
     "no such file or directory",                             # bad path
     "host key verification failed",                          # unknown host
+    "unknown option",                                        # rsync flag typo / version mismatch
+    "syntax or usage error",                                 # rsync bad argv
 )
 
 
@@ -474,6 +476,7 @@ def _run_subject_rsync(plan: SubjectPlan,
                        remote_base: str | None = None,
                        rsync_path: str | None = None,
                        skip_remote_mkdir: bool = False,
+                       remote_mkdir_cmd: str | None = None,
                        ) -> tuple[int, str, bool]:
     """Compose the mkdir + rsync + perms sequence for ONE subject and
     execute them. Returns ``(exit_code, error_message, boundary_crossed)``.
@@ -501,6 +504,7 @@ def _run_subject_rsync(plan: SubjectPlan,
         remote_base=remote_base,
         rsync_path=rsync_path,
         skip_remote_mkdir=skip_remote_mkdir,
+        remote_mkdir_cmd=remote_mkdir_cmd,
     )
 
     initial_bwlimit = bwlimit_policy.current_kbps()
@@ -540,6 +544,7 @@ def transfer_one_subject_with_retry(plan: SubjectPlan, *,
                                     remote_base: str | None = None,
                                     rsync_path: str | None = None,
                                     skip_remote_mkdir: bool = False,
+                                    remote_mkdir_cmd: str | None = None,
                                     ) -> SubjectResult:
     """Transfer one subject with exponential-backoff retry. Returns
     a ``SubjectResult`` regardless of outcome (never raises).
@@ -575,7 +580,8 @@ def transfer_one_subject_with_retry(plan: SubjectPlan, *,
             per_subject_override, bwlimit_poll_s=bwlimit_poll_s,
             ssh_host=ssh_host, remote_base=remote_base,
             rsync_path=rsync_path,
-            skip_remote_mkdir=skip_remote_mkdir)
+            skip_remote_mkdir=skip_remote_mkdir,
+            remote_mkdir_cmd=remote_mkdir_cmd)
         attempt_elapsed = time.perf_counter() - attempt_start
         if log:
             log.emit("rsync_exit", subject=plan.subject_code,
@@ -687,6 +693,7 @@ def run_bulk_transfer(subject_dirs: list[Path],
                       remote_base: str | None = None,
                       rsync_path: str | None = None,
                       skip_remote_mkdir: bool = False,
+                      remote_mkdir_cmd: str | None = None,
                       ) -> tuple[list[SubjectResult], list[tuple[Path, str]]]:
     """Drive the whole batch. Returns
     ``(subject_results, preflight_hard_failures)``.
@@ -809,6 +816,7 @@ def run_bulk_transfer(subject_dirs: list[Path],
                 ssh_host=ssh_host, remote_base=remote_base,
                 rsync_path=rsync_path,
                 skip_remote_mkdir=skip_remote_mkdir,
+                remote_mkdir_cmd=remote_mkdir_cmd,
             )
 
         with ThreadPoolExecutor(max_workers=parallel) as pool:
@@ -1088,11 +1096,19 @@ def _build_parser() -> argparse.ArgumentParser:
                         "to route through WSL.")
     p.add_argument("--no-remote-mkdir", action="store_true",
                    help="Skip the pre-transfer 'ssh HOST umask && "
-                        "mkdir -p ...' step. Needed for Windows sshd "
-                        "(cmd.exe doesn't understand umask) and any "
-                        "endpoint without a POSIX shell. rsync's own "
-                        "--mkpath flag is added automatically so the "
-                        "destination path still gets created.")
+                        "mkdir -p ...' step entirely. Operator must "
+                        "pre-create the destination dir. Use "
+                        "--remote-mkdir if you'd rather have the tool "
+                        "create it via a non-default shell.")
+    p.add_argument("--remote-mkdir", type=str, default=None,
+                   metavar="CMD",
+                   help="Override the default POSIX 'umask 007 && "
+                        "mkdir -p' with a custom mkdir command. The "
+                        "destination path is appended as the last "
+                        "argument. Use for endpoints whose default "
+                        "shell can't handle POSIX -- e.g. Windows sshd "
+                        "with --remote-mkdir=\"wsl -e mkdir -p\" "
+                        "invokes mkdir via WSL.")
     p.add_argument("--background", action="store_true",
                    help="Detach from the controlling terminal and run under "
                         "nohup so the batch survives SSH disconnect / logout. "
@@ -1218,6 +1234,7 @@ def main(argv: list[str] | None = None) -> int:
         remote_base=args.remote_base,
         rsync_path=args.rsync_path,
         skip_remote_mkdir=args.no_remote_mkdir,
+        remote_mkdir_cmd=args.remote_mkdir,
     )
     if only_subjects and not results and not hard_failures:
         # Picker matched nothing (--only-subjects[-file] entries all

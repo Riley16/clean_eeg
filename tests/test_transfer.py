@@ -814,11 +814,10 @@ def _stub_subprocess_run_for_ssh_agent(monkeypatch, *,
     return call_log
 
 
-def test_transfer_plan_no_remote_mkdir_drops_mkdir_and_adds_mkpath(tmp_path):
-    """Windows sshd (default cmd.exe shell) can't parse 'umask &&
-    mkdir -p ...' -- the operator passes --no-remote-mkdir and rsync's
-    own --mkpath creates the destination instead. This test guards
-    both halves: mkdir_argv empty AND rsync argv has --mkpath."""
+def test_transfer_plan_skip_remote_mkdir_leaves_mkdir_empty(tmp_path):
+    """skip_remote_mkdir=True drops the mkdir step entirely. The
+    operator is on the hook for pre-creating the destination (or
+    passing remote_mkdir_cmd)."""
     out = _make_subject_dir(tmp_path)
     plan = build_transfer_plan(
         out, subject_code=SUBJECT_CODE,
@@ -829,7 +828,26 @@ def test_transfer_plan_no_remote_mkdir_drops_mkdir_and_adds_mkpath(tmp_path):
         remote_dir_override="/mnt/backup/clean_eeg/R1755A",
         skip_remote_mkdir=True)
     assert plan.mkdir_argv == [], plan.mkdir_argv
-    assert "--mkpath" in plan.upload_argv, plan.upload_argv
+
+
+def test_transfer_plan_remote_mkdir_cmd_swaps_default(tmp_path):
+    """remote_mkdir_cmd replaces the POSIX 'umask 007 && mkdir -p'
+    with the caller-supplied command (dest path appended). Use case:
+    Windows sshd where the mkdir must go through WSL via
+    'wsl -e mkdir -p'."""
+    out = _make_subject_dir(tmp_path)
+    plan = build_transfer_plan(
+        out, subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        ssh_user=None,
+        ssh_host="my-ssh-alias",
+        use_rsync=True,
+        remote_dir_override="/mnt/backup/clean_eeg/R1755A",
+        remote_mkdir_cmd="wsl -e mkdir -p")
+    assert plan.mkdir_argv == [
+        "ssh", "my-ssh-alias",
+        "wsl -e mkdir -p /mnt/backup/clean_eeg/R1755A",
+    ], plan.mkdir_argv
 
 
 def test_transfer_plan_rsync_path_lands_in_argv(tmp_path):

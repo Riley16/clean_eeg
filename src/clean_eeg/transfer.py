@@ -394,6 +394,7 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
                          excluded_names: set[str] | None = None,
                          rsync_path: str | None = None,
                          skip_remote_mkdir: bool = False,
+                         remote_mkdir_cmd: str | None = None,
                          ) -> TransferPlan:
     # ssh_host is required (no default in the code -- keeps the public
     # repo free of institutional hostnames). Callers can supply
@@ -433,13 +434,21 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
                   if ssh_user else effective_host)
     rsync_target_prefix = f"{ssh_target}:"
 
-    # umask 007 → newly-created intermediate dirs are group-rwx. Pre-existing
-    # dirs are untouched. Skipped when skip_remote_mkdir=True (e.g.
-    # Windows sshd whose default cmd.exe shell can't parse `umask &&
-    # mkdir -p`); in that case rsync's --mkpath flag creates the
-    # destination itself.
+    # mkdir composition:
+    #   skip_remote_mkdir=True  -> no mkdir step; operator must
+    #       pre-create the destination.
+    #   remote_mkdir_cmd set    -> `ssh HOST <cmd> <path>`. Lets the
+    #       operator route mkdir through a shell that DOES exist on
+    #       the remote (e.g. "wsl -e mkdir -p" on a Windows sshd whose
+    #       default cmd.exe can't parse `umask && mkdir -p`).
+    #   default                 -> POSIX shell: `umask 007 && mkdir -p`.
     if skip_remote_mkdir:
         mkdir_argv: list[str] = []
+    elif remote_mkdir_cmd:
+        mkdir_argv = [
+            "ssh", ssh_target,
+            f"{remote_mkdir_cmd} {remote_dir}",
+        ]
     else:
         mkdir_argv = [
             "ssh", ssh_target,
@@ -467,15 +476,15 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
         # by passing --rsync-path="wsl -e rsync".
         rsync_path_args = ([f"--rsync-path={rsync_path}"]
                            if rsync_path else [])
-        # --mkpath: rsync creates the destination path (including any
-        # missing parent dirs) itself. Enabled when we're skipping the
-        # explicit remote-mkdir step so the destination still gets
-        # created without needing a POSIX shell on the remote.
-        mkpath_args = ["--mkpath"] if skip_remote_mkdir else []
+        # NOTE: rsync's --mkpath (added in 3.2.3, Aug 2020) would let
+        # rsync create the destination dir itself, but we can't rely on
+        # it -- some sites' rsync is older and rejects the option. If
+        # --no-remote-mkdir is used, the operator MUST either pre-create
+        # the destination or pass --remote-mkdir with a shell prefix
+        # that works on their remote (e.g. "wsl -e mkdir -p" on Windows).
         upload_argv = [
             "rsync", "-avzh", "--partial", "--progress",
             *rsync_path_args,
-            *mkpath_args,
             "--exclude=quarantine/",
             # Belt-and-suspenders: the raw pre-Presidio annotation dump
             # (clinical_eeg_original_annotations sibling of the transfer
@@ -554,6 +563,7 @@ def build_transfer_plan(output_path: str | Path, *, subject_code: str,
                         excluded_names: set[str] | None = None,
                         rsync_path: str | None = None,
                         skip_remote_mkdir: bool = False,
+                        remote_mkdir_cmd: str | None = None,
                         ) -> TransferPlan:
     """Public helper — resolves ``use_rsync`` from ``shutil.which`` if
     not supplied. Exposed so tests can inspect the composed commands
@@ -584,6 +594,7 @@ def build_transfer_plan(output_path: str | Path, *, subject_code: str,
         excluded_names=excluded_names,
         rsync_path=rsync_path,
         skip_remote_mkdir=skip_remote_mkdir,
+        remote_mkdir_cmd=remote_mkdir_cmd,
         ssh_host=ssh_host,
         remote_base=remote_base,
     )
