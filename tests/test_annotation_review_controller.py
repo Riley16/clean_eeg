@@ -255,7 +255,7 @@ def test_queue_edit_records_in_pending_and_journal(tmp_path):
     assert pending[0].orig_text == "real name here"
     assert pending[0].new_text == "redacted"
     # Persisted to journal on disk (survives process death)
-    assert len(SessionJournal(subj).read_all()) == 1
+    assert len(SessionJournal(subj / "clinical_eeg").read_all()) == 1
 
 
 def test_queue_edit_second_time_overwrites_first(tmp_path):
@@ -269,7 +269,7 @@ def test_queue_edit_second_time_overwrites_first(tmp_path):
     assert len(pending) == 1                         # dedup by cursor
     assert pending[0].new_text == "second attempt"
     # Journal preserved both for audit
-    assert len(SessionJournal(subj).read_all()) == 2
+    assert len(SessionJournal(subj / "clinical_eeg").read_all()) == 2
 
 
 def test_bulk_regex_swap_queues_edits_across_all_files(tmp_path):
@@ -379,7 +379,7 @@ def test_queue_edit_dedups_identical_repeat_submission(tmp_path):
     assert first is third, "third submission should return existing record"
     assert len(c.pending_edits()) == 1
     # Journal has exactly 1 entry, not 3.
-    assert len(SessionJournal(subj).read_all()) == 1
+    assert len(SessionJournal(subj / "clinical_eeg").read_all()) == 1
 
 
 def test_current_display_text_returns_pending_edit_new_text(tmp_path):
@@ -471,7 +471,7 @@ def test_already_reviewed_files_skipped_by_default(tmp_path):
         "done.edf": ["a", "b"],
         "todo.edf": ["c", "d"],
     })
-    ReviewedTracker(subj).mark_reviewed(ReviewedFile.new(
+    ReviewedTracker(subj / "clinical_eeg").mark_reviewed(ReviewedFile.new(
         file_path=subj / "clinical_eeg" / "done.edf",
         n_annotations=2, n_edited=0))
     c = AnnotationReviewController(subj)
@@ -485,7 +485,7 @@ def test_respect_reviewed_tracker_false_includes_all_files(tmp_path):
     subj = _make_subject(tmp_path, "R1755A", {
         "done.edf": ["a"], "todo.edf": ["b"],
     })
-    ReviewedTracker(subj).mark_reviewed(ReviewedFile.new(
+    ReviewedTracker(subj / "clinical_eeg").mark_reviewed(ReviewedFile.new(
         file_path=subj / "clinical_eeg" / "done.edf",
         n_annotations=1, n_edited=0))
     c = AnnotationReviewController(subj, respect_reviewed_tracker=False)
@@ -498,7 +498,7 @@ def test_mark_current_file_reviewed_persists_to_disk(tmp_path):
     c.queue_edit("y-redacted")  # 1 edit on current file
     c.jump_to_end()
     c.mark_current_file_reviewed()
-    entries = ReviewedTracker(subj).read_all()
+    entries = ReviewedTracker(subj / "clinical_eeg").read_all()
     assert len(entries) == 1
     assert entries[0].n_annotations == 2
     # n_edited counts only edits to THIS file
@@ -530,11 +530,11 @@ def test_mark_all_reviewable_files_reviewed_bulk_marks_and_dedups(tmp_path):
     c = AnnotationReviewController(subj)
     # Pre-mark 'a' via the explicit-per-file path.
     c.mark_current_file_reviewed()
-    assert len(ReviewedTracker(subj).read_all()) == 1
+    assert len(ReviewedTracker(subj / "clinical_eeg").read_all()) == 1
     newly = c.mark_all_reviewable_files_reviewed()
     # Only b and c are newly marked; a was already tracked.
     assert sorted(p.name for p in newly) == ["b.edf", "c.edf"]
-    entries = ReviewedTracker(subj).read_all()
+    entries = ReviewedTracker(subj / "clinical_eeg").read_all()
     # Tracker now has entries for all three files (1 pre-existing + 2 new).
     assert sorted({e.file_path for e in entries}) == sorted(
         [str(subj / "clinical_eeg" / n) for n in ("a.edf", "b.edf", "c.edf")])
@@ -565,7 +565,7 @@ def test_mark_all_reviewable_files_reviewed_captures_pending_edit_counts(
     c.move_cursor(+1)
     c.queue_edit("y-redacted")   # edit on a.edf (file_cursor=0, ann=1)
     c.mark_all_reviewable_files_reviewed()
-    entries = {e.file_path: e for e in ReviewedTracker(subj).read_all()}
+    entries = {e.file_path: e for e in ReviewedTracker(subj / "clinical_eeg").read_all()}
     a_entry = entries[str(subj / "clinical_eeg" / "a.edf")]
     b_entry = entries[str(subj / "clinical_eeg" / "b.edf")]
     assert a_entry.n_edited == 2, f"a.edf should have 2 edits: {a_entry}"
@@ -826,7 +826,7 @@ def test_preload_all_drops_files_with_only_whitelisted_annotations(tmp_path):
 
     # The dropped file was silently marked reviewed on disk
     from clean_eeg.annotation_review.journal import ReviewedTracker
-    reviewed = {r.file_path for r in ReviewedTracker(subj).read_all()}
+    reviewed = {r.file_path for r in ReviewedTracker(subj / "clinical_eeg").read_all()}
     assert any(p.endswith("all_boilerplate.edf") for p in reviewed)
     c.close()
 
@@ -902,7 +902,7 @@ def test_controller_drops_stale_journal_entries_that_no_longer_match(
     # Manually write a journal entry that won't match anything in
     # the current file
     from clean_eeg.annotation_review.models import EditRecord
-    j = SessionJournal(subj)
+    j = SessionJournal(subj / "clinical_eeg")
     with j:
         j.append(EditRecord.new(
             file_path=str(subj / "clinical_eeg" / "a.edf"),

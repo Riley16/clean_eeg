@@ -219,8 +219,18 @@ class AnnotationReviewController:
 
         self._edfs: list[Path] = preflight_subject_for_review(
             self.subject_dir, subfolder=subfolder)
-        self._tracker = ReviewedTracker(self.subject_dir)
-        self._journal = SessionJournal(self.subject_dir)
+        # Tracker + session journal live INSIDE the subfolder alongside
+        # the EDFs they describe, NOT at the outer subject dir. This is
+        # the SAME location the reset function (reset_review_state) and
+        # the audit's check_annotation_review_state both expect, so all
+        # three tools agree on one canonical path. A prior version wrote
+        # them at the outer dir, which caused the transfer-preflight
+        # review-complete check + the audit's ✓-if-complete banner to
+        # silently see "no tracker" and treat every reviewed subject as
+        # unreviewed.
+        inner = self.subject_dir / subfolder
+        self._tracker = ReviewedTracker(inner)
+        self._journal = SessionJournal(inner)
         self.site_code = _derive_site_code(self.subject_dir.name)
         self._whitelist = self._load_whitelist()
 

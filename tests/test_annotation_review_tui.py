@@ -252,7 +252,7 @@ def test_cli_no_files_to_review_returns_0_with_hint(tmp_path, capsys):
     from clean_eeg.annotation_review.journal import ReviewedTracker
     from clean_eeg.annotation_review.models import ReviewedFile
     subj = _make_subject(tmp_path, files={"a.edf": [(0.5, "x")]})
-    ReviewedTracker(subj).mark_reviewed(ReviewedFile.new(
+    ReviewedTracker(subj / "clinical_eeg").mark_reviewed(ReviewedFile.new(
         file_path=subj / "clinical_eeg" / "a.edf",
         n_annotations=1, n_edited=0))
 
@@ -442,7 +442,7 @@ def test_tui_n_marks_current_file_reviewed(tmp_path):
     _drive_tui(controller, "nq")
 
     from clean_eeg.annotation_review.journal import ReviewedTracker
-    entries = ReviewedTracker(subj).read_all()
+    entries = ReviewedTracker(subj / "clinical_eeg").read_all()
     assert len(entries) == 1
     assert entries[0].file_path.endswith("a.edf")
 
@@ -673,7 +673,7 @@ def test_tui_n_refuses_when_cursor_not_at_last_annotation(tmp_path):
 
     # File NOT marked reviewed
     from clean_eeg.annotation_review.journal import ReviewedTracker
-    entries = ReviewedTracker(subj).read_all()
+    entries = ReviewedTracker(subj / "clinical_eeg").read_all()
     assert entries == [], (
         f"'n' before reaching end of file must NOT mark reviewed; "
         f"got tracker entries {entries}")
@@ -693,7 +693,7 @@ def test_tui_n_succeeds_after_G_jumps_to_end(tmp_path):
     _drive_tui(controller, "Gnq")
 
     from clean_eeg.annotation_review.journal import ReviewedTracker
-    entries = ReviewedTracker(subj).read_all()
+    entries = ReviewedTracker(subj / "clinical_eeg").read_all()
     assert len(entries) == 1, (
         f"'G' then 'n' must mark reviewed; got {entries}")
 
@@ -709,5 +709,5 @@ def test_tui_n_succeeds_after_scrolling_j_to_last(tmp_path):
     _drive_tui(controller, "jjnq")  # 'j'*2 -> cursor at position 2 (last)
 
     from clean_eeg.annotation_review.journal import ReviewedTracker
-    entries = ReviewedTracker(subj).read_all()
+    entries = ReviewedTracker(subj / "clinical_eeg").read_all()
     assert len(entries) == 1

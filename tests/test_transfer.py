@@ -447,6 +447,51 @@ def test_preflight_review_gate_short_circuits_before_pyedflib(
         f"the header-check pass.")
 
 
+def test_tui_written_tracker_is_read_by_transfer_preflight(tmp_path):
+    """End-to-end regression: the tracker location the TUI's controller
+    writes to MUST be the same location the transfer preflight reads
+    from. A prior bug wrote at the outer subject dir but read from the
+    inner subfolder, causing every reviewed subject to fail preflight
+    with 'annotation review not complete'."""
+    from clean_eeg.annotation_review.controller import (
+        AnnotationReviewController,
+    )
+    from clean_eeg.annotation_review.models import ReviewedFile
+
+    # Set up subject like the pipeline does: <subj>/clinical_eeg/<edfs>
+    # + <subj>/clinical_eeg/deidentify.json.
+    subj = tmp_path / "R1755A"
+    inner = subj / "clinical_eeg"
+    inner.mkdir(parents=True)
+    edf = inner / "ok_R1755A_01.01__10.00.00.edf"
+    _write_deidentified_edf(edf)
+    from clean_eeg.deidentify_manifest import build_manifest, write_manifest
+    manifest = build_manifest(
+        subject_code=SUBJECT_CODE, site_code=SITE_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        input_path=str(tmp_path / "in"), output_path=str(inner),
+        inplace=True, output_edf_paths=[edf],
+        n_files_deidentified=1, n_files_failed=0, n_files_quarantined=0)
+    write_manifest(inner, manifest)
+
+    # Instantiate the controller EXACTLY the way the CLI does (outer
+    # subject_dir + subfolder), mark the file reviewed, close.
+    controller = AnnotationReviewController(
+        subj, subfolder="clinical_eeg", whitelist_path=None)
+    controller._tracker.mark_reviewed(ReviewedFile.new(
+        file_path=edf, n_annotations=1, n_edited=0))
+    controller.close()
+
+    # The transfer's preflight reads from output_path = inner. It must
+    # see the file the TUI just marked. If tracker location drifts
+    # (outer vs inner) this assertion catches it.
+    result = preflight_deidentified_output(inner)
+    assert result.passed, (
+        f"tracker written by TUI (via AnnotationReviewController) must be "
+        f"discoverable by preflight_deidentified_output at the same "
+        f"location; got failures={result.failures}")
+
+
 def test_preflight_review_gate_uses_sidecars_when_present(tmp_path):
     """In-place cleaning writes annotations to a `*_annotations.edf`
     sidecar. The review gate must count SIDECARS (not the paired main
