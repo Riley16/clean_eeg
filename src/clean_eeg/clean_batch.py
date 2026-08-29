@@ -276,6 +276,24 @@ def _default_audit_argv_prefix() -> list[str]:
     return [sys.executable, "-m", "clean_eeg.audit.cli"]
 
 
+# Flags used for both --audit-after-clean AND the post-batch
+# review-phase audit. Kept in one place so the two "post-clean audit"
+# invocations produce identical, header-inclusive output. The operator
+# always wants:
+#   --no-notebook            skip the ~10s ipynb/html render
+#   --hide-annotation-flags  the annotation-review TUI (about to run,
+#                            or already run) shows every annotation --
+#                            listing them in the audit is redundant
+#                            and noisy for cleaned+reviewed subjects
+#   -v                       every check status, not just failures
+#   --print-edf-header       header residue is the load-bearing thing
+#                            a human wants to see after each clean
+#   --print-edf-signal-header  same for the per-channel headers
+POST_CLEAN_AUDIT_FLAGS = [
+    "--no-notebook", "--hide-annotation-flags",
+    "-v", "--print-edf-header", "--print-edf-signal-header"]
+
+
 def audit_one_subject(output_path: str, *,
                        argv_prefix: list[str] | None = None,
                        stream_output: bool = True,
@@ -333,9 +351,16 @@ def run_batch(rows: list[SubjectRow], *,
 
         if audit_after_clean and outcome.clean_succeeded:
             print(f"\n--- audit {row.subject_code} ---", flush=True)
+            # Same flags as the review-phase audit -- see
+            # POST_CLEAN_AUDIT_FLAGS. Header info visible, annotation
+            # matches suppressed (TUI or a prior review already showed
+            # them). Callers overriding argv_prefix win.
+            effective_prefix = (audit_argv_prefix
+                                or _default_audit_argv_prefix()
+                                + POST_CLEAN_AUDIT_FLAGS)
             code, elapsed, err = audit_one_subject(
                 row.output_path,
-                argv_prefix=audit_argv_prefix,
+                argv_prefix=effective_prefix,
                 stream_output=stream_output)
             outcome.audit_exit_code = code
             outcome.audit_elapsed_s = elapsed
@@ -406,9 +431,8 @@ def run_review_phase(outcomes: list[SubjectOutcome]) -> None:
         #                            so operator visually verifies the
         #                            header was cleaned + dates anchored
         try:
-            audit_argv_prefix = _default_audit_argv_prefix() + [
-                "--no-notebook", "--hide-annotation-flags",
-                "-v", "--print-edf-header", "--print-edf-signal-header"]
+            audit_argv_prefix = (_default_audit_argv_prefix()
+                                  + POST_CLEAN_AUDIT_FLAGS)
             audit_rc, _elapsed, _err = audit_one_subject(
                 o.output_path,
                 argv_prefix=audit_argv_prefix,
