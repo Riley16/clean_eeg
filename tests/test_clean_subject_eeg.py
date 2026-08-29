@@ -277,6 +277,55 @@ def test_clean_subject_edf_files_w_inconsistent_signal_headers(monkeypatch):
         assert False, 'RuntimeError was not raised for inconsistent signal headers'
 
 
+def test_looks_structurally_already_cleaned_true_for_deidentified_layout(
+        tmp_path):
+    """A dir with de-identified filenames + matching sidecars looks
+    already-cleaned even without a manifest -- covers the "manifest got
+    deleted / prior run crashed" recovery case."""
+    from clean_eeg.clean_subject_eeg import _looks_structurally_already_cleaned
+    d = tmp_path / "out"
+    d.mkdir()
+    (d / "GA_R1665J_01.01__00.00.00.edf").touch()
+    (d / "GA_R1665J_01.01__00.00.00_annotations.edf").touch()
+    (d / "GA_R1665J_01.01__00.08.10.edf").touch()
+    (d / "GA_R1665J_01.01__00.08.10_annotations.edf").touch()
+    assert _looks_structurally_already_cleaned(str(d)) is True
+
+
+def test_looks_structurally_already_cleaned_false_for_raw_layout(tmp_path):
+    """A dir with raw (not-yet-renamed) filenames must NOT trigger the
+    structural skip -- otherwise we'd skip subjects that were never
+    cleaned."""
+    from clean_eeg.clean_subject_eeg import _looks_structurally_already_cleaned
+    d = tmp_path / "out"
+    d.mkdir()
+    (d / "raw_recording_20240101.edf").touch()
+    assert _looks_structurally_already_cleaned(str(d)) is False
+
+
+def test_looks_structurally_already_cleaned_false_when_sidecar_missing(
+        tmp_path):
+    """Recording matches the de-identified pattern but the matching
+    _annotations.edf sidecar is missing -- indicates a PARTIAL clean
+    (e.g. crashed mid-file). Re-cleaning IS the correct action; must
+    NOT skip."""
+    from clean_eeg.clean_subject_eeg import _looks_structurally_already_cleaned
+    d = tmp_path / "out"
+    d.mkdir()
+    (d / "GA_R1665J_01.01__00.00.00.edf").touch()  # renamed
+    (d / "GA_R1665J_01.01__00.08.10.edf").touch()  # renamed, no sidecar
+    (d / "GA_R1665J_01.01__00.00.00_annotations.edf").touch()  # only one sidecar
+    assert _looks_structurally_already_cleaned(str(d)) is False
+
+
+def test_looks_structurally_already_cleaned_false_when_empty(tmp_path):
+    """Empty dir must not trigger a false-positive skip."""
+    from clean_eeg.clean_subject_eeg import _looks_structurally_already_cleaned
+    d = tmp_path / "out"
+    d.mkdir()
+    assert _looks_structurally_already_cleaned(str(d)) is False
+
+
 def test_signal_header_mismatch_auto_approved_via_approve_confirmations(
         capsys, monkeypatch):
     """--approve-confirmations signal-header-mismatch bypasses the

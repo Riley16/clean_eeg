@@ -337,6 +337,41 @@ def remove_gendered_pronouns(text: str, replacement: str = REDACT_PRONOUN_REPLAC
         return PRONOUN_RE.sub(replacement, text)
 
 
+_DEID_FILENAME_RE = re.compile(
+    r"^.+_R1\d{3}[ACDEFHJMNPST]_\d{2}\.\d{2}__\d{2}\.\d{2}\.\d{2}"
+    r"(_annotations)?\.edf$"
+)
+
+
+def _looks_structurally_already_cleaned(output_path: str) -> bool:
+    """Return True when the directory looks like a completed in-place
+    clean even though ``deidentify.json`` is missing.
+
+    Signal used: every recording (non-sidecar EDF) matches the
+    de-identified filename pattern AND has a matching
+    ``_annotations.edf`` sidecar. The pipeline only writes sidecars
+    after the redaction pass and only renames files after the header
+    rewrite, so satisfying both is strong evidence of a completed run
+    that lost its manifest (delete, crash between last file + manifest
+    write, etc.). Prevents a destructive re-clean over cleaned data.
+    """
+    if not os.path.isdir(output_path):
+        return False
+    names = os.listdir(output_path)
+    edfs = [n for n in names if n.lower().endswith(".edf")]
+    recordings = [n for n in edfs if not n.endswith("_annotations.edf")]
+    sidecars = {n for n in edfs if n.endswith("_annotations.edf")}
+    if not recordings:
+        return False
+    for rec in recordings:
+        if not _DEID_FILENAME_RE.match(rec):
+            return False
+        expected_sidecar = rec[:-4] + "_annotations.edf"
+        if expected_sidecar not in sidecars:
+            return False
+    return True
+
+
 def clean_subject_edf_files(
     input_path: str,
     output_path: str,
@@ -373,10 +408,27 @@ def clean_subject_edf_files(
     # Completion-marker fast path: a prior successful run wrote
     # deidentify.json to output_path. Presence == de-id done. Offer to
     # skip straight to transfer unless --force says re-run from scratch.
-    if not force and manifest_exists(output_path):
+    #
+    # Second-chance structural check: even when deidentify.json is
+    # ABSENT (e.g. an operator deleted it, or a prior run crashed
+    # between the last file and the manifest write), sidecar
+    # ``*_annotations.edf`` files ONLY appear if the in-place pipeline
+    # completed the redaction pass, and every recording is renamed to
+    # the de-identified pattern only after the pipeline runs. If BOTH
+    # hold, treat as already cleaned so we don't destructively re-run
+    # over a subject whose sidecars would drift. --force still wins if
+    # the operator actually wants a re-clean.
+    already_cleaned = (manifest_exists(output_path)
+                       or _looks_structurally_already_cleaned(output_path))
+    if not force and already_cleaned:
+        marker = ("deidentify.json"
+                  if manifest_exists(output_path)
+                  else "sidecar+renamed-files structure "
+                       "(deidentify.json missing but every recording matches "
+                       "the de-identified pattern and has an _annotations.edf sidecar)")
         if skip_if_already_cleaned:
             print(f"[skip-if-already-cleaned] {output_path}: "
-                  f"deidentify.json present, treating as done.")
+                  f"{marker}, treating as done.")
             return
         _maybe_skip_to_transfer(output_path,
                                 auto_response=auto_transfer_response)
