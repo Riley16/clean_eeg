@@ -174,6 +174,26 @@ def _sum_transferable_bytes(subject_dir: Path,
 PREFLIGHT_MAX_WORKERS = 8
 
 
+# Substrings that mark a failure as deterministic (retrying will not
+# help). Case-insensitive match on the rsync/ssh stderr tail.
+_FATAL_CONFIG_ERROR_SUBSTRINGS = (
+    "is not recognized as an internal or external command",  # Windows cmd
+    "command not found",                                     # POSIX sh
+    "not found",                                             # PowerShell
+    "rsync: connection unexpectedly closed",  # remote spawn failed
+    "permission denied (publickey",                          # SSH auth
+    "no such file or directory",                             # bad path
+    "host key verification failed",                          # unknown host
+)
+
+
+def _is_fatal_config_error(err: str | None) -> bool:
+    if not err:
+        return False
+    low = err.lower()
+    return any(s.lower() in low for s in _FATAL_CONFIG_ERROR_SUBSTRINGS)
+
+
 def build_subject_plans(subject_dirs: Iterable[Path]) -> tuple[list[SubjectPlan],
                                                                 list[tuple[Path, str]]]:
     """Preflight every subject; return ``(ready_plans, hard_failures)``.
@@ -452,6 +472,8 @@ def _run_subject_rsync(plan: SubjectPlan,
                        bwlimit_poll_s: float = 30.0,
                        ssh_host: str | None = None,
                        remote_base: str | None = None,
+                       rsync_path: str | None = None,
+                       skip_remote_mkdir: bool = False,
                        ) -> tuple[int, str, bool]:
     """Compose the mkdir + rsync + perms sequence for ONE subject and
     execute them. Returns ``(exit_code, error_message, boundary_crossed)``.
@@ -477,6 +499,8 @@ def _run_subject_rsync(plan: SubjectPlan,
         excluded_names=plan.excluded_names,
         ssh_host=effective_ssh_host,
         remote_base=remote_base,
+        rsync_path=rsync_path,
+        skip_remote_mkdir=skip_remote_mkdir,
     )
 
     initial_bwlimit = bwlimit_policy.current_kbps()
@@ -514,6 +538,8 @@ def transfer_one_subject_with_retry(plan: SubjectPlan, *,
                                     bwlimit_poll_s: float = 30.0,
                                     ssh_host: str | None = None,
                                     remote_base: str | None = None,
+                                    rsync_path: str | None = None,
+                                    skip_remote_mkdir: bool = False,
                                     ) -> SubjectResult:
     """Transfer one subject with exponential-backoff retry. Returns
     a ``SubjectResult`` regardless of outcome (never raises).
@@ -547,7 +573,9 @@ def transfer_one_subject_with_retry(plan: SubjectPlan, *,
         exit_code, err, boundary = _run_subject_rsync(
             plan, ssh_user, bwlimit_policy, rsync_timeout_s,
             per_subject_override, bwlimit_poll_s=bwlimit_poll_s,
-            ssh_host=ssh_host, remote_base=remote_base)
+            ssh_host=ssh_host, remote_base=remote_base,
+            rsync_path=rsync_path,
+            skip_remote_mkdir=skip_remote_mkdir)
         attempt_elapsed = time.perf_counter() - attempt_start
         if log:
             log.emit("rsync_exit", subject=plan.subject_code,
@@ -573,6 +601,25 @@ def transfer_one_subject_with_retry(plan: SubjectPlan, *,
                          new_bwlimit_kbps=bwlimit_policy.current_kbps())
             continue
         last_exit, last_err = exit_code, err
+        # Fast-abort on obviously-deterministic errors -- retrying a
+        # command that failed because it doesn't exist (Windows cmd
+        # rejecting POSIX 'umask', missing 'rsync' on remote PATH, etc)
+        # wastes the retry budget and multiplies wall time. Bail after
+        # the first attempt with a clear failure.
+        if _is_fatal_config_error(err):
+            if log:
+                log.emit("fatal_abort", subject=plan.subject_code,
+                         reason=err[:500])
+            return SubjectResult(
+                subject_code=plan.subject_code,
+                subject_dir=str(plan.subject_dir),
+                attempts=attempt + 1,
+                succeeded=False,
+                elapsed_s=time.perf_counter() - start,
+                last_exit_code=exit_code,
+                last_error=(err + " [aborting retries: deterministic "
+                            "config error, not a transient network fault]"),
+            )
         attempt += 1
         if attempt < max_retries:
             # Exponential backoff: 30, 60, 120, 240, ...
@@ -638,6 +685,8 @@ def run_bulk_transfer(subject_dirs: list[Path],
                       auto_ssh_agent: bool = True,
                       ssh_host: str | None = None,
                       remote_base: str | None = None,
+                      rsync_path: str | None = None,
+                      skip_remote_mkdir: bool = False,
                       ) -> tuple[list[SubjectResult], list[tuple[Path, str]]]:
     """Drive the whole batch. Returns
     ``(subject_results, preflight_hard_failures)``.
@@ -758,6 +807,8 @@ def run_bulk_transfer(subject_dirs: list[Path],
                 remote_dir_override=remote_dir_override,
                 log=log,
                 ssh_host=ssh_host, remote_base=remote_base,
+                rsync_path=rsync_path,
+                skip_remote_mkdir=skip_remote_mkdir,
             )
 
         with ThreadPoolExecutor(max_workers=parallel) as pool:
@@ -1028,6 +1079,20 @@ def _build_parser() -> argparse.ArgumentParser:
                         "this via the site-map layout. Use --remote-dir-"
                         "override instead for flat / non-hierarchical "
                         "targets.")
+    p.add_argument("--rsync-path", type=str, default=None,
+                   help="Passed to rsync as --rsync-path=<cmd>. Needed "
+                        "when the remote's default shell can't find "
+                        "'rsync' on its PATH -- e.g. a Windows sshd "
+                        "whose cmd.exe shell won't invoke rsync "
+                        "directly; use --rsync-path='wsl -e rsync' "
+                        "to route through WSL.")
+    p.add_argument("--no-remote-mkdir", action="store_true",
+                   help="Skip the pre-transfer 'ssh HOST umask && "
+                        "mkdir -p ...' step. Needed for Windows sshd "
+                        "(cmd.exe doesn't understand umask) and any "
+                        "endpoint without a POSIX shell. rsync's own "
+                        "--mkpath flag is added automatically so the "
+                        "destination path still gets created.")
     p.add_argument("--background", action="store_true",
                    help="Detach from the controlling terminal and run under "
                         "nohup so the batch survives SSH disconnect / logout. "
@@ -1151,6 +1216,8 @@ def main(argv: list[str] | None = None) -> int:
         auto_ssh_agent=not args.no_auto_ssh_agent,
         ssh_host=args.ssh_host,
         remote_base=args.remote_base,
+        rsync_path=args.rsync_path,
+        skip_remote_mkdir=args.no_remote_mkdir,
     )
     if only_subjects and not results and not hard_failures:
         # Picker matched nothing (--only-subjects[-file] entries all

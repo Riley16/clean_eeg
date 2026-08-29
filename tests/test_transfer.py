@@ -814,6 +814,40 @@ def _stub_subprocess_run_for_ssh_agent(monkeypatch, *,
     return call_log
 
 
+def test_transfer_plan_no_remote_mkdir_drops_mkdir_and_adds_mkpath(tmp_path):
+    """Windows sshd (default cmd.exe shell) can't parse 'umask &&
+    mkdir -p ...' -- the operator passes --no-remote-mkdir and rsync's
+    own --mkpath creates the destination instead. This test guards
+    both halves: mkdir_argv empty AND rsync argv has --mkpath."""
+    out = _make_subject_dir(tmp_path)
+    plan = build_transfer_plan(
+        out, subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        ssh_user=None,
+        ssh_host="my-ssh-alias",
+        use_rsync=True,
+        remote_dir_override="/mnt/backup/clean_eeg/R1755A",
+        skip_remote_mkdir=True)
+    assert plan.mkdir_argv == [], plan.mkdir_argv
+    assert "--mkpath" in plan.upload_argv, plan.upload_argv
+
+
+def test_transfer_plan_rsync_path_lands_in_argv(tmp_path):
+    """--rsync-path=<cmd> routes rsync via a specific remote command
+    (e.g. 'wsl -e rsync' on Windows). Must appear as
+    --rsync-path=<cmd> in the argv, before the source/dest pair."""
+    out = _make_subject_dir(tmp_path)
+    plan = build_transfer_plan(
+        out, subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        ssh_user=None,
+        ssh_host="my-ssh-alias",
+        use_rsync=True,
+        remote_dir_override="/mnt/backup/clean_eeg/R1755A",
+        rsync_path="wsl -e rsync")
+    assert "--rsync-path=wsl -e rsync" in plan.upload_argv, plan.upload_argv
+
+
 def test_transfer_plan_omits_user_prefix_when_ssh_user_none(tmp_path):
     """When --user isn't passed, the composed SSH target must be just
     the hostname (no 'user@' prefix), so ssh_config's User directive

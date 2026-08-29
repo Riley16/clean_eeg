@@ -499,6 +499,38 @@ def test_load_subject_paths_ignores_blanks_and_comments(tmp_path):
     assert paths == [Path("/a/b"), Path("/c/d")]
 
 
+def test_transfer_bails_early_on_deterministic_config_error(
+        tmp_path, monkeypatch):
+    """A failure like 'umask is not recognized as an internal or
+    external command' (Windows cmd.exe rejecting POSIX mkdir) cannot
+    succeed on retry -- burning through 5 attempts with exponential
+    backoff just delays the real failure by minutes. Fast-abort after
+    the first attempt for known-deterministic errors."""
+    out = _make_subject_dir(tmp_path)
+    subjects_file = tmp_path / "subjects.txt"
+    subjects_file.write_text(str(out) + "\n")
+
+    attempts = {"n": 0}
+    def _fake_rsync(*a, **k):
+        attempts["n"] += 1
+        return 1, ("mkdir: 'umask' is not recognized as an internal "
+                    "or external command, operable program or batch "
+                    "file."), False
+    monkeypatch.setattr(
+        "clean_eeg.bulk_transfer._run_subject_rsync", _fake_rsync)
+
+    rc = main([
+        "--subjects-file", str(subjects_file),
+        "--user", "alice", "--parallel", "1",
+        "--max-retries", "5", "--backoff-base", "0",
+        "--remote-dir-override", str(tmp_path / "dest"),
+    ])
+    assert rc == 1
+    assert attempts["n"] == 1, (
+        f"deterministic config error should abort after 1 attempt "
+        f"(saw {attempts['n']} retries)")
+
+
 def test_reachability_preflight_aborts_batch_on_unreachable_host(
         tmp_path, monkeypatch, capsys):
     """When the SSH endpoint isn't reachable, the batch must abort with

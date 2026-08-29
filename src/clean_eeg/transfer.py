@@ -392,6 +392,8 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
                          remote_base: str | None = None,
                          skip_perms: bool = False,
                          excluded_names: set[str] | None = None,
+                         rsync_path: str | None = None,
+                         skip_remote_mkdir: bool = False,
                          ) -> TransferPlan:
     # ssh_host is required (no default in the code -- keeps the public
     # repo free of institutional hostnames). Callers can supply
@@ -432,11 +434,17 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
     rsync_target_prefix = f"{ssh_target}:"
 
     # umask 007 → newly-created intermediate dirs are group-rwx. Pre-existing
-    # dirs are untouched.
-    mkdir_argv = [
-        "ssh", ssh_target,
-        f'umask 007 && mkdir -p {remote_dir}',
-    ]
+    # dirs are untouched. Skipped when skip_remote_mkdir=True (e.g.
+    # Windows sshd whose default cmd.exe shell can't parse `umask &&
+    # mkdir -p`); in that case rsync's --mkpath flag creates the
+    # destination itself.
+    if skip_remote_mkdir:
+        mkdir_argv: list[str] = []
+    else:
+        mkdir_argv = [
+            "ssh", ssh_target,
+            f'umask 007 && mkdir -p {remote_dir}',
+        ]
 
     excluded_names = excluded_names or set()
     if use_rsync:
@@ -452,8 +460,22 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
         # output_path alongside the successfully-cleaned files.
         # Trailing slash on source path → copy directory contents
         # (incl. log.out and deidentify.json), not the directory itself.
+        # --rsync-path lets the caller override how rsync is invoked on
+        # the REMOTE side. Needed for destinations where rsync isn't on
+        # the default PATH -- e.g. a Windows sshd whose default shell
+        # (cmd.exe) can't find `rsync`; the operator invokes it via WSL
+        # by passing --rsync-path="wsl -e rsync".
+        rsync_path_args = ([f"--rsync-path={rsync_path}"]
+                           if rsync_path else [])
+        # --mkpath: rsync creates the destination path (including any
+        # missing parent dirs) itself. Enabled when we're skipping the
+        # explicit remote-mkdir step so the destination still gets
+        # created without needing a POSIX shell on the remote.
+        mkpath_args = ["--mkpath"] if skip_remote_mkdir else []
         upload_argv = [
             "rsync", "-avzh", "--partial", "--progress",
+            *rsync_path_args,
+            *mkpath_args,
             "--exclude=quarantine/",
             # Belt-and-suspenders: the raw pre-Presidio annotation dump
             # (clinical_eeg_original_annotations sibling of the transfer
@@ -530,6 +552,8 @@ def build_transfer_plan(output_path: str | Path, *, subject_code: str,
                         remote_base: str | None = None,
                         skip_perms: bool = False,
                         excluded_names: set[str] | None = None,
+                        rsync_path: str | None = None,
+                        skip_remote_mkdir: bool = False,
                         ) -> TransferPlan:
     """Public helper — resolves ``use_rsync`` from ``shutil.which`` if
     not supplied. Exposed so tests can inspect the composed commands
@@ -558,6 +582,8 @@ def build_transfer_plan(output_path: str | Path, *, subject_code: str,
         remote_dir_override=remote_dir_override,
         skip_perms=skip_perms,
         excluded_names=excluded_names,
+        rsync_path=rsync_path,
+        skip_remote_mkdir=skip_remote_mkdir,
         ssh_host=ssh_host,
         remote_base=remote_base,
     )
