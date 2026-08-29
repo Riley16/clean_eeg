@@ -395,6 +395,7 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
                          rsync_path: str | None = None,
                          skip_remote_mkdir: bool = False,
                          remote_mkdir_cmd: str | None = None,
+                         compress: bool = False,
                          ) -> TransferPlan:
     # ssh_host is required (no default in the code -- keeps the public
     # repo free of institutional hostnames). Callers can supply
@@ -482,8 +483,15 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
         # --no-remote-mkdir is used, the operator MUST either pre-create
         # the destination or pass --remote-mkdir with a shell prefix
         # that works on their remote (e.g. "wsl -e mkdir -p" on Windows).
+        # -z dropped from the default flag set: EDFs are binary
+        # (int16 signal blocks) that don't compress; -z burns CPU on
+        # both ends without shrinking the payload, which on
+        # cipher-limited SSH links (a single-core bottleneck) actually
+        # SLOWS throughput. Callers who want it back can pass
+        # `compress=True` to build_transfer_plan or set the CLI flag.
+        compress_args = ["-z"] if compress else []
         upload_argv = [
-            "rsync", "-avzh", "--partial", "--progress",
+            "rsync", "-avh", *compress_args, "--partial", "--progress",
             *rsync_path_args,
             "--exclude=quarantine/",
             # Belt-and-suspenders: the raw pre-Presidio annotation dump
@@ -564,6 +572,7 @@ def build_transfer_plan(output_path: str | Path, *, subject_code: str,
                         rsync_path: str | None = None,
                         skip_remote_mkdir: bool = False,
                         remote_mkdir_cmd: str | None = None,
+                        compress: bool = False,
                         ) -> TransferPlan:
     """Public helper — resolves ``use_rsync`` from ``shutil.which`` if
     not supplied. Exposed so tests can inspect the composed commands
@@ -595,6 +604,7 @@ def build_transfer_plan(output_path: str | Path, *, subject_code: str,
         rsync_path=rsync_path,
         skip_remote_mkdir=skip_remote_mkdir,
         remote_mkdir_cmd=remote_mkdir_cmd,
+        compress=compress,
         ssh_host=ssh_host,
         remote_base=remote_base,
     )

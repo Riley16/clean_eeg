@@ -830,6 +830,38 @@ def test_transfer_plan_skip_remote_mkdir_leaves_mkdir_empty(tmp_path):
     assert plan.mkdir_argv == [], plan.mkdir_argv
 
 
+def test_transfer_plan_defaults_to_no_compression(tmp_path):
+    """rsync -z is dropped from the default flag set (EDFs are binary,
+    -z burns CPU without shrinking the payload). Opt back in with
+    compress=True."""
+    out = _make_subject_dir(tmp_path)
+    plan = build_transfer_plan(
+        out, subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        ssh_user=None, ssh_host="my-ssh-alias",
+        use_rsync=True,
+        remote_dir_override="/tmp/target")
+    assert "-z" not in plan.upload_argv, plan.upload_argv
+    # Base flags survived.
+    assert "-avh" in plan.upload_argv or (
+        "-a" in plan.upload_argv and "-v" in plan.upload_argv), (
+        plan.upload_argv)
+
+
+def test_transfer_plan_compress_flag_re_enables_z(tmp_path):
+    """compress=True adds -z back in for callers with genuinely
+    compressible payloads."""
+    out = _make_subject_dir(tmp_path)
+    plan = build_transfer_plan(
+        out, subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        ssh_user=None, ssh_host="my-ssh-alias",
+        use_rsync=True,
+        remote_dir_override="/tmp/target",
+        compress=True)
+    assert "-z" in plan.upload_argv, plan.upload_argv
+
+
 def test_transfer_plan_remote_mkdir_cmd_swaps_default(tmp_path):
     """remote_mkdir_cmd replaces the POSIX 'umask 007 && mkdir -p'
     with the caller-supplied command (dest path appended). Use case:

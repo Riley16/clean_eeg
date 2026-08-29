@@ -466,6 +466,122 @@ def _run_rsync_with_bwlimit_monitor(argv: list[str],
                         + tail, True)
 
 
+def _split_files_by_size(source_dir: Path,
+                           excluded_names: set[str],
+                           n_chunks: int) -> list[list[str]]:
+    """Bin-pack filenames (relative to ``source_dir``) into ``n_chunks``
+    lists so each chunk carries roughly equal bytes. Greedy heuristic:
+    sort by size descending, drop each file into the currently-lightest
+    chunk. Good enough for the typical Jefferson subject shape (a few
+    big EDFs + many small sidecars) -- keeps parallel rsync flows from
+    finishing wildly out of sync."""
+    entries: list[tuple[int, str]] = []
+    for p in sorted(source_dir.iterdir()):
+        if not p.is_file():
+            continue
+        if p.name in excluded_names:
+            continue
+        entries.append((p.stat().st_size, p.name))
+    entries.sort(reverse=True)  # biggest first
+    chunks: list[list[str]] = [[] for _ in range(n_chunks)]
+    chunk_bytes = [0] * n_chunks
+    for size, name in entries:
+        i = min(range(n_chunks), key=lambda k: chunk_bytes[k])
+        chunks[i].append(name)
+        chunk_bytes[i] += size
+    return chunks
+
+
+def _run_subject_multi_flow(plan: SubjectPlan,
+                              base_upload_argv: list[str],
+                              *,
+                              flows: int,
+                              bwlimit_policy: "BwlimitPolicy",
+                              initial_bwlimit: int | None,
+                              rsync_timeout_s: int,
+                              bwlimit_poll_s: float,
+                              ) -> tuple[int, str, bool]:
+    """Run ``flows`` concurrent rsync processes, each transferring a
+    disjoint subset of the subject's files to the same destination.
+    Aggregates their exit codes: any non-zero → subject fails; any
+    boundary-crossed → subject retries without consuming budget.
+
+    ``base_upload_argv`` is the SINGLE-FLOW argv that build_transfer_plan
+    produced (with all the --exclude=, source, dest tokens). We strip
+    those file-set flags and re-inject a per-chunk --files-from=<path>.
+    """
+    import tempfile
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    chunks = _split_files_by_size(
+        plan.subject_dir, plan.excluded_names, flows)
+    # Drop empty chunks so we don't spawn rsync on nothing.
+    chunks = [c for c in chunks if c]
+    if not chunks:
+        return 0, "", False  # subject was empty (or all excluded)
+    if len(chunks) == 1:
+        # Only enough files for one worker; fall through to single flow.
+        upload_argv = _inject_rsync_flags(
+            base_upload_argv, initial_bwlimit, rsync_timeout_s)
+        return _run_rsync_with_bwlimit_monitor(
+            upload_argv, bwlimit_policy, initial_bwlimit,
+            poll_interval_s=bwlimit_poll_s,
+            stream_prefix=plan.subject_code)
+
+    # Locate the source token (the arg ending in '/') and the dest
+    # token (the last one) in the base argv so we can filter out the
+    # per-file --exclude=<basename> tokens without disturbing the rest.
+    source_arg = f"{plan.subject_dir}/"
+    filtered_argv = [
+        t for t in base_upload_argv
+        if not (t.startswith("--exclude=") and "/" not in t[len("--exclude="):])
+    ]
+
+    with tempfile.TemporaryDirectory(prefix="rsync-flows-") as td:
+        list_paths: list[Path] = []
+        for i, chunk in enumerate(chunks):
+            lp = Path(td) / f"chunk_{i}.txt"
+            lp.write_text("\n".join(chunk) + "\n")
+            list_paths.append(lp)
+
+        def _one_flow(idx: int, list_path: Path
+                       ) -> tuple[int, str, bool]:
+            # rsync --files-from=<list> SOURCE DEST -- paths in the
+            # list are relative to SOURCE. This is disjoint from the
+            # base argv's implicit "everything under SOURCE" semantics.
+            argv = []
+            for tok in filtered_argv:
+                if tok == source_arg:
+                    argv.append(f"--files-from={list_path}")
+                    argv.append(str(plan.subject_dir))
+                    continue
+                argv.append(tok)
+            argv = _inject_rsync_flags(
+                argv, initial_bwlimit, rsync_timeout_s)
+            return _run_rsync_with_bwlimit_monitor(
+                argv, bwlimit_policy, initial_bwlimit,
+                poll_interval_s=bwlimit_poll_s,
+                stream_prefix=f"{plan.subject_code}/flow{idx + 1}")
+
+        results: list[tuple[int, str, bool]] = []
+        with ThreadPoolExecutor(
+                max_workers=len(chunks),
+                thread_name_prefix=f"flow-{plan.subject_code}") as pool:
+            futs = {pool.submit(_one_flow, i, lp): i
+                    for i, lp in enumerate(list_paths)}
+            for fut in as_completed(futs):
+                results.append(fut.result())
+
+    # Aggregate: worst outcome wins so the caller retries appropriately.
+    for code, err, boundary in results:
+        if boundary:
+            return code, f"multi-flow: {err}", True
+    for code, err, boundary in results:
+        if code != 0:
+            return code, f"multi-flow: {err}", False
+    return 0, "", False
+
+
 def _run_subject_rsync(plan: SubjectPlan,
                        ssh_user: str | None,
                        bwlimit_policy: "BwlimitPolicy",
@@ -477,6 +593,8 @@ def _run_subject_rsync(plan: SubjectPlan,
                        rsync_path: str | None = None,
                        skip_remote_mkdir: bool = False,
                        remote_mkdir_cmd: str | None = None,
+                       compress: bool = False,
+                       flows: int = 1,
                        ) -> tuple[int, str, bool]:
     """Compose the mkdir + rsync + perms sequence for ONE subject and
     execute them. Returns ``(exit_code, error_message, boundary_crossed)``.
@@ -505,21 +623,36 @@ def _run_subject_rsync(plan: SubjectPlan,
         rsync_path=rsync_path,
         skip_remote_mkdir=skip_remote_mkdir,
         remote_mkdir_cmd=remote_mkdir_cmd,
+        compress=compress,
     )
 
     initial_bwlimit = bwlimit_policy.current_kbps()
-    upload_argv = _inject_rsync_flags(
-        tplan.upload_argv, initial_bwlimit, rsync_timeout_s)
 
     if tplan.mkdir_argv:
         code, err = _run_short(tplan.mkdir_argv)
         if code != 0:
             return code, f"mkdir: {err}", False
 
-    code, err, boundary = _run_rsync_with_bwlimit_monitor(
-        upload_argv, bwlimit_policy, initial_bwlimit,
-        poll_interval_s=bwlimit_poll_s,
-        stream_prefix=plan.subject_code)
+    # Multi-flow within the subject: split the source's transferable
+    # files into ``flows`` chunks and run one rsync per chunk in
+    # parallel, each getting its own SSH channel. Helps when a single
+    # SSH stream is CPU/window-size limited (e.g. tunnel-through-VPS
+    # setups where each channel has independent throughput).
+    if flows > 1:
+        code, err, boundary = _run_subject_multi_flow(
+            plan, tplan.upload_argv, flows=flows,
+            bwlimit_policy=bwlimit_policy,
+            initial_bwlimit=initial_bwlimit,
+            rsync_timeout_s=rsync_timeout_s,
+            bwlimit_poll_s=bwlimit_poll_s,
+        )
+    else:
+        upload_argv = _inject_rsync_flags(
+            tplan.upload_argv, initial_bwlimit, rsync_timeout_s)
+        code, err, boundary = _run_rsync_with_bwlimit_monitor(
+            upload_argv, bwlimit_policy, initial_bwlimit,
+            poll_interval_s=bwlimit_poll_s,
+            stream_prefix=plan.subject_code)
     if code != 0 or boundary:
         return code, f"rsync: {err}", boundary
 
@@ -545,6 +678,8 @@ def transfer_one_subject_with_retry(plan: SubjectPlan, *,
                                     rsync_path: str | None = None,
                                     skip_remote_mkdir: bool = False,
                                     remote_mkdir_cmd: str | None = None,
+                                    compress: bool = False,
+                                    flows: int = 1,
                                     ) -> SubjectResult:
     """Transfer one subject with exponential-backoff retry. Returns
     a ``SubjectResult`` regardless of outcome (never raises).
@@ -581,7 +716,9 @@ def transfer_one_subject_with_retry(plan: SubjectPlan, *,
             ssh_host=ssh_host, remote_base=remote_base,
             rsync_path=rsync_path,
             skip_remote_mkdir=skip_remote_mkdir,
-            remote_mkdir_cmd=remote_mkdir_cmd)
+            remote_mkdir_cmd=remote_mkdir_cmd,
+            compress=compress,
+            flows=flows)
         attempt_elapsed = time.perf_counter() - attempt_start
         if log:
             log.emit("rsync_exit", subject=plan.subject_code,
@@ -694,6 +831,8 @@ def run_bulk_transfer(subject_dirs: list[Path],
                       rsync_path: str | None = None,
                       skip_remote_mkdir: bool = False,
                       remote_mkdir_cmd: str | None = None,
+                      compress: bool = False,
+                      flows: int = 1,
                       ) -> tuple[list[SubjectResult], list[tuple[Path, str]]]:
     """Drive the whole batch. Returns
     ``(subject_results, preflight_hard_failures)``.
@@ -801,10 +940,38 @@ def run_bulk_transfer(subject_dirs: list[Path],
                   "no rsyncs will run.", flush=True)
         else:
             total_gb = sum(p.transferable_bytes for p in ready) / 1e9
+            flows_note = f" x {flows} flows/subject" if flows > 1 else ""
             print(f"[transfer] starting {len(ready)} rsync worker(s) "
-                  f"(parallel={parallel}, {total_gb:.2f} GB total). "
-                  f"Per-subject progress prints on completion.",
-                  flush=True)
+                  f"(parallel={parallel}{flows_note}, "
+                  f"{total_gb:.2f} GB total). Per-subject progress "
+                  f"prints on completion.", flush=True)
+
+        # Aggregate throughput heartbeat: every 30s, print the total
+        # completed-subject bytes / rate so the operator can tell at a
+        # glance whether the batch is making progress even when a
+        # single subject's rsync is mid-transfer and silent.
+        total_bytes = sum(p.transferable_bytes for p in ready)
+        heartbeat_stop = threading.Event()
+
+        def _heartbeat():
+            while not heartbeat_stop.wait(30.0):
+                elapsed = time.perf_counter() - batch_start
+                done = sum(1 for r in results if r.succeeded)
+                mbs = ((completed_bytes / elapsed) / 1e6
+                       if elapsed > 0 else 0)
+                pct = (100 * completed_bytes / total_bytes
+                       if total_bytes else 0)
+                print(f"[heartbeat] elapsed {_format_hms(elapsed)}, "
+                      f"{done}/{len(ready)} subject(s) shipped, "
+                      f"{completed_bytes / 1e9:.2f}/{total_bytes / 1e9:.2f} "
+                      f"GB ({pct:.1f}%), aggregate "
+                      f"{mbs:.1f} MB/s across all subjects.",
+                      flush=True)
+
+        hb_thread = threading.Thread(target=_heartbeat, daemon=True,
+                                       name="transfer-heartbeat")
+        if ready:
+            hb_thread.start()
 
         def _worker(plan: SubjectPlan) -> SubjectResult:
             return transfer_one_subject_with_retry(
@@ -817,6 +984,8 @@ def run_bulk_transfer(subject_dirs: list[Path],
                 rsync_path=rsync_path,
                 skip_remote_mkdir=skip_remote_mkdir,
                 remote_mkdir_cmd=remote_mkdir_cmd,
+                compress=compress,
+                flows=flows,
             )
 
         with ThreadPoolExecutor(max_workers=parallel) as pool:
@@ -865,6 +1034,7 @@ def run_bulk_transfer(subject_dirs: list[Path],
                                     n_total=len(ready), batch_start=batch_start)
                     last_progress = now
 
+        heartbeat_stop.set()
         elapsed = time.perf_counter() - batch_start
         n_success = sum(1 for r in results if r.succeeded)
         log.emit("batch_complete",
@@ -1109,6 +1279,23 @@ def _build_parser() -> argparse.ArgumentParser:
                         "shell can't handle POSIX -- e.g. Windows sshd "
                         "with --remote-mkdir=\"wsl -e mkdir -p\" "
                         "invokes mkdir via WSL.")
+    p.add_argument("--flows-per-subject", type=int, default=1,
+                   metavar="N",
+                   help="Split each subject's files across N concurrent "
+                        "rsync processes (each on its own SSH channel). "
+                        "Helps when a single stream is CPU-bound or "
+                        "hits per-connection window limits (tunnel-via-"
+                        "VPS setups). Files are bin-packed by size so "
+                        "the N flows finish close together. Default 1 "
+                        "(single stream, existing behaviour).")
+    p.add_argument("--compress", action="store_true",
+                   help="Re-enable rsync's -z compression. Dropped from "
+                        "the default flag set because EDF payloads are "
+                        "binary and don't compress; -z burns CPU on "
+                        "both ends without shrinking the wire bytes, "
+                        "which on a cipher-limited SSH link slows the "
+                        "transfer. Turn back on only for text-heavy or "
+                        "known-compressible payloads.")
     p.add_argument("--background", action="store_true",
                    help="Detach from the controlling terminal and run under "
                         "nohup so the batch survives SSH disconnect / logout. "
@@ -1235,6 +1422,8 @@ def main(argv: list[str] | None = None) -> int:
         rsync_path=args.rsync_path,
         skip_remote_mkdir=args.no_remote_mkdir,
         remote_mkdir_cmd=args.remote_mkdir,
+        compress=args.compress,
+        flows=args.flows_per_subject,
     )
     if only_subjects and not results and not hard_failures:
         # Picker matched nothing (--only-subjects[-file] entries all

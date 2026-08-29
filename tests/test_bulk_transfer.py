@@ -499,6 +499,33 @@ def test_load_subject_paths_ignores_blanks_and_comments(tmp_path):
     assert paths == [Path("/a/b"), Path("/c/d")]
 
 
+def test_split_files_by_size_produces_balanced_chunks(tmp_path):
+    """Bin-packer keeps parallel rsync flows near-equal in total bytes.
+    With 3 files sized 100/50/50 and 2 chunks, the split should be
+    [100] and [50,50] -- NOT [100,50] and [50]."""
+    from clean_eeg.bulk_transfer import _split_files_by_size
+    src = tmp_path / "src"; src.mkdir()
+    (src / "big.edf").write_bytes(b"x" * 100)
+    (src / "med1.edf").write_bytes(b"x" * 50)
+    (src / "med2.edf").write_bytes(b"x" * 50)
+    chunks = _split_files_by_size(src, set(), 2)
+    totals = sorted(sum((src / n).stat().st_size for n in c)
+                    for c in chunks)
+    assert totals == [100, 100], (chunks, totals)
+
+
+def test_split_files_by_size_excludes_named_files(tmp_path):
+    """Files in the excluded_names set are dropped from the split entirely."""
+    from clean_eeg.bulk_transfer import _split_files_by_size
+    src = tmp_path / "src"; src.mkdir()
+    (src / "keep.edf").write_bytes(b"x" * 10)
+    (src / "skip.edf").write_bytes(b"x" * 999)
+    chunks = _split_files_by_size(src, {"skip.edf"}, 2)
+    all_names = [n for c in chunks for n in c]
+    assert "skip.edf" not in all_names
+    assert "keep.edf" in all_names
+
+
 def test_transfer_bails_early_on_deterministic_config_error(
         tmp_path, monkeypatch):
     """A failure like 'umask is not recognized as an internal or
