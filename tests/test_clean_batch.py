@@ -382,10 +382,49 @@ def test_run_batch_continues_after_a_failed_subject(tmp_path):
     assert [o.row_index for o in outcomes] == [1, 2, 3]
 
 
+def test_run_batch_parallel_completes_all_subjects_and_preserves_order(
+        tmp_path):
+    """parallel=N dispatches N subject subprocesses concurrently and
+    yields ALL outcomes in CSV row-index order (not completion order),
+    so downstream code (summary, review phase) reads deterministically."""
+    argv_prefix = _make_stub_child(tmp_path, exit_code=0)
+    rows = [
+        SubjectRow(input_path=f"/i/{i}", output_path=f"/o/{i}",
+                   subject_code=f"R{i}", first_name="J", last_name="S",
+                   middle_name=None, row_index=i)
+        for i in (1, 2, 3, 4)
+    ]
+    outcomes = run_batch(rows, argv_prefix=argv_prefix, parallel=2,
+                          heartbeat_interval_s=999)
+    # Order preserved despite as_completed dispatching non-deterministic.
+    assert [o.subject_code for o in outcomes] == ["R1", "R2", "R3", "R4"]
+    assert all(o.succeeded for o in outcomes)
+
+
+def test_run_batch_parallel_prefixes_output_per_subject(tmp_path, capsys):
+    """With parallel > 1, each subject's child output is line-prefixed
+    with [SUBJECT_CODE] so parallel workers' logs stay grep-able."""
+    # Child prints a marker to stdout so we can assert prefixing.
+    marker_child = tmp_path / "marker_child.py"
+    marker_child.write_text(
+        "import sys; print('CHILD_MARKER'); sys.exit(0)\n")
+    argv_prefix = [sys.executable, str(marker_child)]
+
+    rows = [
+        SubjectRow(input_path="/i", output_path="/o", subject_code="R1",
+                   first_name="J", last_name="S",
+                   middle_name=None, row_index=1),
+    ]
+    run_batch(rows, argv_prefix=argv_prefix, parallel=2,
+               heartbeat_interval_s=999)
+    out = capsys.readouterr().out
+    assert "[R1] CHILD_MARKER" in out, out
+
+
 def test_run_batch_calls_clean_one_subject_per_row_in_order(tmp_path):
     """run_batch preserves CSV order AND yields one Outcome per row.
-    Serial execution is the design intent -- parallel per-subject
-    cleaning would fight over Presidio's global model caches."""
+    Sequential path (parallel=1); the parallel path is covered
+    separately by test_run_batch_parallel_*."""
     argv_prefix = _make_stub_child(tmp_path, exit_code=0)
     rows = [
         SubjectRow(input_path=f"/i/{i}", output_path=f"/o/{i}",

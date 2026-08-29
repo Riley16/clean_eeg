@@ -19,10 +19,12 @@ own bookkeeping fields alongside the required ones.
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import os
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -195,13 +197,56 @@ def _default_clean_argv_prefix() -> list[str]:
             "signal-header-mismatch"]
 
 
+def _stream_subprocess_with_prefix(argv: list[str], prefix: str
+                                     ) -> tuple[int, str | None]:
+    """Popen ``argv`` and echo every stdout+stderr line to sys.stdout
+    prefixed with ``[<prefix>]``. Keeps the last 1000 chars of output
+    for the failure-message tail. Returns ``(exit_code, err_tail)``.
+
+    Used by parallel batch mode so multiple concurrent subject clean
+    subprocesses don't produce interleaved unattributed output --
+    the operator can grep by [SUBJECT_CODE] to trace any single one.
+    """
+    tail = collections.deque(maxlen=100)
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT,
+                                 text=True, bufsize=1)
+    except (subprocess.SubprocessError, OSError) as e:
+        return 255, f"{type(e).__name__}: {e}"
+    try:
+        # readline() returns line-by-line; when the child closes
+        # stdout on exit, readline() returns "" and we break.
+        assert proc.stdout is not None
+        for raw in iter(proc.stdout.readline, ""):
+            line = raw.rstrip("\n")
+            sys.stdout.write(f"[{prefix}] {line}\n")
+            sys.stdout.flush()
+            tail.append(line)
+        proc.wait()
+    except Exception as e:
+        proc.kill(); proc.wait()
+        return 255, f"{type(e).__name__}: {e}"
+    if proc.returncode != 0:
+        err_tail = "\n".join(list(tail)[-20:])[-1000:]
+        return proc.returncode, (
+            err_tail or f"clean_subject_eeg exited {proc.returncode}")
+    return proc.returncode, None
+
+
 def clean_one_subject(row: SubjectRow, *, extra_argv: list[str] | None = None,
                       argv_prefix: list[str] | None = None,
                       stream_output: bool = True,
+                      prefix_output: str | None = None,
                       ) -> SubjectOutcome:
     """Shell out to ``clean_subject_eeg`` for one row. Streams the
     child's stdout+stderr to the parent's terminal by default so an
     operator watching the batch sees per-file progress live.
+
+    ``prefix_output``: when set, streams the child's output line-by-
+    line to sys.stdout with each line prefixed by ``[<prefix>]``. Used
+    by parallel batch mode where multiple subject clean subprocesses
+    would otherwise interleave anonymously.
 
     Never raises; a subprocess or OS-level error is captured into the
     ``error_message`` field and the exit code is fabricated as 255.
@@ -210,16 +255,20 @@ def clean_one_subject(row: SubjectRow, *, extra_argv: list[str] | None = None,
         extra_argv=extra_argv)
     start = time.perf_counter()
     try:
-        if stream_output:
+        if prefix_output is not None:
+            exit_code, error_message = _stream_subprocess_with_prefix(
+                argv, prefix_output)
+        elif stream_output:
             proc = subprocess.run(argv)
             error_message = None if proc.returncode == 0 else (
                 f"clean_subject_eeg exited {proc.returncode}")
+            exit_code = proc.returncode
         else:
             proc = subprocess.run(argv, capture_output=True, text=True)
             error_message = None if proc.returncode == 0 else (
                 (proc.stderr or proc.stdout or "").strip()[-1000:]
                 or f"clean_subject_eeg exited {proc.returncode}")
-        exit_code = proc.returncode
+            exit_code = proc.returncode
     except (subprocess.SubprocessError, OSError) as e:
         exit_code = 255
         error_message = f"{type(e).__name__}: {e}"
@@ -334,14 +383,29 @@ def run_batch(rows: list[SubjectRow], *,
               stream_output: bool = True,
               audit_after_clean: bool = False,
               audit_argv_prefix: list[str] | None = None,
+              parallel: int = 1,
+              heartbeat_interval_s: int = 30,
               ) -> list[SubjectOutcome]:
-    """Iterate ``rows`` sequentially, calling :func:`clean_one_subject`
-    on each. If ``audit_after_clean``, runs ``audit-subject-eeg`` on
-    the output_path after a successful clean; audit failures roll up
-    into the SubjectOutcome and count against the batch exit code.
-    Continues past per-subject failures; caller reads the returned
-    list to decide the process exit code.
+    """Drive the batch. If ``parallel`` > 1, dispatch subjects via a
+    ThreadPoolExecutor of that width; each worker's output is line-
+    prefixed with ``[SUBJECT_CODE]`` so parallel logs stay grep-able.
+    A heartbeat thread prints "N/M done, K in flight" every 30s so the
+    operator can confirm work is happening even when individual
+    subjects are quiet.
+
+    If ``audit_after_clean``, runs ``audit-subject-eeg`` on the
+    output_path after a successful clean; audit failures roll up into
+    the SubjectOutcome and count against the batch exit code. Continues
+    past per-subject failures; caller reads the returned list to
+    decide the process exit code.
     """
+    if parallel > 1:
+        return _run_batch_parallel(
+            rows, extra_argv=extra_argv, argv_prefix=argv_prefix,
+            audit_after_clean=audit_after_clean,
+            audit_argv_prefix=audit_argv_prefix,
+            parallel=parallel,
+            heartbeat_interval_s=heartbeat_interval_s)
     outcomes: list[SubjectOutcome] = []
     total = len(rows)
     for row in rows:
@@ -379,6 +443,103 @@ def run_batch(rows: list[SubjectRow], *,
         print(f"[{row.row_index}/{total}] {status} {row.subject_code}  "
               f"(clean {outcome.elapsed_s:.1f} s, "
               f"exit={outcome.exit_code}){aud}", flush=True)
+    return outcomes
+
+
+def _run_batch_parallel(rows: list[SubjectRow], *,
+                          extra_argv: list[str] | None,
+                          argv_prefix: list[str] | None,
+                          audit_after_clean: bool,
+                          audit_argv_prefix: list[str] | None,
+                          parallel: int,
+                          heartbeat_interval_s: int,
+                          ) -> list[SubjectOutcome]:
+    """Parallel batch worker. See run_batch() for semantics."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    outcomes: list[SubjectOutcome] = []
+    total = len(rows)
+    in_flight: set[str] = set()
+    lock = threading.Lock()
+    batch_start = time.perf_counter()
+    hb_stop = threading.Event()
+
+    def _heartbeat():
+        while not hb_stop.wait(heartbeat_interval_s):
+            elapsed = time.perf_counter() - batch_start
+            with lock:
+                done = len(outcomes)
+                inflight_snapshot = sorted(in_flight)
+            hrs, rem = divmod(int(elapsed), 3600)
+            mins, secs = divmod(rem, 60)
+            print(f"\n[heartbeat] {hrs:02d}:{mins:02d}:{secs:02d} elapsed, "
+                  f"{done}/{total} subject(s) complete, "
+                  f"{len(inflight_snapshot)} in flight: "
+                  f"{', '.join(inflight_snapshot) or '(none)'}",
+                  flush=True)
+    hb_thread = threading.Thread(target=_heartbeat, daemon=True,
+                                   name="clean-batch-heartbeat")
+    hb_thread.start()
+
+    def _work_one(row: SubjectRow) -> SubjectOutcome:
+        with lock:
+            in_flight.add(row.subject_code)
+        try:
+            outcome = clean_one_subject(
+                row, extra_argv=extra_argv, argv_prefix=argv_prefix,
+                # Prefix per-subject so parallel workers' output stays
+                # attributable (grep [R1XXXA] for one subject's log).
+                prefix_output=row.subject_code)
+            if audit_after_clean and outcome.clean_succeeded:
+                effective_prefix = (audit_argv_prefix
+                                     or _default_audit_argv_prefix()
+                                     + POST_CLEAN_AUDIT_FLAGS)
+                # Audit also prefixed so its lines are attributable.
+                argv = effective_prefix + [outcome.output_path]
+                exit_code, err = _stream_subprocess_with_prefix(
+                    argv, f"{row.subject_code}:audit")
+                outcome.audit_exit_code = exit_code
+                outcome.audit_elapsed_s = 0.0
+                outcome.audit_error_message = err
+        finally:
+            with lock:
+                in_flight.discard(row.subject_code)
+        return outcome
+
+    print(f"[batch] starting {total} subject(s) with parallel={parallel}. "
+          f"Per-subject output prefixed [SUBJECT_CODE]. "
+          f"Heartbeat every {heartbeat_interval_s}s.",
+          flush=True)
+    with ThreadPoolExecutor(max_workers=parallel,
+                              thread_name_prefix="clean-worker") as pool:
+        futures = {pool.submit(_work_one, row): row for row in rows}
+        for fut in as_completed(futures):
+            row = futures[fut]
+            try:
+                outcome = fut.result()
+            except Exception as e:
+                outcome = SubjectOutcome(
+                    row_index=row.row_index,
+                    subject_code=row.subject_code,
+                    input_path=row.input_path,
+                    output_path=row.output_path,
+                    exit_code=255, elapsed_s=0.0,
+                    error_message=f"worker crash: {type(e).__name__}: {e}",
+                )
+            with lock:
+                outcomes.append(outcome)
+            status = "OK " if outcome.succeeded else "FAIL"
+            aud = ""
+            if outcome.audit_exit_code is not None:
+                aud = f"  audit_exit={outcome.audit_exit_code}"
+            print(f"[{row.row_index}/{total}] {status} "
+                  f"{row.subject_code}  "
+                  f"(clean {outcome.elapsed_s:.1f} s, "
+                  f"exit={outcome.exit_code}){aud}", flush=True)
+
+    hb_stop.set()
+    # Preserve input order for the summary + downstream review phase.
+    outcomes.sort(key=lambda o: o.row_index)
     return outcomes
 
 
@@ -578,6 +739,15 @@ def _build_parser() -> argparse.ArgumentParser:
                          "audit-subject-eeg against the output_path. "
                          "Audit failures roll up into the subject's "
                          "outcome and count against the batch exit code."))
+    p.add_argument("--parallel", type=int, default=1, metavar="N",
+                   help=("Run N subject clean subprocesses concurrently "
+                         "(default: 1, sequential). Each worker's output "
+                         "is line-prefixed with [SUBJECT_CODE] so parallel "
+                         "logs stay grep-able. A heartbeat line every 30s "
+                         "shows how many subjects are complete and which "
+                         "are still in flight. Watch memory / network I/O "
+                         "-- N=4 on a 130-file-per-subject workload can "
+                         "saturate NFS."))
     p.add_argument("--no-review-after-batch", "--no_review_after_batch",
                    dest="no_review_after_batch", action="store_true",
                    help=("Suppress the post-batch review phase (default: "
@@ -633,7 +803,8 @@ def main(argv: list[str] | None = None) -> int:
     outcomes = run_batch(
         rows, extra_argv=extra,
         stream_output=not args.quiet_child_output,
-        audit_after_clean=args.audit_after_clean)
+        audit_after_clean=args.audit_after_clean,
+        parallel=args.parallel)
     _print_summary(outcomes)
 
     if not args.no_review_after_batch:
