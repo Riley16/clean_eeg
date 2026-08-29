@@ -776,6 +776,12 @@ def _stub_subprocess_run_for_ssh_agent(monkeypatch, *,
     real_run = _tr.subprocess.run
     call_log: list[list[str]] = []
 
+    # Fake fingerprint returned by `ssh-keygen -lf <key>` and echoed
+    # into `ssh-add -l` output so the per-key `_agent_has_key` check
+    # sees a match when ssh_add_l_exit=0 (i.e. "the loaded key is the
+    # one we're asking about").
+    _FAKE_FP = "SHA256:AAAAtestfingerprintBBBB"
+
     class _P:
         def __init__(self, rc: int, out: str = "", err: str = ""):
             self.returncode = rc
@@ -785,7 +791,12 @@ def _stub_subprocess_run_for_ssh_agent(monkeypatch, *,
     def _run(argv, **kw):
         call_log.append(list(argv))
         if argv[:2] == ["ssh-add", "-l"]:
-            return _P(ssh_add_l_exit)
+            return _P(ssh_add_l_exit,
+                      out=(f"256 {_FAKE_FP} test (ED25519)\n"
+                            if ssh_add_l_exit == 0 else ""))
+        if argv[:2] == ["ssh-keygen", "-lf"]:
+            # Match the real ssh-keygen output shape: "<bits> <fp> ..."
+            return _P(0, f"256 {_FAKE_FP} test (ED25519)\n")
         if argv[:2] == ["ssh-agent", "-s"]:
             if ssh_agent_stdout is None:
                 raise FileNotFoundError("ssh-agent not on PATH")
@@ -801,6 +812,63 @@ def _stub_subprocess_run_for_ssh_agent(monkeypatch, *,
 
     monkeypatch.setattr(_tr.subprocess, "run", _run)
     return call_log
+
+
+def test_ensure_ssh_agent_reloads_when_agent_has_other_keys_but_not_this_one(
+        monkeypatch, capsys, tmp_path):
+    """Regression: the agent may have a github key (or similar) loaded
+    while the transfer key isn't. A prior version keyed off "any key
+    loaded" and would skip the ssh-add pass, letting the batch dispatch
+    with an agent that couldn't auth the transfer -- every subject
+    would fail with Permission denied under BatchMode.
+
+    The per-key fingerprint check catches this by re-loading when the
+    specific transfer key isn't in `ssh-add -l`."""
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.delenv("SSH_AGENT_PID", raising=False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    fake_key = tmp_path / "transfer_key"
+    fake_key.write_text("stub")
+
+    # Stub returns the OTHER key's fingerprint in `ssh-add -l` but the
+    # ssh-keygen -lf of our key returns a DIFFERENT fingerprint -- so
+    # _agent_has_key(transfer_key) is False even though the agent has
+    # "some" key loaded. Expected behaviour: proceed with ssh-add.
+    import clean_eeg.transfer as _tr
+    call_log: list[list[str]] = []
+    OTHER_FP = "SHA256:agent-holds-github-key"
+    OUR_FP = "SHA256:the-transfer-key"
+
+    class _P:
+        def __init__(self, rc, out="", err=""):
+            self.returncode = rc; self.stdout = out; self.stderr = err
+
+    def _run(argv, **kw):
+        call_log.append(list(argv))
+        if argv[:2] == ["ssh-add", "-l"]:
+            return _P(0, out=f"256 {OTHER_FP} github (ED25519)\n")
+        if argv[:2] == ["ssh-keygen", "-lf"]:
+            return _P(0, out=f"256 {OUR_FP} transfer (ED25519)\n")
+        if argv[:1] == ["ssh-add"] and len(argv) >= 2:
+            return _P(0)  # ssh-add of our key succeeds
+        if argv[:2] == ["ssh-agent", "-s"]:
+            return _P(0, out="SSH_AUTH_SOCK=/tmp/fake; export SSH_AUTH_SOCK;\n"
+                              "SSH_AGENT_PID=1; export SSH_AGENT_PID;\n")
+        if argv[:2] == ["ssh-agent", "-k"]:
+            return _P(0)
+        raise AssertionError(f"unexpected subprocess: {argv}")
+
+    monkeypatch.setattr(_tr.subprocess, "run", _run)
+
+    _tr.ensure_ssh_agent(key_path=fake_key)
+
+    # Must have called ssh-add on OUR key path, not just short-circuited.
+    added = [c for c in call_log if c[:1] == ["ssh-add"] and len(c) >= 2
+             and c[1] == str(fake_key)]
+    assert added, (
+        f"ensure_ssh_agent must attempt to load the specific key even "
+        f"when the agent has other keys; call log: {call_log}")
 
 
 def test_ensure_ssh_agent_noop_when_keys_already_loaded(monkeypatch, capsys,

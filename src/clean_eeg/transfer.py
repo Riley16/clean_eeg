@@ -641,6 +641,40 @@ def _agent_has_keys() -> bool:
     return proc.returncode == 0
 
 
+def _key_fingerprint(key_path: Path) -> str | None:
+    """Fingerprint of the (private OR public) key at ``key_path`` via
+    ``ssh-keygen -lf``. ssh-keygen accepts either half of the pair and
+    returns the same fingerprint, so we can call it against the private
+    key path the operator supplied. Returns None on any failure."""
+    try:
+        proc = subprocess.run(["ssh-keygen", "-lf", str(key_path)],
+                                capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    # Format: "<bits> <fingerprint> <comment> (<type>)"
+    parts = proc.stdout.strip().split()
+    return parts[1] if len(parts) >= 2 else None
+
+
+def _agent_has_key(key_path: Path) -> bool:
+    """True iff the agent has THIS SPECIFIC key loaded (by fingerprint).
+    Distinct from _agent_has_keys() which only checks "any key loaded" --
+    a shell agent holding a github key but NOT the transfer key would
+    fool the naive check and let SSH fall back to a passphrase prompt
+    that never fires under BatchMode."""
+    fp = _key_fingerprint(key_path)
+    if fp is None:
+        return False
+    try:
+        proc = subprocess.run(["ssh-add", "-l"], capture_output=True,
+                                text=True, timeout=5)
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return False
+    return proc.returncode == 0 and fp in proc.stdout
+
+
 def _spawn_ssh_agent() -> bool:
     """Spawn a fresh ssh-agent, parse its stdout env exports, set the
     corresponding env vars in this process's os.environ so subprocesses
@@ -727,8 +761,18 @@ def ensure_ssh_agent(key_path: Path | None = None,
     """
     key_path = key_path or DEFAULT_SSH_KEY_PATH
 
-    # Step 1: already good?
-    if _agent_has_keys():
+    # Step 1: is THIS SPECIFIC key already in the agent? A prior
+    # version only checked "any key loaded" which let a shell agent
+    # holding e.g. a github key mask that the transfer key wasn't
+    # loaded -- rsync would then fall back to a passphrase prompt that
+    # BatchMode refused to answer, and every subject failed with
+    # "Permission denied (publickey)".
+    if key_path.exists() and _agent_has_key(key_path):
+        return
+    # Fallback: if we can't fingerprint the key file (e.g. permissions,
+    # ssh-keygen not installed), fall back to the coarse "any key
+    # loaded" check so we don't gratuitously re-prompt.
+    if not key_path.exists() and _agent_has_keys():
         return
 
     if not auto:
@@ -768,10 +812,28 @@ def ensure_ssh_agent(key_path: Path | None = None,
         if proc.returncode != 0:
             _print_ssh_agent_manual_hint(
                 key_path, ssh_add_returncode=proc.returncode)
+            return
     except (FileNotFoundError, subprocess.SubprocessError, OSError) as e:
         print(f"[transfer] ssh-add failed ({type(e).__name__}: {e}). "
               f"Continuing without the agent.", flush=True)
         _print_ssh_agent_manual_hint(key_path)
+        return
+
+    # Post-add verification: confirm the fingerprint we intended to load
+    # actually shows up in `ssh-add -l`. Catches subtle failures like a
+    # mistyped passphrase that ssh-add still exits 0 for on some
+    # OpenSSH builds, and gives the operator a confirmation line before
+    # the batch dispatches parallel rsyncs.
+    if _agent_has_key(key_path):
+        print(f"[transfer] key loaded into agent (fingerprint verified).",
+              flush=True)
+    else:
+        print(f"[transfer] WARNING: ssh-add exited 0 but the key's "
+              f"fingerprint is not in `ssh-add -l`. Downstream rsyncs "
+              f"will likely fail with Permission denied. Investigate:\n"
+              f"    ssh-add -l\n"
+              f"    ssh-add {key_path}",
+              file=sys.stderr, flush=True)
 
 
 def transfer_subject(output_path: str | Path, *,
