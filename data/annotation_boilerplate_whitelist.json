@@ -3,7 +3,9 @@
     ".{1,5}",
     "(?i)(?:\\S{1,5} )?(?:artifact|asleep|awake|spikes?|review|no seizures)(?: \\S{1,5})?",
     "(?i)Mark(?: \\S{1,5})?",
-    "\\*+\\s*"
+    "\\*+\\s*",
+    "(?i)awake-np",
+    "(?i).{0,7}spikes?"
   ],
   "per_site": {
     "S": [],

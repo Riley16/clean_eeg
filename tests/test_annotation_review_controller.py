@@ -852,6 +852,43 @@ def test_preload_all_keeps_files_with_partial_boilerplate(tmp_path):
     c.close()
 
 
+def test_preload_all_preserves_files_when_auto_drop_disabled(tmp_path):
+    """auto_drop_whitelisted_files=False: --preload-all still eagerly
+    loads every file's annotations (for the perf win) but the
+    100%-whitelisted files stay in the reviewable set and are NOT
+    silently written to the reviewed-files tracker. This is the path
+    --rerun-annot-review takes so a "force re-review" flag actually
+    surfaces every file rather than being undone by the auto-drop."""
+    import json as _json
+    subj = _make_subject(tmp_path, "R1755A", {
+        "all_boilerplate.edf": ["PAT REF EEG", "PAT REF EEG"],
+        "has_real.edf": ["seizure onset", "eyes closed"],
+    })
+    wl_path = tmp_path / "wl.json"
+    wl_path.write_text(_json.dumps({
+        "shared": [], "per_site": {"A": [r"PAT REF EEG"]}}))
+
+    c = AnnotationReviewController(subj, whitelist_path=wl_path,
+                                     preload_all=True,
+                                     auto_drop_whitelisted_files=False)
+    reviewable_names = [c._edfs[i].name for i in c._file_indices]
+    # 100%-whitelisted file is preserved rather than dropped.
+    assert "all_boilerplate.edf" in reviewable_names
+    assert "has_real.edf" in reviewable_names
+
+    # Tracker was NOT silently populated -- the operator is expected
+    # to walk every file before it gets marked reviewed.
+    from clean_eeg.annotation_review.journal import ReviewedTracker
+    reviewed = {r.file_path for r in ReviewedTracker(subj).read_all()}
+    assert reviewed == set(), (
+        "auto_drop_whitelisted_files=False must not write to the "
+        f"reviewed tracker; found: {reviewed}")
+
+    # Preload still happened -- cache is populated for both files.
+    assert all(fi in c._annotations_cache for fi in c._file_indices)
+    c.close()
+
+
 def test_controller_close_shuts_down_prefetch_pool(tmp_path):
     """Regression: close() must shutdown the ThreadPoolExecutor so
     hanging daemon threads don't outlive the process. Verified by
