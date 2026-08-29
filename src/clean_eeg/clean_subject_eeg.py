@@ -1283,7 +1283,6 @@ def _audit_signal_integrity(orig_signals: list, clean_file_path: str, filename: 
     # in clean_subject_edf_files carries running counts, and the
     # manifest records n_files_deidentified for post-hoc verification.
     # Failures still raise loudly (see the RuntimeErrors above).
-    _ = (n_data_signals, spot_idx)
 
 
 def convert_edfC_to_edfD(input_file: str):

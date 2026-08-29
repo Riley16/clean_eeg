@@ -784,6 +784,52 @@ def test_audit_madvise_hint_is_correctness_neutral(tmp_path, monkeypatch):
                              inplace=True, digital=True)
 
 
+def test_audit_signal_integrity_handles_zero_data_channels(tmp_path):
+    """Regression: _audit_signal_integrity crashed with
+    UnboundLocalError('spot_idx') on any file whose only channel is
+    'EDF Annotations' -- happens naturally for annotation-only sidecar
+    EDFs and any raw file with just the annotations track. The
+    pyedflib cross-check (which defines spot_idx) is skipped when
+    n_data_signals == 0, but a leftover dead-code reference used the
+    unbound name after that guard and blew up EVERY such file's
+    audit. Effect: 27 files got quarantined for a single subject
+    during an overnight batch. This test triggers the exact shape."""
+    import pyedflib
+    from clean_eeg.clean_subject_eeg import _audit_signal_integrity
+
+    # Write a minimal EDF+C with a single channel labeled exactly
+    # "EDF Annotations" so _audit_signal_integrity classifies it as
+    # non-data and computes data_signal_disk_indices == [].
+    path = tmp_path / "annotations_only.edf"
+    n_channels = 1
+    signal_headers = [{
+        "label": "EDF Annotations", "dimension": "uV",
+        "sample_frequency": 100,
+        "physical_max": 3200.0, "physical_min": -3200.0,
+        "digital_max": 32767, "digital_min": -32768,
+        "prefilter": "", "transducer": "",
+    }]
+    with pyedflib.EdfWriter(str(path), n_channels,
+                              file_type=pyedflib.FILETYPE_EDFPLUS) as f:
+        f.setHeader({
+            "technician": "T", "recording_additional": "",
+            "patientname": "X", "patient_additional": "",
+            "patientcode": "R1755A", "equipment": "X",
+            "admincode": "", "sex": "X",
+            "startdate": datetime(1985, 1, 1, 10, 0, 0),
+            "birthdate": "01 jan 1900", "gender": "X",
+        })
+        f.setSignalHeaders(signal_headers)
+        f.writeSamples([np.zeros(200, dtype=np.float64)])
+
+    # orig_signals=[] matches the zero-data-signal file. Prior to the
+    # fix this raised UnboundLocalError; now it must complete silently.
+    _audit_signal_integrity(orig_signals=[],
+                              clean_file_path=str(path),
+                              filename="annotations_only.edf",
+                              inplace=True, digital=True)
+
+
 def test_audit_survives_missing_madvise(tmp_path, monkeypatch):
     """Some platforms lack MADV_SEQUENTIAL. The audit must degrade
     gracefully -- no crash, still verifies signal integrity correctly.
