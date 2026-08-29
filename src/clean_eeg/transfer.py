@@ -255,6 +255,48 @@ def preflight_deidentified_output(output_path: str | Path,
     edfs = _iter_edfs(output_path, excluded_names=excluded_names)
     if not edfs:
         failures.append(f"{output_path} contains no .edf files to upload")
+
+    # 4. Manual annotation review must be complete. Cleaned-but-not-
+    # reviewed subjects are held back so the operator can't accidentally
+    # upload a subject whose annotations they haven't yet audited.
+    #
+    # ORDERING: this check runs BEFORE the pyedflib-based header checks
+    # and the hash spot-check because it's cheap (a small JSONL read)
+    # and eliminates ~all unreviewed subjects in a batch. On network
+    # storage (Oceanus / NFS), the per-file pyedflib open dominates
+    # preflight cost -- fast-failing here takes bulk preflight from
+    # seconds-per-unreviewed-subject to milliseconds. When it fails we
+    # return immediately: an unreviewed subject can't transfer for any
+    # reason, and later checks would just add noise to the log.
+    #
+    # In stub-pair mode (in-place cleaning), carriers are the sidecars;
+    # in inline mode, they're the recordings themselves.
+    from clean_eeg.audit.annotations import check_annotation_review_state
+    from clean_eeg.print_edf_header import ANNOTATION_STUB_SUFFIX
+    stubs = [p for p in edfs if p.name.endswith(ANNOTATION_STUB_SUFFIX)]
+    review_carriers = (stubs if stubs
+                       else [p for p in edfs
+                             if not p.name.endswith(ANNOTATION_STUB_SUFFIX)])
+    if review_carriers:
+        review = check_annotation_review_state(output_path, review_carriers)
+        if review.get("state") != "complete":
+            n_r = review.get("n_reviewed", 0)
+            n_c = review.get("n_annotation_carriers",
+                              len(review_carriers))
+            return PreflightResult(
+                passed=False,
+                failures=[
+                    f"annotation review not complete for {subject_code}: "
+                    f"{n_r}/{n_c} file(s) marked reviewed. Run "
+                    f"annotation-review-eeg on this subject before transfer, "
+                    f"or pass a session that ends with the "
+                    f"'Mark all as reviewed?' prompt answered Y."
+                ],
+                warnings=warnings,
+                manifest=manifest,
+            )
+
+    # 5. Naming pattern for every EDF in the output dir.
     for p in edfs:
         if not _DEID_FILENAME_RE.match(p.name):
             failures.append(
@@ -263,13 +305,13 @@ def preflight_deidentified_output(output_path: str | Path,
                 "— did this file skip the rename step?"
             )
 
-    # 4. Per-file header expectations (only for the transfer-eligible set).
+    # 6. Per-file header expectations (only for the transfer-eligible set).
     _check_edf_headers(edfs, subject_code, failures)
 
-    # 5. Spot-check hash on one file.
+    # 7. Spot-check hash on one file.
     _spot_check_hash(edfs, manifest, failures)
 
-    # 6. Defensive: the raw pre-Presidio annotation dump (created during
+    # 8. Defensive: the raw pre-Presidio annotation dump (created during
     # cleaning at <subject>/<subfolder>_original_annotations/, sibling
     # to output_path) contains PHI and MUST NOT be inside the transfer
     # source. Under normal operation this dir is a SIBLING of
@@ -288,34 +330,6 @@ def preflight_deidentified_output(output_path: str | Path,
             f"be transferred. Move it out of the transfer source or "
             f"delete it before rerunning transfer-subject-eeg."
         )
-
-    # 7. Manual annotation review must be complete. Cleaned-but-not-
-    # reviewed subjects are held back so the operator can't accidentally
-    # upload a subject whose annotations they haven't yet audited. The
-    # audit-side helper is authoritative -- reuses the SAME "complete"
-    # definition the audit reports and the TUI writes ("every annotation
-    # carrier is in the tracker"), so the two stages stay in lockstep.
-    # In stub-pair mode (in-place cleaning), carriers are the sidecars;
-    # in inline mode, they're the recordings themselves.
-    from clean_eeg.audit.annotations import check_annotation_review_state
-    from clean_eeg.print_edf_header import ANNOTATION_STUB_SUFFIX
-    stubs = [p for p in edfs if p.name.endswith(ANNOTATION_STUB_SUFFIX)]
-    review_carriers = (stubs if stubs
-                       else [p for p in edfs
-                             if not p.name.endswith(ANNOTATION_STUB_SUFFIX)])
-    if review_carriers:
-        review = check_annotation_review_state(output_path, review_carriers)
-        if review.get("state") != "complete":
-            n_r = review.get("n_reviewed", 0)
-            n_c = review.get("n_annotation_carriers",
-                              len(review_carriers))
-            failures.append(
-                f"annotation review not complete for {subject_code}: "
-                f"{n_r}/{n_c} file(s) marked reviewed. Run "
-                f"annotation-review-eeg on this subject before transfer, "
-                f"or pass a session that ends with the "
-                f"'Mark all as reviewed?' prompt answered Y."
-            )
 
     return PreflightResult(
         passed=not failures,

@@ -238,8 +238,16 @@ def test_preflight_still_fails_when_unlisted_bad_file_present(tmp_path):
     skipped.
     """
     out = _make_subject_dir(tmp_path)
-    # Bad-name file, NOT registered as failed in manifest
-    _write_deidentified_edf(out / "sneaky_wrong_name.edf")
+    # Bad-name file, NOT registered as failed in manifest. Marked
+    # reviewed so the review-complete short-circuit doesn't fire and
+    # the filename check runs -- this test targets the FILENAME failure
+    # mode specifically.
+    from clean_eeg.annotation_review.journal import ReviewedTracker
+    from clean_eeg.annotation_review.models import ReviewedFile
+    sneaky = out / "sneaky_wrong_name.edf"
+    _write_deidentified_edf(sneaky)
+    ReviewedTracker(out).mark_reviewed(ReviewedFile.new(
+        file_path=sneaky, n_annotations=1, n_edited=0))
     result = preflight_deidentified_output(out)
     assert not result.passed
     assert any("sneaky_wrong_name.edf" in f and "does not match" in f
@@ -411,6 +419,32 @@ def test_preflight_review_gate_names_the_subject_and_progress(tmp_path):
                if "annotation review not complete" in f)
     assert SUBJECT_CODE in msg
     assert "0/1" in msg
+
+
+def test_preflight_review_gate_short_circuits_before_pyedflib(
+        tmp_path, monkeypatch):
+    """Perf-critical ordering: when review isn't complete, preflight
+    must return BEFORE opening EDFs via pyedflib. This makes the
+    unreviewed-subject case cheap even on network storage where every
+    EDF open costs a round-trip. Monkey-patches EdfReader to detect any
+    accidental re-ordering that reintroduces the slow path."""
+    import pyedflib
+    calls = {"n": 0}
+    real_reader = pyedflib.EdfReader
+
+    class _CountingReader(real_reader):
+        def __init__(self, *a, **kw):
+            calls["n"] += 1
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(pyedflib, "EdfReader", _CountingReader)
+    out = _make_subject_dir(tmp_path, mark_reviewed=False)
+    result = preflight_deidentified_output(out)
+    assert not result.passed
+    assert calls["n"] == 0, (
+        f"review-not-complete preflight opened {calls['n']} EDF(s) via "
+        f"pyedflib -- ordering regression. Should short-circuit before "
+        f"the header-check pass.")
 
 
 def test_preflight_review_gate_uses_sidecars_when_present(tmp_path):

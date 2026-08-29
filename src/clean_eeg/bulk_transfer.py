@@ -169,6 +169,9 @@ def _sum_transferable_bytes(subject_dir: Path,
     return total
 
 
+PREFLIGHT_MAX_WORKERS = 8
+
+
 def build_subject_plans(subject_dirs: Iterable[Path]) -> tuple[list[SubjectPlan],
                                                                 list[tuple[Path, str]]]:
     """Preflight every subject; return ``(ready_plans, hard_failures)``.
@@ -181,33 +184,56 @@ def build_subject_plans(subject_dirs: Iterable[Path]) -> tuple[list[SubjectPlan]
 
     PHI safety: ``manifest.failed_files`` names populate each plan's
     ``excluded_names`` so rsync ``--exclude=<name>`` blocks them.
+
+    Preflight is parallelised across up to PREFLIGHT_MAX_WORKERS
+    threads. On network storage (Oceanus / NFS) each subject's preflight
+    is I/O-bound -- pyedflib header opens dominate wall time -- so
+    threads (not processes) yield a near-linear speedup with no GIL
+    contention. Serial-order results are preserved so batch output and
+    the summary read in the order the operator supplied.
     """
     # Late import so `bulk_transfer` can be imported standalone in
     # tests without pulling the pyedflib chain.
+    from concurrent.futures import ThreadPoolExecutor
     from clean_eeg.transfer import (
         _failed_names_from_manifest,
         preflight_deidentified_output,
     )
 
+    subject_list = [Path(d) for d in subject_dirs]
+
+    def _one(subject_dir: Path):
+        result = preflight_deidentified_output(subject_dir)
+        excluded: set[str] = set()
+        transferable = 0
+        if result.passed and result.manifest is not None:
+            excluded = _failed_names_from_manifest(result.manifest)
+            transferable = _sum_transferable_bytes(subject_dir, excluded)
+        return subject_dir, result, excluded, transferable
+
     ready: list[SubjectPlan] = []
     hard_failures: list[tuple[Path, str]] = []
-    for subject_dir in subject_dirs:
-        subject_dir = Path(subject_dir)
-        result = preflight_deidentified_output(subject_dir)
-        if not result.passed:
-            hard_failures.append(
-                (subject_dir, "; ".join(result.failures)))
-            continue
-        assert result.manifest is not None
-        excluded = _failed_names_from_manifest(result.manifest)
-        transferable = _sum_transferable_bytes(subject_dir, excluded)
-        ready.append(SubjectPlan(
-            subject_dir=subject_dir,
-            subject_code=result.manifest["subject_code"],
-            site_incoming_folder=result.manifest["site_incoming_folder"],
-            transferable_bytes=transferable,
-            excluded_names=excluded,
-        ))
+    if not subject_list:
+        return ready, hard_failures
+
+    n_workers = min(PREFLIGHT_MAX_WORKERS, len(subject_list))
+    with ThreadPoolExecutor(
+            max_workers=n_workers, thread_name_prefix="preflight") as pool:
+        # executor.map preserves input order in its output iterator.
+        for subject_dir, result, excluded, transferable in pool.map(
+                _one, subject_list):
+            if not result.passed:
+                hard_failures.append(
+                    (subject_dir, "; ".join(result.failures)))
+                continue
+            assert result.manifest is not None
+            ready.append(SubjectPlan(
+                subject_dir=subject_dir,
+                subject_code=result.manifest["subject_code"],
+                site_incoming_folder=result.manifest["site_incoming_folder"],
+                transferable_bytes=transferable,
+                excluded_names=excluded,
+            ))
     return ready, hard_failures
 
 
