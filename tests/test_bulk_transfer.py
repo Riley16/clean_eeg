@@ -499,6 +499,81 @@ def test_load_subject_paths_ignores_blanks_and_comments(tmp_path):
     assert paths == [Path("/a/b"), Path("/c/d")]
 
 
+def test_reachability_preflight_aborts_batch_on_unreachable_host(
+        tmp_path, monkeypatch, capsys):
+    """When the SSH endpoint isn't reachable, the batch must abort with
+    a clear error BEFORE dispatching any rsync workers. Prevents the
+    'silent hang for hours' failure mode where every parallel worker
+    sits blocked on the same broken SSH handshake."""
+    out = _make_subject_dir(tmp_path)
+    subjects_file = tmp_path / "subjects.txt"
+    subjects_file.write_text(str(out) + "\n")
+
+    # Force the reachability probe to report unreachable, and make ANY
+    # transfer-related subprocess (rsync, chgrp) raise so we can assert
+    # workers never fired. ssh-add / ssh-agent probes from ensure_ssh_agent
+    # are allowed to pass through as no-ops.
+    def fake_run(argv, **kw):
+        head = (argv or [""])[0]
+        if head == "ssh":
+            return subprocess.CompletedProcess(
+                argv, 255, stdout="", stderr="ssh: Connection timed out")
+        if head in ("ssh-add", "ssh-agent"):
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="")
+        raise AssertionError(
+            f"reachability probe failed but bulk_transfer still spawned "
+            f"a downstream subprocess: {argv[:3]}...")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "clean_eeg.bulk_transfer._run_subject_rsync",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("workers should not have run")))
+
+    rc = main([
+        "--subjects-file", str(subjects_file),
+        "--user", "alice", "--parallel", "1",
+        "--max-retries", "1", "--backoff-base", "0",
+    ])
+    assert rc == 0  # returns 0 because no results = no failures
+    err = capsys.readouterr().err
+    assert "ABORT" in err
+    assert "Connection timed out" in err or "ssh" in err
+
+
+def test_remote_dir_override_supports_subject_code_template(
+        tmp_path, monkeypatch, capsys):
+    """The '{subject_code}' placeholder in --remote-dir-override is
+    expanded per subject so a single template lands each subject in
+    its own dir. Otherwise a batch of N subjects would all land in the
+    same override dir and clobber each other."""
+    out = _make_subject_dir(tmp_path)
+    subjects_file = tmp_path / "subjects.txt"
+    subjects_file.write_text(str(out) + "\n")
+
+    captured = {"rsync_paths": []}
+
+    def fake_rsync(plan, ssh_user, bwlimit_policy, rsync_timeout_s,
+                    remote_dir_override, **kw):
+        captured["rsync_paths"].append(remote_dir_override)
+        return 0, "", False
+
+    monkeypatch.setattr(
+        "clean_eeg.bulk_transfer._run_subject_rsync", fake_rsync)
+
+    rc = main([
+        "--subjects-file", str(subjects_file),
+        "--user", "alice", "--parallel", "1",
+        "--max-retries", "1", "--backoff-base", "0",
+        "--remote-dir-override",
+        "/mnt/backup/clean_eeg/{subject_code}",
+    ])
+    assert rc == 0
+    assert captured["rsync_paths"] == [
+        "/mnt/backup/clean_eeg/R1755A"], captured["rsync_paths"]
+
+
 def test_main_returns_nonzero_when_subjects_file_empty(tmp_path, capsys):
     f = tmp_path / "subjects.txt"
     f.write_text("\n# only comments\n")

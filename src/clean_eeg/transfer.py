@@ -388,7 +388,18 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
                          remote_dir_override: str | None = None,
                          skip_perms: bool = False,
                          excluded_names: set[str] | None = None,
+                         ssh_host: str | None = None,
+                         remote_base: str | None = None,
                          ) -> TransferPlan:
+    # SSH endpoint + remote base are overridable so a batch can target
+    # something other than the default rhino/CML pair. Common case: a
+    # personal ssh_config alias (e.g. 'eeg-transfer-endpoint') that
+    # ProxyJumps through a VPS to a Windows/WSL box, with the target
+    # dir on an external drive. Overrides are additive with
+    # --remote-dir-override so the caller can pin one, two, or all
+    # three axes without changing the others.
+    effective_host = ssh_host or SSH_HOST
+    effective_base = remote_base or REMOTE_BASE
     if remote_dir_override is not None:
         # Test/scratch mode: caller supplies the full remote path
         # directly and (by default) opts out of the site-group perms
@@ -397,14 +408,14 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
         subject_remote_dir = remote_dir
         site_parent_dir = str(Path(remote_dir).parent)
     else:
-        site_parent_dir = f"{REMOTE_BASE}/{site_incoming_folder}"
+        site_parent_dir = f"{effective_base}/{site_incoming_folder}"
         subject_remote_dir = f"{site_parent_dir}/{subject_code}"
         remote_dir = f"{subject_remote_dir}/{SUBJECT_SUBFOLDER}"
 
     # umask 007 → newly-created intermediate dirs are group-rwx. Pre-existing
     # dirs are untouched.
     mkdir_argv = [
-        "ssh", f"{ssh_user}@{SSH_HOST}",
+        "ssh", f"{ssh_user}@{effective_host}",
         f'umask 007 && mkdir -p {remote_dir}',
     ]
 
@@ -436,7 +447,7 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
             "--exclude=*_original_annotations/",
             *(f"--exclude={n}" for n in sorted(excluded_names)),
             f"{output_path}/",
-            f"{ssh_user}@{SSH_HOST}:{remote_dir}/",
+            f"{ssh_user}@{effective_host}:{remote_dir}/",
         ]
         transport = "rsync"
     else:
@@ -460,7 +471,7 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
             *sorted(str(p) for p in output_path.glob("*.edf")
                     if p.name not in excluded_names),
             *existing_sidecars,
-            f"{ssh_user}@{SSH_HOST}:{remote_dir}/",
+            f"{ssh_user}@{effective_host}:{remote_dir}/",
         ]
         transport = "scp"
 
@@ -478,7 +489,7 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
         perms_argv: list[str] = []
     else:
         perms_argv = [
-            "ssh", f"{ssh_user}@{SSH_HOST}",
+            "ssh", f"{ssh_user}@{effective_host}",
             f"chgrp -R --reference={site_parent_dir} {subject_remote_dir}; "
             f"chmod -R g+rwX,o-rwx {subject_remote_dir}",
         ]
@@ -498,6 +509,8 @@ def build_transfer_plan(output_path: str | Path, *, subject_code: str,
                         remote_dir_override: str | None = None,
                         skip_perms: bool = False,
                         excluded_names: set[str] | None = None,
+                        ssh_host: str | None = None,
+                        remote_base: str | None = None,
                         ) -> TransferPlan:
     """Public helper — resolves ``use_rsync`` from ``shutil.which`` if
     not supplied. Exposed so tests can inspect the composed commands
@@ -526,6 +539,8 @@ def build_transfer_plan(output_path: str | Path, *, subject_code: str,
         remote_dir_override=remote_dir_override,
         skip_perms=skip_perms,
         excluded_names=excluded_names,
+        ssh_host=ssh_host,
+        remote_base=remote_base,
     )
 
 

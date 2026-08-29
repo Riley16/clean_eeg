@@ -27,12 +27,14 @@ needs to redo work already on the wire.
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import getpass
 import json
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -305,10 +307,42 @@ def _run_short(argv: list[str]) -> tuple[int, str]:
     return 0, ""
 
 
+class _PrefixedStreamReader(threading.Thread):
+    """Reader thread that pulls one line at a time from a subprocess
+    pipe and echoes it (line-buffered) to ``sys.stdout`` with a
+    per-subject prefix. Keeps the last ``keep_tail`` lines in memory so
+    the outer caller can surface them in the failure return value.
+
+    Line-buffered semantics play well with rsync ``--progress``: rsync
+    emits '\\r'-only updates while a file is transferring (buffered
+    inside the pipe, not returned by readline) and a final '\\n' when
+    each file completes (readline returns the completion summary). The
+    result is one printed line per file completion, prefixed with the
+    subject code, live -- no more silent hours.
+    """
+    def __init__(self, fh, prefix: str, keep_tail: int = 20):
+        super().__init__(daemon=True, name=f"stream-{prefix}")
+        self.fh = fh
+        self.prefix = prefix
+        self.tail = collections.deque(maxlen=keep_tail)
+
+    def run(self) -> None:
+        try:
+            for raw in iter(self.fh.readline, ""):
+                line = raw.rstrip("\n")
+                sys.stdout.write(f"[{self.prefix}] {line}\n")
+                sys.stdout.flush()
+                self.tail.append(line)
+        except (OSError, ValueError):
+            # ValueError: I/O op on closed file (parent .close()'d it)
+            pass
+
+
 def _run_rsync_with_bwlimit_monitor(argv: list[str],
                                     bwlimit_policy: "BwlimitPolicy",
                                     initial_bwlimit: int | None,
                                     poll_interval_s: float = 30.0,
+                                    stream_prefix: str | None = None,
                                     ) -> tuple[int, str, bool]:
     """Popen rsync and poll the bwlimit policy every ``poll_interval_s``.
     If the effective cap changes from ``initial_bwlimit``, SIGTERM the
@@ -319,31 +353,80 @@ def _run_rsync_with_bwlimit_monitor(argv: list[str],
     Returns ``(exit_code, error_tail, boundary_crossed)``. When
     boundary_crossed, ``exit_code`` reflects the SIGTERM'd process
     and should NOT count as a retry-consuming failure.
+
+    ``stream_prefix``: when set, spawns reader threads that echo rsync's
+    stdout+stderr line-buffered to ``sys.stdout`` prefixed with
+    ``[stream_prefix]``. Lets the operator see per-file completions live
+    on a multi-hour transfer instead of watching a blank terminal. When
+    None, the prior behaviour is preserved (capture-then-tail on
+    failure) -- callers that need clean stdout (tests) can opt out.
     """
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
+                                stderr=subprocess.PIPE, text=True,
+                                bufsize=1)
     except (subprocess.SubprocessError, OSError) as e:
         return 255, f"popen: {type(e).__name__}: {e}", False
 
+    # Live-stream mode: reader threads consume stdout/stderr as they
+    # arrive AND keep the last N lines around for the failure tail.
+    # Only engage when the process has real pipes (test fakes may not
+    # supply them; fall back to capture mode in that case).
+    stdout_reader: _PrefixedStreamReader | None = None
+    stderr_reader: _PrefixedStreamReader | None = None
+    if (stream_prefix is not None
+            and getattr(proc, "stdout", None) is not None
+            and getattr(proc, "stderr", None) is not None):
+        stdout_reader = _PrefixedStreamReader(proc.stdout, stream_prefix)
+        stderr_reader = _PrefixedStreamReader(proc.stderr,
+                                                stream_prefix + "!")
+        stdout_reader.start()
+        stderr_reader.start()
+
+    def _final_tail() -> str:
+        if stdout_reader is None or stderr_reader is None:
+            return ""
+        lines = list(stderr_reader.tail) or list(stdout_reader.tail)
+        return " | ".join(lines[-5:])
+
+    stream_mode = stdout_reader is not None
     while True:
         try:
-            stdout, stderr = proc.communicate(timeout=poll_interval_s)
-            if proc.returncode == 0:
+            if not stream_mode:
+                stdout, stderr = proc.communicate(
+                    timeout=poll_interval_s)
+                if proc.returncode == 0:
+                    return 0, "", False
+                tail = (stderr or stdout or "").strip().splitlines()[-5:]
+                return proc.returncode, " | ".join(tail), False
+            # Stream mode: block on proc.wait with the same cadence.
+            rc = proc.wait(timeout=poll_interval_s)
+            assert stdout_reader is not None and stderr_reader is not None
+            stdout_reader.join(timeout=1)
+            stderr_reader.join(timeout=1)
+            if rc == 0:
                 return 0, "", False
-            tail = (stderr or stdout or "").strip().splitlines()[-5:]
-            return proc.returncode, " | ".join(tail), False
+            return rc, _final_tail() or "(no output captured)", False
         except subprocess.TimeoutExpired:
             if bwlimit_policy.current_kbps() != initial_bwlimit:
                 proc.terminate()
                 try:
-                    stdout, stderr = proc.communicate(timeout=5)
+                    proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                    proc.wait()
+                if stream_mode:
+                    assert (stdout_reader is not None
+                            and stderr_reader is not None)
+                    stdout_reader.join(timeout=1)
+                    stderr_reader.join(timeout=1)
+                    tail = _final_tail()
+                else:
                     stdout, stderr = proc.communicate()
-                tail = (stderr or stdout or "").strip().splitlines()[-3:]
+                    tail = " | ".join(
+                        (stderr or stdout or "").strip().splitlines()[-3:])
                 return (proc.returncode, "bwlimit_boundary_crossed: "
-                        + " | ".join(tail), True)
+                        + tail, True)
 
 
 def _run_subject_rsync(plan: SubjectPlan,
@@ -352,6 +435,8 @@ def _run_subject_rsync(plan: SubjectPlan,
                        rsync_timeout_s: int,
                        remote_dir_override: str | None,
                        bwlimit_poll_s: float = 30.0,
+                       ssh_host: str | None = None,
+                       remote_base: str | None = None,
                        ) -> tuple[int, str, bool]:
     """Compose the mkdir + rsync + perms sequence for ONE subject and
     execute them. Returns ``(exit_code, error_message, boundary_crossed)``.
@@ -371,6 +456,8 @@ def _run_subject_rsync(plan: SubjectPlan,
         ssh_user=ssh_user,
         remote_dir_override=remote_dir_override,
         excluded_names=plan.excluded_names,
+        ssh_host=ssh_host,
+        remote_base=remote_base,
     )
 
     initial_bwlimit = bwlimit_policy.current_kbps()
@@ -384,7 +471,8 @@ def _run_subject_rsync(plan: SubjectPlan,
 
     code, err, boundary = _run_rsync_with_bwlimit_monitor(
         upload_argv, bwlimit_policy, initial_bwlimit,
-        poll_interval_s=bwlimit_poll_s)
+        poll_interval_s=bwlimit_poll_s,
+        stream_prefix=plan.subject_code)
     if code != 0 or boundary:
         return code, f"rsync: {err}", boundary
 
@@ -405,6 +493,8 @@ def transfer_one_subject_with_retry(plan: SubjectPlan, *,
                                     remote_dir_override: str | None = None,
                                     log: EventLog | None = None,
                                     bwlimit_poll_s: float = 30.0,
+                                    ssh_host: str | None = None,
+                                    remote_base: str | None = None,
                                     ) -> SubjectResult:
     """Transfer one subject with exponential-backoff retry. Returns
     a ``SubjectResult`` regardless of outcome (never raises).
@@ -426,9 +516,19 @@ def transfer_one_subject_with_retry(plan: SubjectPlan, *,
                      attempt=attempt + 1, bwlimit_kbps=bwlimit,
                      bytes_expected=plan.transferable_bytes)
         attempt_start = time.perf_counter()
+        # Per-subject remote_dir_override: if the caller supplied a
+        # template like "/mnt/backup/clean_eeg/{subject_code}", expand
+        # it here so each subject lands in its own destination dir.
+        # Non-template strings pass through unchanged (backwards-
+        # compatible).
+        per_subject_override = (
+            remote_dir_override.format(subject_code=plan.subject_code)
+            if remote_dir_override is not None
+            else None)
         exit_code, err, boundary = _run_subject_rsync(
             plan, ssh_user, bwlimit_policy, rsync_timeout_s,
-            remote_dir_override, bwlimit_poll_s=bwlimit_poll_s)
+            per_subject_override, bwlimit_poll_s=bwlimit_poll_s,
+            ssh_host=ssh_host, remote_base=remote_base)
         attempt_elapsed = time.perf_counter() - attempt_start
         if log:
             log.emit("rsync_exit", subject=plan.subject_code,
@@ -517,6 +617,8 @@ def run_bulk_transfer(subject_dirs: list[Path],
                       only_subjects: list[str] | None = None,
                       ssh_key: Path | None = None,
                       auto_ssh_agent: bool = True,
+                      ssh_host: str | None = None,
+                      remote_base: str | None = None,
                       ) -> tuple[list[SubjectResult], list[tuple[Path, str]]]:
     """Drive the whole batch. Returns
     ``(subject_results, preflight_hard_failures)``.
@@ -538,8 +640,45 @@ def run_bulk_transfer(subject_dirs: list[Path],
     # once, not per-subject). Every subprocess spawned below (mkdir,
     # rsync, perms per subject) inherits SSH_AUTH_SOCK from this
     # process, so they all reuse the same agent.
-    from clean_eeg.transfer import ensure_ssh_agent
+    from clean_eeg.transfer import ensure_ssh_agent, SSH_HOST as _DEFAULT_SSH_HOST
     ensure_ssh_agent(key_path=ssh_key, auto=auto_ssh_agent)
+
+    # Reachability preflight. Rsync's own timeout is per-I/O and fires
+    # ONLY after a connection is up; if the SSH handshake itself hangs
+    # (VPS down, tunnel not established, wrong hostname) the operator
+    # otherwise sits on a silent terminal indefinitely. A 10-second
+    # ConnectTimeout gives a fast, clear error before we fan out to N
+    # parallel workers all hanging on the same broken host.
+    #
+    # Skipped when remote_dir_override is set: that flag signals a
+    # test/scratch destination (local filesystem, mock, etc.) where the
+    # SSH probe would falsely fail.
+    if remote_dir_override is None:
+        effective_host = ssh_host or _DEFAULT_SSH_HOST
+        reach_argv = [
+            "ssh", "-o", "ConnectTimeout=10",
+            "-o", "BatchMode=yes",  # never prompt for a password
+            f"{ssh_user}@{effective_host}", ":"]
+        print(f"[transfer] checking reachability of "
+              f"{ssh_user}@{effective_host} (10s timeout)...", flush=True)
+        try:
+            reach = subprocess.run(reach_argv, capture_output=True,
+                                    text=True, timeout=15)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"[transfer] ABORT: could not reach "
+                  f"{ssh_user}@{effective_host} "
+                  f"({type(e).__name__}: {e}). "
+                  f"Fix the endpoint or pass --ssh-host <alias>.",
+                  file=sys.stderr, flush=True)
+            return [], []
+        if reach.returncode != 0:
+            err_tail = (reach.stderr or reach.stdout or "").strip()
+            print(f"[transfer] ABORT: ssh {ssh_user}@{effective_host} "
+                  f"exited {reach.returncode}. Fix credentials/tunnel "
+                  f"and re-run.\n    stderr: {err_tail}",
+                  file=sys.stderr, flush=True)
+            return [], []
+        print(f"[transfer] reachability OK.", flush=True)
 
     log_path = log_path or _default_log_path(subjects_file)
     ready, hard_failures = build_subject_plans(subject_dirs)
@@ -582,6 +721,7 @@ def run_bulk_transfer(subject_dirs: list[Path],
                 backoff_base_s=backoff_base_s,
                 remote_dir_override=remote_dir_override,
                 log=log,
+                ssh_host=ssh_host, remote_base=remote_base,
             )
 
         with ThreadPoolExecutor(max_workers=parallel) as pool:
@@ -826,8 +966,24 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="JSONL event log path (default: alongside --subjects-file, "
                         "named bulk_transfer.jsonl).")
     p.add_argument("--remote-dir-override", type=str, default=None,
-                   help="Test/scratch mode: full remote destination path. "
-                        "Overrides the site-map-driven derivation.")
+                   help="Full remote destination path per subject. "
+                        "Overrides the site-map-driven derivation. Supports "
+                        "'{subject_code}' as a substitution placeholder so a "
+                        "single template lands each subject in its own dir "
+                        "(e.g. /mnt/backup/clean_eeg/{subject_code}).")
+    p.add_argument("--ssh-host", type=str, default=None,
+                   help="Override the default rhino SSH endpoint. Accepts "
+                        "any ssh_config alias -- useful for personal "
+                        "endpoints with ProxyJump (e.g. an alias defined in "
+                        "~/.ssh/config that hops through a VPS to a home "
+                        "backup box). Combines with --remote-dir-override "
+                        "for full control of the destination.")
+    p.add_argument("--remote-base", type=str, default=None,
+                   help="Override REMOTE_BASE (default: rhino's incoming "
+                        "dir). Per-subject dirs are still derived below "
+                        "this via the site-map layout. Use --remote-dir-"
+                        "override instead for flat / non-hierarchical "
+                        "targets.")
     p.add_argument("--background", action="store_true",
                    help="Detach from the controlling terminal and run under "
                         "nohup so the batch survives SSH disconnect / logout. "
@@ -940,6 +1096,8 @@ def main(argv: list[str] | None = None) -> int:
         only_subjects=only_subjects or None,
         ssh_key=args.ssh_key,
         auto_ssh_agent=not args.no_auto_ssh_agent,
+        ssh_host=args.ssh_host,
+        remote_base=args.remote_base,
     )
     if only_subjects and not results and not hard_failures:
         # Picker matched nothing (--only-subjects[-file] entries all
