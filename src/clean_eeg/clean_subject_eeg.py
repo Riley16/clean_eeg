@@ -343,6 +343,47 @@ _DEID_FILENAME_RE = re.compile(
 )
 
 
+def _prior_clean_artifacts_present(output_path: str
+                                     ) -> tuple[bool, list[str]]:
+    """Return ``(has_signs, reason_lines)``. True when the directory
+    contains ANY trace of a prior in-place clean (sidecar file OR any
+    recording renamed to the de-identified filename pattern). Distinct
+    from :func:`_looks_structurally_already_cleaned` which requires
+    100% coverage; this catches the PARTIAL state where an earlier run
+    started, cleaned some files, and died before either finishing or
+    writing the manifest.
+
+    Re-running a fresh clean over that state is dangerous:
+      - The dry-run header check refuses the re-cleaned headers
+        (pyedflib rejects a twice-anonymized header shape).
+      - Sidecars from the prior run get incorporated into the fresh
+        input set and audit crashes trying to process them as raw.
+      - Any redaction we run on already-redacted annotation text can
+        drift (Presidio's match set is non-deterministic across
+        versions), so re-running silently divergence-inducing.
+
+    Callers should treat True + missing manifest as "partially
+    cleaned, needs manual triage" and refuse to proceed.
+    """
+    if not os.path.isdir(output_path):
+        return False, []
+    names = os.listdir(output_path)
+    edfs = [n for n in names if n.lower().endswith(".edf")]
+    sidecars = [n for n in edfs if n.endswith("_annotations.edf")]
+    renamed = [n for n in edfs
+               if not n.endswith("_annotations.edf")
+               and _DEID_FILENAME_RE.match(n)]
+    reasons: list[str] = []
+    if sidecars:
+        reasons.append(f"{len(sidecars)} '_annotations.edf' sidecar(s) "
+                       f"present (only created by an in-place clean)")
+    if renamed:
+        reasons.append(f"{len(renamed)} main EDF(s) match the de-identified "
+                       f"filename pattern *_R1XXXY_MM.DD__HH.MM.SS.edf "
+                       f"(only produced by clean_subject_eeg rename)")
+    return (len(reasons) > 0, reasons)
+
+
 def _looks_structurally_already_cleaned(output_path: str) -> bool:
     """Return True when the directory looks like a completed in-place
     clean even though ``deidentify.json`` is missing.
@@ -433,6 +474,38 @@ def clean_subject_edf_files(
         _maybe_skip_to_transfer(output_path,
                                 auto_response=auto_transfer_response)
         return
+
+    # Partial-prior-clean detection: some traces of a prior in-place
+    # clean exist (sidecars, renamed files) but neither the manifest
+    # nor the full structural check confirms completion. Re-running is
+    # destructive -- the header-redaction pass produces EDF+
+    # combinations pyedflib rejects, and every already-cleaned file
+    # would quarantine on the dry-run write check. Refuse to proceed;
+    # let the operator triage manually.
+    #
+    # --force overrides (they can force a re-clean if they've inspected
+    # the state and know what they're doing).
+    if not force:
+        has_partial, reasons = _prior_clean_artifacts_present(output_path)
+        if has_partial:
+            raise RuntimeError(
+                f"Subject at {output_path} looks PARTIALLY cleaned by a "
+                f"prior run: {'; '.join(reasons)}. There is no manifest "
+                f"(deidentify.json) and not every file matches the fully-"
+                f"cleaned structural shape, so this state is ambiguous. "
+                f"Re-cleaning would fail on every already-cleaned file "
+                f"(pyedflib rejects twice-redacted headers) and could "
+                f"drift redacted annotations. Manual triage options:\n"
+                f"  1. If you believe the prior run actually completed: "
+                f"touch a valid deidentify.json (or copy one from another "
+                f"subject with matching subject_code and timestamp) so "
+                f"--skip-if-already-cleaned picks it up.\n"
+                f"  2. If you want a fresh re-clean: pass --force to this "
+                f"subject specifically, and be aware that annotation "
+                f"redactions may not exactly reproduce the prior run.\n"
+                f"  3. Otherwise leave it alone -- the already-cleaned "
+                f"files in place remain valid; only the manifest is "
+                f"missing.")
 
     try:
         EDF_meta_data, load_failed_files = _load_edf_metadata(

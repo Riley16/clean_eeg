@@ -277,6 +277,103 @@ def test_clean_subject_edf_files_w_inconsistent_signal_headers(monkeypatch):
         assert False, 'RuntimeError was not raised for inconsistent signal headers'
 
 
+def test_prior_clean_artifacts_present_true_for_sidecars_alone(tmp_path):
+    """A stray sidecar (from an aborted prior clean) is enough evidence
+    of prior work -- callers must NOT proceed to a fresh clean."""
+    from clean_eeg.clean_subject_eeg import _prior_clean_artifacts_present
+    d = tmp_path / "out"; d.mkdir()
+    (d / "raw_recording.edf").touch()
+    (d / "GA_R1665J_01.01__00.00.00_annotations.edf").touch()
+    has, reasons = _prior_clean_artifacts_present(str(d))
+    assert has is True
+    assert any("sidecar" in r for r in reasons)
+
+
+def test_prior_clean_artifacts_present_true_for_renamed_alone(tmp_path):
+    """A recording renamed to the de-identified pattern is enough
+    evidence of prior work even without any sidecar."""
+    from clean_eeg.clean_subject_eeg import _prior_clean_artifacts_present
+    d = tmp_path / "out"; d.mkdir()
+    (d / "GA_R1665J_01.01__00.00.00.edf").touch()
+    (d / "unmodified_raw.edf").touch()
+    has, reasons = _prior_clean_artifacts_present(str(d))
+    assert has is True
+    assert any("de-identified filename pattern" in r for r in reasons)
+
+
+def test_prior_clean_artifacts_present_false_for_pristine_raw(tmp_path):
+    """No sidecars, no renamed files -> pristine raw input; caller
+    proceeds normally."""
+    from clean_eeg.clean_subject_eeg import _prior_clean_artifacts_present
+    d = tmp_path / "out"; d.mkdir()
+    (d / "raw_recording_a.edf").touch()
+    (d / "raw_recording_b.edf").touch()
+    has, reasons = _prior_clean_artifacts_present(str(d))
+    assert has is False
+    assert reasons == []
+
+
+def test_clean_subject_refuses_partial_prior_clean_without_force(
+        tmp_path):
+    """End-to-end: a directory with SOME evidence of prior in-place
+    cleaning but no manifest triggers a hard RuntimeError with a
+    triage-focused message. Batch runners catch it -> subject marked
+    FAIL, other subjects continue.
+
+    Prior behaviour: the pipeline proceeded to re-clean, blew up on
+    the dry-run write for every already-cleaned file, and quarantined
+    all of them (R1665J: 27+ files quarantined in one overnight run).
+    This test guards against that regression."""
+    from clean_eeg.clean_subject_eeg import clean_subject_edf_files
+
+    d = tmp_path / "R1665J_input"; d.mkdir()
+    # Simulate the R1665J shape: one raw file + one file from a prior
+    # clean (renamed with de-identified pattern) + its sidecar. No
+    # manifest -> partial state.
+    (d / "GA_R1665J_01.01__00.00.00.edf").touch()
+    (d / "GA_R1665J_01.01__00.00.00_annotations.edf").touch()
+    (d / "raw_unmodified.edf").touch()
+
+    with pytest.raises(RuntimeError, match="PARTIALLY cleaned"):
+        clean_subject_edf_files(
+            subject_name=None,
+            subject_code="R1665J",
+            input_path=str(d),
+            output_path=str(d),
+            inplace=True,
+            approve_confirmations={"in-place"},
+            auto_transfer_response="n")
+
+
+def test_clean_subject_partial_prior_clean_bypassable_with_force(
+        tmp_path, monkeypatch):
+    """--force overrides the partial-prior-clean refusal for operators
+    who've inspected the state and want to re-clean anyway."""
+    from clean_eeg.clean_subject_eeg import clean_subject_edf_files
+
+    d = tmp_path / "R1665J_input"; d.mkdir()
+    (d / "GA_R1665J_01.01__00.00.00.edf").touch()
+    (d / "GA_R1665J_01.01__00.00.00_annotations.edf").touch()
+
+    # Short-circuit the pipeline right after the partial-check so we
+    # only assert the guard was BYPASSED (not the whole re-clean).
+    # A ConsecutiveLoadFailureLimit is the earliest downstream escape.
+    monkeypatch.setattr(
+        "clean_eeg.clean_subject_eeg._load_edf_metadata",
+        lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("PIPELINE_REACHED")))
+    with pytest.raises(RuntimeError, match="PIPELINE_REACHED"):
+        clean_subject_edf_files(
+            subject_name=None,
+            subject_code="R1665J",
+            input_path=str(d),
+            output_path=str(d),
+            inplace=True,
+            force=True,
+            approve_confirmations={"in-place"},
+            auto_transfer_response="n")
+
+
 def test_looks_structurally_already_cleaned_true_for_deidentified_layout(
         tmp_path):
     """A dir with de-identified filenames + matching sidecars looks
