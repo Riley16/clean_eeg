@@ -181,8 +181,7 @@ class AnnotationReviewController:
                  respect_reviewed_tracker: bool = True,
                  external_prefetch_paths: list[Path] | None = None,
                  preload_all: bool = False,
-                 hide_whitelisted: bool = True,
-                 auto_drop_whitelisted_files: bool = True):
+                 hide_whitelisted: bool = True):
         """``external_prefetch_paths``: optional additional EDF paths
         (e.g. the FIRST N files of the NEXT subject) to warm the
         prefetch queue after this subject's own files are exhausted.
@@ -210,14 +209,13 @@ class AnnotationReviewController:
         # the view greyed out (previous default). Toggled at CLI via
         # --show-whitelisted.
         self.hide_whitelisted = hide_whitelisted
-        # auto_drop_whitelisted_files=True (default): --preload-all
-        # auto-marks 100%-whitelisted files as reviewed and drops them
-        # from the reviewable set. False: still preload for perf, but
-        # DO NOT drop -- the operator sees every file, even ones with
-        # nothing to edit. Set to False by --rerun-annot-review so a
-        # "force re-review" flag actually forces the review instead of
-        # silently re-populating the tracker via the auto-drop path.
-        self.auto_drop_whitelisted_files = auto_drop_whitelisted_files
+        # Populated by _preload_all_and_drop_empty: count of files
+        # auto-marked reviewed because 100% of their annotations matched
+        # the whitelist / delete bucket. Distinct from files already in
+        # the reviewed tracker from a prior session -- the CLI uses this
+        # to give the operator an accurate "why is there nothing to do"
+        # message.
+        self.num_files_auto_skipped_whitelist = 0
 
         self._edfs: list[Path] = preflight_subject_for_review(
             self.subject_dir, subfolder=subfolder)
@@ -382,18 +380,8 @@ class AnnotationReviewController:
                 continue
             self._annotations_cache[fi] = _prefetch_one(self._edfs[fi])
 
-        # After all loaded, optionally drop files whose EVERY annotation
-        # is whitelisted or delete-marked. Skip the drop step when
-        # auto_drop_whitelisted_files is False (e.g. --rerun-annot-review)
-        # so a "force re-review" flag actually surfaces every file --
-        # otherwise the auto-drop silently re-populates the tracker and
-        # the CLI reports "already reviewed" for 100%-whitelisted files.
-        if not self.auto_drop_whitelisted_files:
-            if self._file_indices:
-                self.file_cursor = self._file_indices[0]
-            self.annotation_cursor = 0
-            return
-
+        # After all loaded, drop files whose EVERY annotation is
+        # whitelisted or delete-marked. Empty files also drop.
         keep: list[int] = []
         dropped_paths: list[Path] = []
         for fi in self._file_indices:
@@ -419,11 +407,12 @@ class AnnotationReviewController:
         if self._file_indices:
             self.file_cursor = self._file_indices[0]
         self.annotation_cursor = 0
+        self.num_files_auto_skipped_whitelist = len(dropped_paths)
 
         if dropped_paths:
             print(f"[review] auto-skipped {len(dropped_paths)} file(s) "
                   f"with no non-boilerplate annotations "
-                  f"(marked reviewed).")
+                  f"(all whitelisted; marked reviewed).")
 
     def _schedule_prefetch(self) -> None:
         """Ensure the next PREFETCH_LOOKAHEAD unreviewed files after

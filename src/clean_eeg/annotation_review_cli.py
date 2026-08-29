@@ -156,14 +156,9 @@ def main(argv: list[str] | None = None) -> int:
                         "launching: deletes the reviewed-files tracker "
                         "and any pending-edit journal from a prior "
                         "aborted session, so the TUI treats every file "
-                        "as fresh. Also disables the --preload-all "
-                        "auto-drop path so 100%%-whitelisted files "
-                        "still surface for manual re-review (otherwise "
-                        "the reset tracker would be silently "
-                        "re-populated by the preload auto-drop). "
-                        "PRESERVES the applied/ and discarded/ audit "
-                        "trails inside .annotation_review/ -- those "
-                        "record edits that already landed on disk "
+                        "as fresh. PRESERVES the applied/ and "
+                        "discarded/ audit trails inside .annotation_review/ "
+                        "-- those record edits that already landed on disk "
                         "(applied) or were explicitly rejected "
                         "(discarded) in prior sessions. Use when you "
                         "aborted a review partway through and want to "
@@ -214,14 +209,7 @@ def main(argv: list[str] | None = None) -> int:
             whitelist_path=resolved_wl_path,
             respect_reviewed_tracker=not args.include_reviewed,
             preload_all=args.preload_all,
-            hide_whitelisted=not args.show_whitelisted,
-            # --rerun-annot-review disables the preload auto-drop path
-            # so 100%-whitelisted files stay in the reviewable set. Without
-            # this, --rerun-annot-review would reset the tracker only for
-            # --preload-all to silently re-populate it via the auto-drop
-            # branch, and the CLI would report "already reviewed" for the
-            # very files the operator asked to re-see.
-            auto_drop_whitelisted_files=not args.rerun_annot_review)
+            hide_whitelisted=not args.show_whitelisted)
     except PreflightFailure as e:
         print(f"[error] {e}", file=sys.stderr)
         return 2
@@ -232,10 +220,30 @@ def main(argv: list[str] | None = None) -> int:
     from clean_eeg.annotation_review.tui import build_review_app
 
     if controller.num_files_to_review == 0:
-        print(f"[info] all {controller.num_files} EDF file(s) already "
-              f"reviewed (per {args.subject_dir.name}/"
-              ".annotation_reviewed_tracker). Nothing to do -- pass "
-              "--include-reviewed to re-review.")
+        # Distinguish auto-skipped-because-fully-whitelisted from
+        # already-reviewed-by-human. When --preload-all just drained the
+        # queue, the tracker entries are the ones IT wrote a moment ago,
+        # so blaming the tracker would misdirect the operator (there's
+        # nothing they missed reviewing -- there's nothing to review).
+        n_wl = controller.num_files_auto_skipped_whitelist
+        if n_wl and n_wl == controller.num_files:
+            print(f"[info] all {controller.num_files} EDF file(s) had "
+                  f"every annotation whitelisted -- nothing to review. "
+                  f"Pass --show-whitelisted to inspect the whitelisted "
+                  f"annotations, or edit the whitelist JSON if any of "
+                  f"them shouldn't be silenced.")
+        elif n_wl:
+            print(f"[info] all {controller.num_files} EDF file(s) either "
+                  f"had every annotation whitelisted ({n_wl} file(s)) or "
+                  f"were already reviewed in a prior session. Nothing "
+                  f"to review -- pass --include-reviewed to revisit "
+                  f"previously-reviewed files, or --show-whitelisted to "
+                  f"inspect the whitelisted ones.")
+        else:
+            print(f"[info] all {controller.num_files} EDF file(s) already "
+                  f"reviewed (per {args.subject_dir.name}/"
+                  ".annotation_reviewed_tracker). Nothing to do -- pass "
+                  "--include-reviewed to re-review.")
         return 0
 
     app = build_review_app(controller)

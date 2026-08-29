@@ -852,40 +852,33 @@ def test_preload_all_keeps_files_with_partial_boilerplate(tmp_path):
     c.close()
 
 
-def test_preload_all_preserves_files_when_auto_drop_disabled(tmp_path):
-    """auto_drop_whitelisted_files=False: --preload-all still eagerly
-    loads every file's annotations (for the perf win) but the
-    100%-whitelisted files stay in the reviewable set and are NOT
-    silently written to the reviewed-files tracker. This is the path
-    --rerun-annot-review takes so a "force re-review" flag actually
-    surfaces every file rather than being undone by the auto-drop."""
+def test_preload_all_records_auto_skipped_whitelist_count(tmp_path):
+    """The controller exposes num_files_auto_skipped_whitelist so the
+    CLI can distinguish "auto-skipped because fully whitelisted" from
+    "already reviewed by human in a prior session" when the reviewable
+    queue is empty at startup."""
     import json as _json
     subj = _make_subject(tmp_path, "R1755A", {
         "all_boilerplate.edf": ["PAT REF EEG", "PAT REF EEG"],
-        "has_real.edf": ["seizure onset", "eyes closed"],
+        "also_boilerplate.edf": ["PAT REF EEG"],
+        "has_real.edf": ["seizure onset"],
     })
     wl_path = tmp_path / "wl.json"
     wl_path.write_text(_json.dumps({
         "shared": [], "per_site": {"A": [r"PAT REF EEG"]}}))
 
     c = AnnotationReviewController(subj, whitelist_path=wl_path,
-                                     preload_all=True,
-                                     auto_drop_whitelisted_files=False)
-    reviewable_names = [c._edfs[i].name for i in c._file_indices]
-    # 100%-whitelisted file is preserved rather than dropped.
-    assert "all_boilerplate.edf" in reviewable_names
-    assert "has_real.edf" in reviewable_names
+                                     preload_all=True)
+    assert c.num_files_auto_skipped_whitelist == 2
+    c.close()
 
-    # Tracker was NOT silently populated -- the operator is expected
-    # to walk every file before it gets marked reviewed.
-    from clean_eeg.annotation_review.journal import ReviewedTracker
-    reviewed = {r.file_path for r in ReviewedTracker(subj).read_all()}
-    assert reviewed == set(), (
-        "auto_drop_whitelisted_files=False must not write to the "
-        f"reviewed tracker; found: {reviewed}")
 
-    # Preload still happened -- cache is populated for both files.
-    assert all(fi in c._annotations_cache for fi in c._file_indices)
+def test_num_files_auto_skipped_whitelist_defaults_to_zero(tmp_path):
+    """Without preload_all the auto-drop path never runs; the counter
+    must stay at 0 so the CLI doesn't misreport."""
+    subj = _make_subject(tmp_path, "R1755A", {"a.edf": ["x"]})
+    c = AnnotationReviewController(subj)
+    assert c.num_files_auto_skipped_whitelist == 0
     c.close()
 
 

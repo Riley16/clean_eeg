@@ -262,6 +262,31 @@ def test_cli_no_files_to_review_returns_0_with_hint(tmp_path, capsys):
     assert "already reviewed" in out or "--include-reviewed" in out
 
 
+def test_cli_all_files_whitelisted_says_whitelisted_not_reviewed(
+        tmp_path, capsys):
+    """When --preload-all auto-drops every file because 100% of its
+    annotations match the whitelist, the operator should see a message
+    that says the files were whitelisted -- not "already reviewed" --
+    so they don't chase a phantom prior session that never happened.
+    """
+    wl_path = tmp_path / "wl.json"
+    wl_path.write_text(json.dumps({
+        "shared": [], "per_site": {"A": [r"PAT REF EEG"]}}))
+    subj = _make_subject(tmp_path, files={
+        "a.edf": [(0.5, "PAT REF EEG")],
+        "b.edf": [(0.5, "PAT REF EEG")]})
+
+    rc = cli_main(["--subject-dir", str(subj),
+                    "--whitelist-path", str(wl_path),
+                    "--preload-all"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "whitelisted" in out
+    assert "nothing to review" in out.lower()
+    # Must NOT misdirect the operator to the tracker.
+    assert ".annotation_reviewed_tracker" not in out
+
+
 def test_cli_approval_prompt_only_y_applies():
     """SAFETY: only exact 'y' / 'yes' triggers the apply pass. A
     fat-fingered 'n' or 'no' must discard, not silently apply.
@@ -514,6 +539,7 @@ def test_cli_rerun_annot_review_calls_reset_before_controller(monkeypatch,
             tracker_exists_at_controller_init["value"] = tracker.exists()
             self.num_files_to_review = 0
             self.num_files = 0
+            self.num_files_auto_skipped_whitelist = 0
 
         def close(self):
             pass
@@ -546,6 +572,7 @@ def test_cli_rerun_annot_review_noop_message_when_nothing_to_reset(
                       **_ignored):
             self.num_files_to_review = 0
             self.num_files = 0
+            self.num_files_auto_skipped_whitelist = 0
 
         def close(self):
             pass
@@ -581,6 +608,7 @@ def test_cli_auto_locates_standard_whitelist_when_not_specified(
             captured["whitelist_path"] = whitelist_path
             self.num_files_to_review = 0    # short-circuits main() early
             self.num_files = 0
+            self.num_files_auto_skipped_whitelist = 0
 
         def close(self):
             pass
@@ -615,6 +643,7 @@ def test_cli_no_whitelist_flag_disables_auto_load(tmp_path, monkeypatch):
             captured["whitelist_path"] = whitelist_path
             self.num_files_to_review = 0
             self.num_files = 0
+            self.num_files_auto_skipped_whitelist = 0
 
         def close(self):
             pass
