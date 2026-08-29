@@ -194,7 +194,7 @@ def build_subject_plans(subject_dirs: Iterable[Path]) -> tuple[list[SubjectPlan]
     """
     # Late import so `bulk_transfer` can be imported standalone in
     # tests without pulling the pyedflib chain.
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from clean_eeg.transfer import (
         _failed_names_from_manifest,
         preflight_deidentified_output,
@@ -203,37 +203,70 @@ def build_subject_plans(subject_dirs: Iterable[Path]) -> tuple[list[SubjectPlan]
     subject_list = [Path(d) for d in subject_dirs]
 
     def _one(subject_dir: Path):
+        t0 = time.perf_counter()
         result = preflight_deidentified_output(subject_dir)
         excluded: set[str] = set()
         transferable = 0
         if result.passed and result.manifest is not None:
             excluded = _failed_names_from_manifest(result.manifest)
             transferable = _sum_transferable_bytes(subject_dir, excluded)
-        return subject_dir, result, excluded, transferable
+        return (subject_dir, result, excluded, transferable,
+                time.perf_counter() - t0)
 
-    ready: list[SubjectPlan] = []
-    hard_failures: list[tuple[Path, str]] = []
+    ready_by_idx: dict[int, SubjectPlan] = {}
+    fail_by_idx: dict[int, tuple[Path, str]] = {}
     if not subject_list:
-        return ready, hard_failures
+        return [], []
 
-    n_workers = min(PREFLIGHT_MAX_WORKERS, len(subject_list))
+    n = len(subject_list)
+    n_workers = min(PREFLIGHT_MAX_WORKERS, n)
+    # Live per-subject notifications so the operator sees preflight
+    # progress instead of staring at a blank terminal for the multi-
+    # minute stretch it takes to open pyedflib headers over network
+    # storage on the 1-2 subjects that survive the review-complete
+    # fast-fail. Prints as each subject completes (unordered).
+    print(f"[preflight] checking {n} subject(s) (parallel={n_workers}, "
+          f"fast-fail on unreviewed)...", flush=True)
+    completed = 0
     with ThreadPoolExecutor(
             max_workers=n_workers, thread_name_prefix="preflight") as pool:
-        # executor.map preserves input order in its output iterator.
-        for subject_dir, result, excluded, transferable in pool.map(
-                _one, subject_list):
-            if not result.passed:
-                hard_failures.append(
-                    (subject_dir, "; ".join(result.failures)))
-                continue
-            assert result.manifest is not None
-            ready.append(SubjectPlan(
-                subject_dir=subject_dir,
-                subject_code=result.manifest["subject_code"],
-                site_incoming_folder=result.manifest["site_incoming_folder"],
-                transferable_bytes=transferable,
-                excluded_names=excluded,
-            ))
+        futures = {pool.submit(_one, sd): i
+                   for i, sd in enumerate(subject_list)}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            subject_dir, result, excluded, transferable, elapsed = fut.result()
+            completed += 1
+            if result.passed:
+                assert result.manifest is not None
+                code = result.manifest["subject_code"]
+                ready_by_idx[idx] = SubjectPlan(
+                    subject_dir=subject_dir,
+                    subject_code=code,
+                    site_incoming_folder=result.manifest["site_incoming_folder"],
+                    transferable_bytes=transferable,
+                    excluded_names=excluded,
+                )
+                print(f"[preflight {completed}/{n}] OK    "
+                      f"{code}  ({elapsed:.1f}s, "
+                      f"{transferable / 1e9:.2f} GB to ship)", flush=True)
+            else:
+                reason = "; ".join(result.failures)
+                fail_by_idx[idx] = (subject_dir, reason)
+                # Truncate the reason for the live line -- full reason
+                # lands in the event log + end-of-batch summary.
+                short = (reason[:120] + "…") if len(reason) > 120 else reason
+                print(f"[preflight {completed}/{n}] SKIP  "
+                      f"{subject_dir.name}  ({elapsed:.1f}s): {short}",
+                      flush=True)
+
+    # Sort back into input order so downstream code (event log, summary)
+    # reads in the operator-supplied sequence.
+    ready = [ready_by_idx[i] for i in sorted(ready_by_idx)]
+    hard_failures = [fail_by_idx[i] for i in sorted(fail_by_idx)]
+    total_gb = sum(p.transferable_bytes for p in ready) / 1e9
+    print(f"[preflight] done: {len(ready)} ready to ship "
+          f"({total_gb:.2f} GB total), {len(hard_failures)} skipped.",
+          flush=True)
     return ready, hard_failures
 
 
@@ -532,6 +565,16 @@ def run_bulk_transfer(subject_dirs: list[Path],
         completed_bytes = 0
         batch_start = time.perf_counter()
 
+        if not ready:
+            print("[transfer] nothing to ship after preflight; "
+                  "no rsyncs will run.", flush=True)
+        else:
+            total_gb = sum(p.transferable_bytes for p in ready) / 1e9
+            print(f"[transfer] starting {len(ready)} rsync worker(s) "
+                  f"(parallel={parallel}, {total_gb:.2f} GB total). "
+                  f"Per-subject progress prints on completion.",
+                  flush=True)
+
         def _worker(plan: SubjectPlan) -> SubjectResult:
             return transfer_one_subject_with_retry(
                 plan, ssh_user=ssh_user, bwlimit_policy=bwlimit_policy,
@@ -568,6 +611,17 @@ def run_bulk_transfer(subject_dirs: list[Path],
                          elapsed_s=round(result.elapsed_s, 2),
                          last_exit_code=result.last_exit_code,
                          last_error=(result.last_error or "")[:500] or None)
+
+                # Live per-subject line so the operator sees progress
+                # even when the periodic aggregate hasn't fired yet.
+                # Bytes shown are transferable-plan bytes (rsync's own
+                # --progress prints the wire numbers).
+                tag = "OK  " if result.succeeded else "FAIL"
+                print(f"[transfer {len(results)}/{len(ready)}] {tag} "
+                      f"{result.subject_code}  "
+                      f"({result.elapsed_s:.1f}s, "
+                      f"{plan.transferable_bytes / 1e9:.2f} GB)",
+                      flush=True)
 
                 now = time.perf_counter()
                 if now - last_progress >= progress_interval_s:
