@@ -1975,6 +1975,15 @@ if __name__ == "__main__":
             # stdin/stdout aren't TTYs, so SSH-without-PTY / nohup / cron
             # invocations are safe.
             launch_review=not args.no_launch_review,
+            # --no-launch-review is the batch/scripted signal: also
+            # skip the end-of-run "Ready to transfer to CML server?"
+            # prompt. Nothing in a headless batch context wants to
+            # answer that (transfers are driven by bulk-transfer-eeg
+            # separately). Without this, the batch stalled at subject
+            # N even after clean succeeded because the prompt blocked
+            # forever on a fresh subprocess stdin.
+            auto_transfer_response=(
+                "n" if args.no_launch_review else None),
             audit_sample_files=args.audit_sample_files,
         )
 
