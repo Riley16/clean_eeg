@@ -494,11 +494,19 @@ def _print_summary(outcomes: list[SubjectOutcome]) -> None:
     if audit_s:
         print(f"  clean time: {clean_only_s:.1f} s   "
               f"audit time: {audit_s:.1f} s")
+    non_interactive_aborts: list[SubjectOutcome] = []
     for o in outcomes:
         if o.succeeded:
             continue
+        err = o.error_message or ""
+        if "[non-interactive]" in err:
+            # Track separately so the operator's morning-triage list
+            # highlights "subjects that needed a human answer" versus
+            # real errors. Non-interactive aborts are always fixable
+            # (add a bypass flag, or re-run that subject with a TTY).
+            non_interactive_aborts.append(o)
         if not o.clean_succeeded:
-            err_tail = (o.error_message or "").splitlines()[-1:]
+            err_tail = err.splitlines()[-1:]
             print(f"  FAIL row {o.row_index} {o.subject_code} [clean]: "
                   f"exit={o.exit_code} :: "
                   f"{err_tail[0] if err_tail else ''}")
@@ -508,6 +516,22 @@ def _print_summary(outcomes: list[SubjectOutcome]) -> None:
             print(f"  FAIL row {o.row_index} {o.subject_code} [audit]: "
                   f"exit={o.audit_exit_code} :: "
                   f"{err_tail[0] if err_tail else ''}")
+
+    if non_interactive_aborts:
+        print(f"\n  [!] {len(non_interactive_aborts)} subject(s) aborted "
+              f"because the pipeline hit an interactive prompt in "
+              f"non-interactive mode:")
+        for o in non_interactive_aborts:
+            # Show the offending prompt text so the operator knows what
+            # bypass flag / CSV correction is needed.
+            for line in (o.error_message or "").splitlines():
+                if "[non-interactive]" in line and "refusing to prompt" in line:
+                    print(f"    {o.subject_code}: "
+                          f"{line.split('refusing to prompt:', 1)[-1].strip()}")
+                    break
+        print(f"  Each of these subjects can be re-run individually "
+              f"with an appropriate bypass flag once the underlying "
+              f"issue is confirmed.")
 
 
 # ---------------------------------------------------------------------------

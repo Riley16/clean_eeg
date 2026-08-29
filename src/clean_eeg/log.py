@@ -152,13 +152,50 @@ def close_logger():
         _logger = None
 
 
+import builtins as _builtins
+_ORIG_INPUT = _builtins.input
+
+
 def logged_input(prompt: str = "") -> str:
     """Drop-in replacement for input() that logs the user's response.
 
     The prompt itself is already captured by the TeeStream when input()
     writes it to stdout. This function additionally logs the user's
     typed response, which is read from stdin and not echoed through stdout.
+
+    Headless-safety: when stdin isn't a TTY (nohup, cron, subprocess
+    pipe, SSH-without-PTY), NEVER block on input(). Emit the prompt
+    text + a clear "[non-interactive]" banner to stderr and return the
+    empty string. Downstream callers that treat any non-'y'/'yes'
+    answer as "abort" then raise a RuntimeError, which the batch runner
+    catches -- that subject fails, the batch keeps moving. This makes
+    overnight batches bulletproof against a prompt we forgot to gate:
+    the worst case is one subject fails, not the whole batch stalling
+    silently until morning.
+
+    Test-env carve-out: when unit tests monkeypatch ``builtins.input``,
+    they're supplying the prompt response deterministically; honour the
+    mock and skip the isatty guard. Only pure ``builtins.input`` under
+    a non-TTY stdin triggers the fail-safe.
     """
+    input_is_mocked = _builtins.input is not _ORIG_INPUT
+    if not input_is_mocked and not sys.stdin.isatty():
+        # Surface enough to diagnose after the fact WITHOUT ever
+        # blocking. Prompt goes to stderr so a stdout tee doesn't
+        # swallow it, and the [non-interactive] tag makes it grep-able
+        # in the log.
+        sys.stderr.write(
+            f"[non-interactive] refusing to prompt: {prompt}\n"
+            f"[non-interactive] auto-answered empty (subject will be "
+            f"aborted). Fix the underlying issue, add a bypass flag "
+            f"(e.g. --approve-confirmations, --fail-on-name-mismatch), "
+            f"or re-run this subject interactively.\n")
+        sys.stderr.flush()
+        if _logger is not None:
+            _logger.write_to_log(
+                f"[non-interactive] auto-answered empty for prompt: "
+                f"{prompt}\n")
+        return ""
     response = input(prompt)
     if _logger is not None:
         _logger.write_to_log(f"{response}\n")

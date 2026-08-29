@@ -170,6 +170,32 @@ def test_logged_input_captures_response(tmp_path):
     assert "yes" in content
 
 
+def test_logged_input_never_blocks_when_stdin_not_tty(tmp_path, capsys):
+    """Headless-safety regression: when stdin isn't a TTY,
+    logged_input must NEVER call input() (which would block forever
+    under nohup/cron/piped-stdin). It should print a diagnostic to
+    stderr and return the empty string so downstream code aborts the
+    subject without stalling the batch.
+
+    A prior version called input() unconditionally and turned overnight
+    27-subject cleaning batches into 3-subject-completed / 24-stalled
+    disasters."""
+    log_path = str(tmp_path / "log.out")
+    setup_logger(log_path)
+    try:
+        # No monkeypatch of builtins.input -- production shape, where
+        # nothing intercepts and input() would block on stdin. Only the
+        # isatty guard should short-circuit.
+        with patch("sys.stdin.isatty", return_value=False):
+            result = logged_input("Continue? yes/no: ")
+        assert result == ""
+        err = capsys.readouterr().err
+        assert "[non-interactive]" in err
+        assert "Continue?" in err
+    finally:
+        close_logger()
+
+
 def test_logged_input_scrubs_phi(tmp_path):
     """logged_input() should scrub PHI from the logged response."""
     log_path = str(tmp_path / "log.out")
