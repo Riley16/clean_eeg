@@ -711,9 +711,18 @@ def _build_parser() -> argparse.ArgumentParser:
                     "with retries, parallelism, day/night bandwidth caps, "
                     "and PHI-safety enforcement.",
     )
-    p.add_argument("--subjects-file", type=Path, required=True,
-                   help="Text file with one absolute subject-dir path per line. "
-                        "Blank lines and '#' comments are ignored.")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--subjects-file", type=Path,
+                     help="Text file with one absolute subject-dir path per line. "
+                          "Blank lines and '#' comments are ignored.")
+    src.add_argument("--subjects-csv", type=Path,
+                     help="Same CSV clean-batch-eeg consumes; the "
+                          "'output_path' column is treated as the "
+                          "subject-dir list. Lets a single CSV drive "
+                          "both stages so operators don't maintain two "
+                          "parallel lists. Preflight's review-complete "
+                          "gate silently holds back subjects that "
+                          "haven't been reviewed yet.")
     p.add_argument("--user", type=str, default=None,
                    help="SSH user (default: $USER).")
     p.add_argument("--parallel", type=int, default=DEFAULT_PARALLEL,
@@ -787,12 +796,26 @@ def _load_subject_paths(subjects_file: Path) -> list[Path]:
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv) if argv is not None else sys.argv[1:]
     args = _build_parser().parse_args(argv)
-    subject_dirs = _load_subject_paths(args.subjects_file)
+    # --subjects-file and --subjects-csv are mutually exclusive at the
+    # arg-parser level; exactly one is populated. --subjects-csv reuses
+    # the clean-batch CSV so operators run both stages off one file.
+    if args.subjects_csv is not None:
+        from clean_eeg.clean_batch import parse_subjects_csv, CsvSchemaError
+        try:
+            rows = parse_subjects_csv(args.subjects_csv)
+        except CsvSchemaError as e:
+            print(f"CSV schema error: {e}", file=sys.stderr)
+            return 2
+        subject_dirs = [Path(r.output_path) for r in rows]
+        source_path = args.subjects_csv
+    else:
+        subject_dirs = _load_subject_paths(args.subjects_file)
+        source_path = args.subjects_file
     if not subject_dirs:
-        print(f"No subject paths found in {args.subjects_file}", file=sys.stderr)
+        print(f"No subject paths found in {source_path}", file=sys.stderr)
         return 1
 
-    log_path = args.log_path or _default_log_path(args.subjects_file)
+    log_path = args.log_path or _default_log_path(source_path)
     if args.background:
         # Re-exec self under nohup, minus --background, and exit.
         pid, script_path, stdout_log = _relaunch_in_background(
@@ -833,7 +856,7 @@ def main(argv: list[str] | None = None) -> int:
         backoff_base_s=args.backoff_base,
         remote_dir_override=args.remote_dir_override,
         log_path=args.log_path,
-        subjects_file=args.subjects_file,
+        subjects_file=source_path,
         only_subjects=only_subjects or None,
         ssh_key=args.ssh_key,
         auto_ssh_agent=not args.no_auto_ssh_agent,

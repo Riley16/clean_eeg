@@ -22,6 +22,8 @@ import sys
 from datetime import datetime, time as dtime
 from pathlib import Path
 
+import pytest
+
 # Reuse the deidentified-subject fixture builder from test_transfer.py --
 # we do NOT want to duplicate the setup logic. Import via sys.path so
 # pytest's rootdir discovery finds it.
@@ -504,6 +506,59 @@ def test_main_returns_nonzero_when_subjects_file_empty(tmp_path, capsys):
     assert rc == 1
     err = capsys.readouterr().err
     assert "No subject paths" in err
+
+
+def test_main_accepts_subjects_csv_and_derives_output_paths(
+        tmp_path, monkeypatch):
+    """--subjects-csv reads the same CSV clean-batch-eeg consumes and
+    uses each row's output_path column as the subject dir. Lets an
+    operator drive both stages off one file instead of maintaining
+    parallel lists."""
+    out = _make_subject_dir(tmp_path)
+    csv_path = tmp_path / "subjects.csv"
+    csv_path.write_text(
+        "input_path,output_path,subject_code,first_name,last_name\n"
+        f"{tmp_path / 'in'},{out},R1755A,Alice,Smith\n")
+    monkeypatch.setattr(
+        "clean_eeg.bulk_transfer._run_subject_rsync",
+        lambda *a, **k: (0, "", False))
+    rc = main([
+        "--subjects-csv", str(csv_path),
+        "--user", "alice", "--parallel", "1",
+        "--max-retries", "1", "--backoff-base", "0",
+        "--remote-dir-override", str(tmp_path / "dest"),
+    ])
+    assert rc == 0
+
+
+def test_main_rejects_both_subjects_file_and_subjects_csv(tmp_path, capsys):
+    """--subjects-file and --subjects-csv are mutually exclusive at the
+    parser level. Guards against confused invocations where the operator
+    thinks one overrides the other."""
+    (tmp_path / "s.txt").write_text("/tmp\n")
+    (tmp_path / "s.csv").write_text("x")
+    with pytest.raises(SystemExit) as ei:
+        main(["--subjects-file", str(tmp_path / "s.txt"),
+              "--subjects-csv", str(tmp_path / "s.csv")])
+    assert ei.value.code != 0
+
+
+def test_main_requires_exactly_one_of_subjects_file_or_csv(capsys):
+    """Neither given -> parser rejects. Complements the mutex test."""
+    with pytest.raises(SystemExit) as ei:
+        main([])
+    assert ei.value.code != 0
+
+
+def test_main_subjects_csv_bad_schema_returns_2(tmp_path, capsys):
+    """A malformed CSV (missing required columns) exits 2 with a schema
+    error message rather than crashing partway through the transfer."""
+    csv_path = tmp_path / "bad.csv"
+    csv_path.write_text("subject_code\nR1755A\n")  # missing required cols
+    rc = main(["--subjects-csv", str(csv_path)])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "CSV schema error" in err
 
 
 def test_main_returns_nonzero_when_any_subject_fails(tmp_path, monkeypatch):
