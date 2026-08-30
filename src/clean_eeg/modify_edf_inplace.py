@@ -133,6 +133,14 @@ def update_edf_header_inplace(edf_path: str,
     os.remove(temp_path)
 
 
+class HeaderRoundtripFatalError(RuntimeError):
+    """Raised by :func:`validate_header_roundtrip` when the proposed
+    redacted header would produce a file pyedflib can't re-open.
+    Distinct type so callers can catch it separately from softer
+    truncation warnings and MUST abort before overwriting the input
+    file (the write would corrupt intact source data)."""
+
+
 def validate_header_roundtrip(header: dict, signal_headers: list = None) -> list[str]:
     """Check the redacted header round-trips cleanly through pyedflib.
 
@@ -143,17 +151,22 @@ def validate_header_roundtrip(header: dict, signal_headers: list = None) -> list
          subfields into the 80-byte patient_id / recording_id slots)
          are captured and returned.
       2. Dry-run READ-BACK: open the same temp file with
-         pyedflib.EdfReader. Catches the case where pyedflib accepts
-         the header on write but its own read-side strict validator
-         rejects it -- rare but real, and the whole point of catching
-         these BEFORE overwriting the real data.
+         pyedflib.EdfReader. If pyedflib refuses its own write, this
+         function RAISES :class:`HeaderRoundtripFatalError` -- the
+         proposed header is unparseable and the caller MUST NOT write
+         it back over the source file (would corrupt the header and
+         quarantine the result while destroying the source header
+         bytes). Prior to this raise, the pipeline printed a warning
+         but continued -- R1665J lost 51 files' worth of headers this
+         way in one batch.
 
     The read-back requires at least one data record to satisfy
     pyedflib's ``EDFLIB_FILE_ERRORS_NUMBER_DATARECORDS`` check, so we
     write exactly one record of zeros per channel. For a 178-channel
     NK export at ~150 spr that's ~53 KB / file — cost < 1 s.
 
-    Returns a list of warning / error strings. Empty list = clean.
+    Returns a list of warning strings (typically field truncation).
+    Empty list = clean. Raises on unparseable output header.
     """
     import tempfile
     import warnings as warnings_module
@@ -184,14 +197,20 @@ def validate_header_roundtrip(header: dict, signal_headers: list = None) -> list
         for w in caught:
             result.append(str(w.message))
         # READ-BACK: any OSError here means pyedflib refuses to open
-        # what pyedflib just wrote. Best diagnosable pre-overwrite.
+        # what pyedflib just wrote. Raise instead of returning-as-
+        # warning so the caller aborts BEFORE overwriting the real
+        # file. Prior behaviour silently proceeded past this warning
+        # and corrupted 51 of R1665J's file headers in one batch.
         try:
             with pyedflib.EdfReader(tmp_path):
                 pass
         except OSError as e:
-            result.append(
-                "pyedflib refused to open its own dry-run write of "
-                f"the redacted header: {e}"
+            raise HeaderRoundtripFatalError(
+                f"pyedflib refused to open its own dry-run write of "
+                f"the redacted header: {e}. Refusing to overwrite the "
+                f"source file with this header -- would corrupt it. "
+                f"Non-fatal warnings collected before the raise: "
+                f"{result if result else '(none)'}"
             )
     finally:
         os.remove(tmp_path)

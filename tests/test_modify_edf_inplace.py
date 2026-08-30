@@ -350,15 +350,24 @@ def test_validate_header_roundtrip_no_warnings(base_edf):
     assert result == [], f"Unexpected warnings: {result}"
 
 
-def test_validate_header_roundtrip_truncation_warning(base_edf):
-    """Overly long header field should produce a truncation warning."""
+def test_validate_header_roundtrip_severe_truncation_is_fatal(base_edf):
+    """A 200-char technician field overflows the 80-byte recording_id
+    slot so drastically that pyedflib's own read-back rejects the file.
+    We raise :class:`HeaderRoundtripFatalError` with the collected
+    truncation warnings surfaced in the exception message -- callers
+    then abort BEFORE overwriting the source file rather than silently
+    corrupting it. Prior behaviour returned the warning + proceeded."""
+    from clean_eeg.modify_edf_inplace import HeaderRoundtripFatalError
     with pyedflib.EdfReader(base_edf) as f:
         header = f.getHeader()
-    # technician is packed into recording_id (80 bytes total with equipment, admincode, etc.)
-    header['technician'] = 'A' * 200
-    result = validate_header_roundtrip(header)
-    assert len(result) > 0, "Expected truncation warning for oversized field"
-    assert any('80 chars' in w for w in result)
+        signal_headers = [f.getSignalHeader(i) for i in range(f.signals_in_file)]
+    header['technician'] = 'A' * 200   # forces recording_id > 80 chars
+    with pytest.raises(HeaderRoundtripFatalError) as ei:
+        validate_header_roundtrip(header, signal_headers)
+    # Truncation warnings should be surfaced inside the exception
+    # message so the operator sees both the primary cause AND the
+    # write-side warnings collected before the read-back refused.
+    assert "80 chars" in str(ei.value)
 
 
 def test_validate_header_roundtrip_read_back_succeeds(base_edf):
@@ -375,6 +384,29 @@ def test_validate_header_roundtrip_read_back_succeeds(base_edf):
     # Negative regression: none of the returned strings mention read-back
     # failure (the string the read-back path would emit).
     assert not any("refused to open" in r for r in result)
+
+
+def test_validate_header_roundtrip_raises_on_readback_failure(base_edf):
+    """When the proposed header produces a file pyedflib refuses to
+    re-open, validate_header_roundtrip must RAISE HeaderRoundtripFatalError
+    rather than returning-as-warning. Prior behaviour silently returned
+    the warning and callers ignored it -- clean_subject_eeg then
+    overwrote the source file with the bad header and quarantined the
+    (now-corrupted) result. That's how R1665J lost 51 file headers in
+    one batch. This regression asserts the fatal-raise path fires."""
+    from clean_eeg.modify_edf_inplace import (
+        HeaderRoundtripFatalError,
+        validate_header_roundtrip,
+    )
+    with pyedflib.EdfReader(base_edf) as f:
+        header = f.getHeader()
+    # Calling validate_header_roundtrip WITHOUT signal_headers means
+    # pyedflib writes a zero-record temp EDF, which its own strict
+    # reader refuses (EDFLIB_FILE_ERRORS_NUMBER_DATARECORDS). Reliable
+    # trigger for the fatal path across pyedflib versions.
+    with pytest.raises(HeaderRoundtripFatalError,
+                        match="refused to open its own dry-run write"):
+        validate_header_roundtrip(header)
 
 
 def test_verify_output_edf_loadable_positive(base_edf):
