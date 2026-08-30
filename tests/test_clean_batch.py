@@ -125,6 +125,51 @@ def test_parse_csv_ignores_extra_columns(tmp_path):
     assert len(rows) == 1
 
 
+def test_parse_csv_hash_prefixed_subject_code_is_skipped(tmp_path, capsys):
+    """Operator workflow: prepend '#' to a subject_code cell to
+    exclude that subject from the batch WITHOUT deleting the row (so
+    the CSV keeps its manifest history). Skipped rows: don't count
+    against the returned list, don't require other cells to be
+    valid, DO show up in a stderr summary so their absence is
+    visible in the batch log."""
+    csv_path = tmp_path / "s.csv"
+    good = _valid_row("R1755A")
+    bad_header = _valid_row("#R1665J")     # skip via hash prefix
+    bad_header["input_path"] = ""          # normally would raise; must not
+    also_good = _valid_row("R1755B")
+    _write_csv(csv_path, [good, bad_header, also_good])
+    rows = parse_subjects_csv(csv_path)
+    assert [r.subject_code for r in rows] == ["R1755A", "R1755B"]
+    err = capsys.readouterr().err
+    assert "#R1665J" in err
+    assert "skipped 1" in err
+
+
+def test_parse_csv_hash_prefix_alone_still_valid_skip(tmp_path, capsys):
+    """A '#' alone in the subject_code cell (with no code following)
+    is also a valid skip marker -- some operators may prefer '#' as a
+    pure comment character even when they haven't left the subject
+    code in place."""
+    csv_path = tmp_path / "s.csv"
+    good = _valid_row("R1755A")
+    hash_only = _valid_row("#")
+    _write_csv(csv_path, [good, hash_only])
+    rows = parse_subjects_csv(csv_path)
+    assert len(rows) == 1
+    assert "skipped 1" in capsys.readouterr().err
+
+
+def test_parse_csv_hash_in_middle_of_code_still_included(tmp_path):
+    """Guard: '#' must be the FIRST character to trigger skip. A
+    subject_code like 'R1#755A' (unlikely but possible operator typo)
+    stays in the batch -- otherwise a typo silently drops a subject."""
+    csv_path = tmp_path / "s.csv"
+    _write_csv(csv_path, [_valid_row("R1#755A")])
+    rows = parse_subjects_csv(csv_path)
+    assert len(rows) == 1
+    assert rows[0].subject_code == "R1#755A"
+
+
 def test_parse_csv_strips_whitespace_from_cells(tmp_path):
     """Common operator mistake: pasted values have trailing spaces.
     Wrapper should strip so downstream argv is clean."""

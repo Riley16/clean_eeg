@@ -129,6 +129,14 @@ def parse_subjects_csv(path: Path) -> list[SubjectRow]:
     Fails fast on missing required columns or blank required cells --
     silently skipping a bad row would let the operator run for hours
     before noticing a subject was dropped.
+
+    Skip syntax: any row whose ``subject_code`` starts with ``#`` is
+    treated as commented-out and dropped from the returned list. The
+    other cells in that row are NOT validated (they can be anything,
+    including empty), so commenting a subject out doesn't force the
+    operator to also fill placeholder values. A one-line summary
+    prints to stderr with the skipped codes so their absence is
+    visible in the batch log.
     """
     with open(path, encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
@@ -143,7 +151,17 @@ def parse_subjects_csv(path: Path) -> list[SubjectRow]:
                 f"Optional: {list(OPTIONAL_COLUMNS)}.")
 
         rows: list[SubjectRow] = []
+        skipped_codes: list[str] = []
         for i, raw in enumerate(reader, start=1):
+            code_raw = (raw.get("subject_code") or "").strip()
+            # `#`-prefixed subject_code = commented-out row. Skip
+            # without validating the rest of the row -- the operator
+            # is explicitly opting this subject out.
+            if code_raw.startswith("#"):
+                # Preserve the operator's original prefix in the log
+                # so they can grep the CSV for it.
+                skipped_codes.append(code_raw)
+                continue
             missing_cells = [c for c in REQUIRED_COLUMNS
                              if not (raw.get(c) or "").strip()]
             if missing_cells:
@@ -153,12 +171,16 @@ def parse_subjects_csv(path: Path) -> list[SubjectRow]:
             rows.append(SubjectRow(
                 input_path=raw["input_path"].strip(),
                 output_path=raw["output_path"].strip(),
-                subject_code=raw["subject_code"].strip(),
+                subject_code=code_raw,
                 first_name=raw["first_name"].strip(),
                 last_name=raw["last_name"].strip(),
                 middle_name=mn,
                 row_index=i,
             ))
+    if skipped_codes:
+        print(f"[csv] skipped {len(skipped_codes)} commented-out "
+              f"subject(s) (# prefix): {', '.join(skipped_codes)}",
+              file=sys.stderr, flush=True)
     return rows
 
 
