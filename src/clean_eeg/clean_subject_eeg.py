@@ -1884,22 +1884,24 @@ def get_clean_eeg_cli_arguments():
                              "transfer-subject-eeg or bulk-transfer-eeg. "
                              "Automatically enabled by --no-launch-review.")
     parser.add_argument("--audit-sample-files", "--audit_sample_files",
-                        dest="audit_sample_files", type=int, default=None,
+                        dest="audit_sample_files", type=int, default=3,
                         metavar="N",
                         help="Audit signal integrity on N sampled files per "
-                             "subject instead of every file. N=0 is equivalent "
-                             "to --skip_audit (no audit); N>=len(files) "
-                             "reverts to the default full audit. Selection is "
-                             "deterministic: always includes first + last "
+                             "subject instead of every file. Default: 3 "
+                             "(first + last + one interior). N=0 is "
+                             "equivalent to --skip_audit (no audit); "
+                             "N>=len(files) reverts to full-audit. Selection "
+                             "is deterministic: always includes first + last "
                              "file, plus (N-2) evenly-spaced interior files. "
                              "Trade defense-in-depth (bit-verify EVERY file) "
-                             "for wall-time (skip signal I/O on unaudited "
-                             "files -- signal preload is the dominant per-file "
-                             "cost on multi-GB EEGs over network storage). "
-                             "Recommended for batch runs on large subjects "
-                             "when you trust the pipeline's per-file "
-                             "primitives (which are covered by their own unit "
-                             "tests).")
+                             "for wall-time (signal preload is the dominant "
+                             "per-file cost on multi-GB EEGs over network "
+                             "storage). Non-audited files still get the "
+                             "pre-write header dry-run + post-write pyedflib "
+                             "re-open + rollback protection -- only the "
+                             "signal-bytes cross-check is skipped. Default "
+                             "chosen for batch runs on large subjects; pass "
+                             "a larger N (or omit) for more paranoia.")
 
     args = parser.parse_args()
 

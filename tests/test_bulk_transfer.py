@@ -684,6 +684,43 @@ def test_main_requires_exactly_one_of_subjects_file_or_csv(capsys):
     assert ei.value.code != 0
 
 
+def test_subjects_csv_skips_hash_prefixed_rows_in_transfer(
+        tmp_path, monkeypatch, capsys):
+    """Skip syntax parity with clean-batch-eeg: prepending '#' to a
+    subject_code cell in the CSV must also skip that subject when the
+    same CSV is fed to bulk-transfer-eeg. Otherwise operators who
+    commented out a bad subject for the clean batch would have to
+    remember to also filter it out of the transfer command."""
+    out = _make_subject_dir(tmp_path)
+    csv_path = tmp_path / "subjects.csv"
+    csv_path.write_text(
+        "input_path,output_path,subject_code,first_name,last_name\n"
+        f"{tmp_path / 'in'},{out},R1755A,Alice,Smith\n"
+        f",,#R1665J,,\n"  # skip via # prefix; other cells blank OK
+    )
+    seen_rsync_targets: list = []
+    def _fake_rsync(plan, *a, **k):
+        seen_rsync_targets.append(plan.subject_code)
+        return 0, "", False
+    monkeypatch.setattr(
+        "clean_eeg.bulk_transfer._run_subject_rsync", _fake_rsync)
+
+    rc = main([
+        "--subjects-csv", str(csv_path),
+        "--user", "alice", "--parallel", "1",
+        "--max-retries", "1", "--backoff-base", "0",
+        "--remote-dir-override", str(tmp_path / "dest"),
+    ])
+    assert rc == 0
+    assert "R1665J" not in seen_rsync_targets, (
+        f"# prefix should have skipped R1665J; rsync ran on "
+        f"{seen_rsync_targets}")
+    # The [csv] skipped ... line prints to stderr from
+    # parse_subjects_csv so the operator sees it in both stages.
+    err = capsys.readouterr().err
+    assert "skipped 1" in err and "#R1665J" in err
+
+
 def test_main_subjects_csv_bad_schema_returns_2(tmp_path, capsys):
     """A malformed CSV (missing required columns) exits 2 with a schema
     error message rather than crashing partway through the transfer."""

@@ -2557,6 +2557,23 @@ def test_prompt_bypass_flag_does_not_hang_stdin(
             f"-- the bypass path may not have run. Trace:\n{combined}")
 
 
+def test_audit_sample_files_cli_default_is_3():
+    """--audit-sample-files defaults to 3 (first + last + one interior).
+    Pins the ergonomic default chosen for batch runs on large subjects
+    where per-file signal-preload is the dominant wall-time cost.
+    Regression against a future well-meaning "full audit by default"
+    revert that would silently 40x per-file clean time for the batch
+    operators."""
+    import subprocess as _sp
+    result = _sp.run(
+        [sys.executable, "-m", "clean_eeg.clean_subject_eeg", "--help"],
+        capture_output=True, text=True, timeout=30)
+    assert "Default: 3" in result.stdout, (
+        f"--help output must document 'Default: 3' for "
+        f"--audit-sample-files. Change the default? Update the CLI "
+        f"help text too. --help output was:\n{result.stdout[-2000:]}")
+
+
 def test_audit_sample_files_end_to_end_calls_audit_exactly_N_times(
         monkeypatch, tmp_path):
     """End-to-end confirmation: --audit-sample-files N causes
