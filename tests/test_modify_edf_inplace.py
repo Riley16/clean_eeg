@@ -350,6 +350,91 @@ def test_validate_header_roundtrip_no_warnings(base_edf):
     assert result == [], f"Unexpected warnings: {result}"
 
 
+def test_update_header_inplace_rolls_back_on_unloadable_result(
+        base_edf, monkeypatch):
+    """update_edf_header_inplace must restore the pre-write header
+    bytes if the post-write pyedflib open fails, so the source file is
+    never left in a corrupted state. Simulates the R1665J-class bug
+    (write succeeds mechanically but produces an unloadable file) by
+    forcing verify_output_edf_loadable to return a diagnostic string
+    after the write lands."""
+    from clean_eeg import modify_edf_inplace as _m
+
+    # Snapshot the pre-call bytes of the source file so we can prove
+    # they're restored byte-for-byte after the rollback.
+    with open(base_edf, "rb") as f:
+        pre_bytes = f.read()
+
+    with pyedflib.EdfReader(base_edf) as f:
+        header = f.getHeader()
+        signal_headers = [f.getSignalHeader(i) for i in range(f.signals_in_file)]
+
+    # Force the post-write verification to report an error even though
+    # the actual write would have produced a loadable file.
+    monkeypatch.setattr(
+        _m, "verify_output_edf_loadable",
+        lambda _p: "SIMULATED post-write verification failure")
+
+    with pytest.raises(RuntimeError,
+                        match="Restored the pre-write header bytes"):
+        update_edf_header_inplace(base_edf, header,
+                                   signal_header_updates=signal_headers)
+
+    # Source file bytes must be back to exactly what they were before.
+    with open(base_edf, "rb") as f:
+        post_bytes = f.read()
+    assert pre_bytes == post_bytes, (
+        "rollback failed to restore source file byte-for-byte")
+
+
+def test_clear_annotations_inplace_rolls_back_on_validation_failure(
+        base_edf, monkeypatch):
+    """clear_edf_annotations_inplace must restore every annotation
+    record's pre-clear bytes if post-clear validation fails, so the
+    source file is not left with a half-cleared annotation channel."""
+    from clean_eeg import modify_edf_inplace as _m
+
+    with open(base_edf, "rb") as f:
+        pre_bytes = f.read()
+
+    # Force the validation step to fail by monkeypatching
+    # pyedflib.EdfReader within modify_edf_inplace to raise.
+    class _BadReader:
+        def __init__(self, *a, **k):
+            raise RuntimeError("SIMULATED validation failure")
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(_m.pyedflib, "EdfReader", _BadReader)
+
+    with pytest.raises(RuntimeError,
+                        match="Restored pre-clear annotation bytes"):
+        clear_edf_annotations_inplace(base_edf, validate=True)
+
+    with open(base_edf, "rb") as f:
+        post_bytes = f.read()
+    assert pre_bytes == post_bytes, (
+        "annotation clear rollback failed to restore source file "
+        "byte-for-byte")
+
+
+def test_clear_annotations_inplace_validate_false_skips_rollback(
+        base_edf):
+    """validate=False bypasses the post-write check entirely. The
+    caller is trusting the write; rollback logic never fires. Behaves
+    exactly like the pre-safety-net version."""
+    # Just call it -- should complete without raising and modify the file.
+    with open(base_edf, "rb") as f:
+        pre_bytes = f.read()
+    clear_edf_annotations_inplace(base_edf, validate=False)
+    with open(base_edf, "rb") as f:
+        post_bytes = f.read()
+    assert pre_bytes != post_bytes, (
+        "clearing with validate=False should still modify the file")
+
+
 def test_validate_header_roundtrip_severe_truncation_is_fatal(base_edf):
     """A 200-char technician field overflows the 80-byte recording_id
     slot so drastically that pyedflib's own read-back rejects the file.

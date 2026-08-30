@@ -114,21 +114,60 @@ def update_edf_header_inplace(edf_path: str,
         total_length = field_width * on_disk_n_signals
         copy_bytes(edf_path, temp_path, abs_offset, total_length)
 
-    # Copy updated header bytes back to original file
+    # Copy updated header bytes back to original file. Snapshot the
+    # bytes we're about to overwrite FIRST so we can restore them if
+    # the resulting file fails pyedflib's re-open check. Cost is O(header)
+    # (a few KB), so we get atomicity for the header-modification scope
+    # without paying O(file_size) to copy the whole EDF to a temp.
+    n_copy_bytes = TOTAL_HEADER_BYTES
+    if signal_header_updates is not None:
+        n_copy_bytes += len(orig_signal_headers) * SIGNAL_HEADER_BYTES
+    with open(edf_path, "rb") as f:
+        pre_write_snapshot = f.read(n_copy_bytes)
     with open(edf_path, "r+b") as orig_file, open(temp_path, "rb") as temp_file:
-        n_copy_bytes = TOTAL_HEADER_BYTES
-        if signal_header_updates is not None:
-            n_copy_bytes += len(orig_signal_headers) * SIGNAL_HEADER_BYTES
         updated_header_bytes = temp_file.read(n_copy_bytes)
         orig_file.seek(0)
         orig_file.write(updated_header_bytes)
+        orig_file.flush()
+        os.fsync(orig_file.fileno())
+
+    # Post-write validation: if pyedflib refuses the file we just
+    # wrote, restore the snapshot (rolling back the destructive write)
+    # and raise. Guards against write producing an unloadable file --
+    # the exact class of bug that destroyed R1665J's headers because
+    # the caller's pre-write validate_header_roundtrip caught the
+    # problem but returned it as a soft warning we ignored.
+    post_write_err = verify_output_edf_loadable(edf_path)
+    if post_write_err is not None:
+        with open(edf_path, "r+b") as orig_file:
+            orig_file.seek(0)
+            orig_file.write(pre_write_snapshot)
+            orig_file.flush()
+            os.fsync(orig_file.fileno())
+        os.remove(temp_path)
+        raise RuntimeError(
+            f"In-place header write to {edf_path} produced a file "
+            f"pyedflib refuses to open ({post_write_err}). Restored "
+            f"the pre-write header bytes to preserve the source file.")
 
     if confirm_signals_unchanged:
         with pyedflib.EdfReader(edf_path) as f:
             for i in range(f.signals_in_file):
                 updated_signal = f.readSignal(i)
                 if not all(updated_signal == orig_signals[i]):
-                    raise ValueError(f"Signal {i} changed after in-place header update")
+                    # Signal integrity failed AFTER the header write
+                    # already landed. Restore the snapshot so the file
+                    # returns to its original state; the caller sees
+                    # the raise and the source is not corrupted.
+                    with open(edf_path, "r+b") as of2:
+                        of2.seek(0)
+                        of2.write(pre_write_snapshot)
+                        of2.flush()
+                        os.fsync(of2.fileno())
+                    os.remove(temp_path)
+                    raise ValueError(
+                        f"Signal {i} changed after in-place header "
+                        f"update. Restored pre-write header bytes.")
 
     os.remove(temp_path)
 
@@ -287,15 +326,22 @@ def clear_edf_annotations_inplace(path, validate: bool = True):
     n_signals = len(signal_record_lengths)
     n_records = get_header_field(path, 'num_data_records')
 
-    # get annotation record bytes
+    # Snapshot every record's annotation bytes BEFORE writing so we
+    # can roll back if the resulting file fails validation. Cost is
+    # O(n_records * ann_record_length) in memory -- typically a few
+    # MB -- vs O(file_size) if we copied the whole EDF to a temp.
+    # Preserves atomicity for the annotation-clearing scope without
+    # paying to duplicate multi-GB signal data.
+    snapshots: list[tuple[int, bytes]] = []
     with open(path, "r+b") as f:
         for i in range(n_records):
             annotation_record_offset = TOTAL_HEADER_BYTES + SIGNAL_HEADER_BYTES * n_signals + total_records_length * i + ann_record_offset
             f.seek(annotation_record_offset)
             ann_record_bytes = f.read(ann_record_length)
+            snapshots.append((annotation_record_offset, ann_record_bytes))
 
             # blank out annotation texts after time-keeping annotations
-            # first annotation after time-keeping must be empty, so 2 x14 bytes in a row separate 
+            # first annotation after time-keeping must be empty, so 2 x14 bytes in a row separate
             # time-keeping from first annotation in each record
             EDF_TAL_TIMEKEEPING_DELIMITER = b'\x14\x14'
             time_keeping_offset = ann_record_bytes.find(EDF_TAL_TIMEKEEPING_DELIMITER) + len(EDF_TAL_TIMEKEEPING_DELIMITER)
@@ -304,12 +350,34 @@ def clear_edf_annotations_inplace(path, validate: bool = True):
                                     b'\x00' * (len(ann_record_bytes) - time_keeping_offset))
             f.seek(annotation_record_offset)
             f.write(blanked_record_bytes)
-    
+        f.flush()
+        os.fsync(f.fileno())
+
     # confirm the resulting EDF still loads and has no text annotations
     if validate:
-        with pyedflib.EdfReader(path) as f:
-            _, _, ann_texts = f.readAnnotations()
-            assert len(ann_texts) == 0, "Annotations found after clearing"
+        try:
+            with pyedflib.EdfReader(path) as f:
+                _, _, ann_texts = f.readAnnotations()
+                if len(ann_texts) != 0:
+                    raise RuntimeError(
+                        f"Annotation clearing left {len(ann_texts)} "
+                        f"non-empty annotation text(s) behind; "
+                        f"expected 0.")
+        except Exception as exc:
+            # Validation failed. Restore every snapshot to its
+            # original offset so the source is back to pre-clear state
+            # before we raise.
+            with open(path, "r+b") as f_restore:
+                for offset, orig_bytes in snapshots:
+                    f_restore.seek(offset)
+                    f_restore.write(orig_bytes)
+                f_restore.flush()
+                os.fsync(f_restore.fileno())
+            raise RuntimeError(
+                f"clear_edf_annotations_inplace validation failed for "
+                f"{path} ({type(exc).__name__}: {exc}). Restored "
+                f"pre-clear annotation bytes to preserve source data."
+            ) from exc
 
 
 
