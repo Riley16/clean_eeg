@@ -38,6 +38,7 @@ transfer-subject-eeg = "clean_eeg.transfer_cli:main"
 bulk-transfer-eeg = "clean_eeg.bulk_transfer:main"
 clean-batch-eeg = "clean_eeg.clean_batch:main"
 annotation-review-eeg = "clean_eeg.annotation_review_cli:main"
+verify-quarantine-eeg = "clean_eeg.quarantine_verify:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
