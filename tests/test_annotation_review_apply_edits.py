@@ -756,6 +756,53 @@ def test_sidecar_apply_all_edge_cases_composed(tmp_path):
     assert all(a.text != "REMOVE_ME" for a in ann_after)
 
 
+def test_sidecar_apply_preserves_empty_text_annotations_in_source(tmp_path):
+    """R1671J regression: pipeline sidecars routinely contain
+    empty-text annotations (visible as '+3.968\\x14\\x14' TALs at the
+    start of a record). iter_annotations skips them, but pyedflib
+    preserves them. Prior to the pyedflib-based reader in
+    _apply_edits_sidecar, apply lost them silently and the pre-swap
+    count-mismatch check aborted with 'original had N, replacement
+    has N-1'.
+
+    Simulate by writing a sidecar with an intentional empty-text row,
+    apply an edit to a DIFFERENT annotation, verify apply succeeds
+    and the empty-text row is preserved in pyedflib's readback."""
+    sidecar = tmp_path / "R1671J_annotations.edf"
+    _write_sidecar(sidecar, [
+        (0.0, "Segment: REC START SMITH E"),
+        (3.968, "+4.000000"),
+        (3.968, ""),                          # empty-text row
+        (6.944, "+7.000000"),
+        (10.0, "edit_me"),
+    ])
+    with pyedflib.EdfReader(str(sidecar)) as f:
+        _, _, texts_before = f.readAnnotations()
+    assert len(texts_before) == 5, texts_before
+
+    # Edit a non-empty-text row via a synthesized EditRecord (skip the
+    # controller since it uses iter_annotations which would skip the
+    # empty-text row -- this exercises apply-layer robustness only).
+    edit = EditRecord.new(
+        file_path=str(sidecar),
+        record_index=4, byte_offset_in_record=0,
+        onset_s=10.0, orig_text="edit_me", new_text="X")
+    results = apply_pending_edits([edit])
+    assert results[0].succeeded, results[0].error_message
+
+    with pyedflib.EdfReader(str(sidecar)) as f:
+        onsets, _, texts_after = f.readAnnotations()
+    pairs = sorted((round(float(o), 6), str(t))
+                   for o, t in zip(onsets, texts_after))
+    assert pairs == sorted([
+        (0.0, "Segment: REC START SMITH E"),
+        (3.968, "+4.000000"),
+        (3.968, ""),                          # PRESERVED
+        (6.944, "+7.000000"),
+        (10.0, "X"),
+    ]), pairs
+
+
 def test_sidecar_apply_refuses_leftover_temp(tmp_path):
     """Refuses to apply if a `.review_apply.tmp` leftover from a prior
     crash is still on disk -- matches the data-EDF path's safety."""

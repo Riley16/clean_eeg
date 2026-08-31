@@ -119,36 +119,40 @@ def _apply_edits_to_one_file(edf_path: Path,
                               edits: list[EditRecord]) -> None:
     """Apply ``edits`` to ``edf_path`` atomically. Raises
     ApplyEditsError with a specific reason on failure; the original
-    is guaranteed untouched in that case."""
-    current = iter_annotations(edf_path)
-    modified_texts = _apply_edits_in_memory(current, edits)
+    is guaranteed untouched in that case.
 
-    # Duration convention: our byte-level reader returns 0.0 for TALs
-    # that carry no duration (no \x15 in the TAL). pyedflib's
-    # readAnnotations returns -1.0 for the same case. Convert at the
-    # writer boundary so the on-disk stub carries pyedflib's sentinel
-    # and roundtrip checks pass.
-    onsets = np.array([a.onset_s for a in current], dtype=np.float64)
-    durations = np.array(
-        [(a.duration_s if a.duration_s > 0 else -1.0) for a in current],
-        dtype=np.float64)
-    texts = np.array(modified_texts, dtype=object)
-
+    Sidecars and data EDFs use different reading strategies:
+      * Sidecars are read via ``pyedflib.readAnnotations`` -- captures
+        every annotation the on-disk file has, including empty-text
+        rows that our byte-level ``iter_annotations`` skips. This
+        matters because pipeline sidecars routinely contain
+        empty-text markers (screenshot 3 of R1671J's original), and
+        losing one silently corrupts the file.
+      * Data EDFs continue to use ``iter_annotations`` so
+        ``_apply_edits_in_memory`` can match edits by their exact
+        ``(record_index, byte_offset_in_record)`` fields (which
+        pyedflib doesn't expose).
+    """
     with pyedflib.EdfReader(str(edf_path)) as f:
         n_signals = f.signals_in_file
         stub_header = f.getHeader()
 
     if n_signals == 0:
-        _apply_edits_sidecar(edf_path, stub_header,
-                             (onsets, durations, texts), edits)
+        _apply_edits_sidecar(edf_path, stub_header, edits)
     else:
+        current = iter_annotations(edf_path)
+        modified_texts = _apply_edits_in_memory(current, edits)
+        onsets = np.array([a.onset_s for a in current], dtype=np.float64)
+        durations = np.array(
+            [(a.duration_s if a.duration_s > 0 else -1.0) for a in current],
+            dtype=np.float64)
+        texts = np.array(modified_texts, dtype=object)
         _apply_edits_data_edf(edf_path, stub_header,
                               (onsets, durations, texts), edits)
 
 
 def _apply_edits_sidecar(edf_path: Path,
                           header: dict,
-                          annotations: tuple,
                           edits: list[EditRecord]) -> None:
     """Sidecar path: rewrite the whole file with the modified
     annotation list. No merge dance -- there are no signal bytes to
@@ -156,16 +160,51 @@ def _apply_edits_sidecar(edf_path: Path,
     record layout for the modified list and atomic-swap the result
     over the original.
 
+    Reads via ``pyedflib.readAnnotations`` (not iter_annotations)
+    because pipeline sidecars contain empty-text annotations that
+    the byte-level reader skips; missing even one triggers the
+    pre-swap count-mismatch and aborts otherwise-valid edits.
+
+    Matches edits to on-disk rows by ``(round(onset, 6), orig_text)``.
+    Duplicates at the same (onset, orig_text) are handled by
+    consuming edits FIFO from a per-pair queue. An edit whose
+    (onset, orig_text) doesn't match any on-disk row is rejected --
+    the file may have been mutated between review and apply.
+
     Before the atomic swap, cross-check the temp against the ORIGINAL
     file (both read via pyedflib) so a corrupted or misordered
-    replacement cannot overwrite the source. Verifies:
-      * pyedflib can load the temp (loadability guarantee).
-      * Headers match field-by-field.
-      * Every edited-slot text equals the corresponding
-        ``EditRecord.new_text``.
-      * Every UNEDITED-slot text equals the original file's text at
-        the same onset/duration.
+    replacement cannot overwrite the source.
     """
+    from collections import defaultdict
+
+    with pyedflib.EdfReader(str(edf_path)) as f:
+        onsets, durations, texts = f.readAnnotations()
+
+    # Edits keyed by (rounded onset, orig_text). Value is a FIFO queue
+    # of new_texts -- handles the rare case where multiple edits share
+    # the same (onset, orig_text) pair.
+    edits_queue: dict[tuple[float, str], list[str]] = defaultdict(list)
+    for e in edits:
+        edits_queue[(round(e.onset_s, 6), e.orig_text)].append(e.new_text)
+
+    modified_texts = []
+    for onset, text in zip(onsets, texts):
+        key = (round(float(onset), 6), str(text))
+        queue = edits_queue.get(key)
+        if queue:
+            modified_texts.append(queue.pop(0))
+        else:
+            modified_texts.append(str(text))
+
+    unmatched = {k: v for k, v in edits_queue.items() if v}
+    if unmatched:
+        example = next(iter(unmatched.keys()))
+        raise ApplyEditsError(
+            f"edit references (onset, orig_text) not present in "
+            f"{edf_path.name}: {example!r} (all such: {list(unmatched.keys())[:3]})")
+
+    annotations = (onsets, durations, np.array(modified_texts, dtype=object))
+
     temp_path = Path(str(edf_path) + APPLY_TEMP_SUFFIX)
     if temp_path.exists():
         raise ApplyEditsError(
