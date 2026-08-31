@@ -77,47 +77,133 @@ def test_deidentify_edf_annotations():
 
 
 def test_deidentify_edf_annotations_whitelist_bypasses_redaction():
-    """PHI-leak fix: annotations that fullmatch the boilerplate whitelist
-    must skip Presidio entirely and be preserved as-is. Without this,
-    a subject whose first name is 'Mark' would have '*Mark' (common
-    Jefferson boilerplate) rewritten to '*<REDACTED>' while every OTHER
-    subject in the batch keeps '*Mark' in the cleaned output. That
-    diagnostic divergence lets a sleuth infer the affected subject's
-    first name.
+    """Whitelist bypass fires when the boilerplate annotation does NOT
+    contain the subject's name. Preserves the 'no diagnostic divergence'
+    property for name-collision-free boilerplate (e.g. '*Mark' on a
+    subject named Alice: whitelist match, no name present, preserved).
 
-    Approach: subject_name explicitly = 'Mark Smith', annotation
-    contains '*Mark' (which the shared whitelist matches via
-    asterisk-strip -> 'Mark' -> Mark family). Without whitelist:
-    Presidio redacts 'Mark'. With whitelist: '*Mark' preserved as-is."""
+    UPDATED SEMANTICS (post safety-net): a subject whose name IS Mark
+    used to keep '*Mark' too; that leaked PHI. The safety net now
+    forces such annotations through Presidio. See
+    test_whitelist_bypass_refused_when_subject_name_present."""
+    from clean_eeg.anonymize import PersonalName
+    from clean_eeg.annotation_boilerplate import load_whitelist
+    from clean_eeg.paths import ANNOTATION_BOILERPLATE_WHITELIST_PATH
+    from clean_eeg.clean_subject_eeg import deidentify_edf_annotations
+
+    # Subject unrelated to 'Mark' -> whitelist bypass legitimately fires.
+    alice_name = PersonalName(first_name="Alice", middle_names=[], last_name="Smith")
+    ann_texts = ["*Mark", "patient noted", "*Mark"]
+    annotations = (np.array([0.0, 1.0, 2.0]),
+                    np.array([-1.0, -1.0, -1.0]),
+                    np.array(ann_texts, dtype=object))
+    wl = load_whitelist(ANNOTATION_BOILERPLATE_WHITELIST_PATH)
+
+    new = deidentify_edf_annotations(annotations,
+                                      subject_name=alice_name,
+                                      whitelist=wl,
+                                      site_code="J")
+    out = list(new[2])
+    assert out[0] == "*Mark", (
+        f"whitelisted '*Mark' (no name collision) must be preserved; "
+        f"got {out[0]!r}")
+    assert out[2] == "*Mark"
+
+
+def test_whitelist_bypass_refused_when_subject_name_present():
+    """SAFETY NET: annotations matching the boilerplate whitelist must
+    still go through Presidio if the annotation contains the subject's
+    name. Guards against the whitelist's permissive patterns
+    ('.{1,5}', leading '\\S{1,5}') letting a short first name slip
+    through unredacted. This is the direct fix for the reported bug
+    where a subject named Mark still had 'Mark' in cleaned annotations
+    despite headers being cleaned correctly."""
     from clean_eeg.anonymize import PersonalName
     from clean_eeg.annotation_boilerplate import load_whitelist
     from clean_eeg.paths import ANNOTATION_BOILERPLATE_WHITELIST_PATH
     from clean_eeg.clean_subject_eeg import deidentify_edf_annotations
 
     mark_name = PersonalName(first_name="Mark", middle_names=[], last_name="Smith")
-    ann_texts = ["*Mark", "patient noted by Mark", "*Mark"]
+    # Every annotation below fullmatches SOME whitelist pattern:
+    #   '*Mark'  -> '(?i)Mark(?: \\S{1,5})?' after asterisk-strip
+    #   'Mark'   -> '.{1,5}' shared
+    #   'Mark awake' -> '(?i)(?:\\S{1,5} )?(?:...|awake|...)(?: \\S{1,5})?'
+    ann_texts = ["*Mark", "Mark", "Mark awake"]
     annotations = (np.array([0.0, 1.0, 2.0]),
                     np.array([-1.0, -1.0, -1.0]),
                     np.array(ann_texts, dtype=object))
     wl = load_whitelist(ANNOTATION_BOILERPLATE_WHITELIST_PATH)
 
-    # With whitelist: '*Mark' preserved as-is; 'patient noted by Mark'
-    # still redacted (it doesn't fullmatch any whitelist pattern).
     new = deidentify_edf_annotations(annotations,
                                       subject_name=mark_name,
                                       whitelist=wl,
                                       site_code="J")
     out = list(new[2])
-    assert out[0] == "*Mark", (
-        f"whitelisted '*Mark' must be preserved verbatim, got {out[0]!r}"
-    )
-    assert out[2] == "*Mark", (
-        f"whitelisted '*Mark' must be preserved verbatim, got {out[2]!r}"
-    )
-    # The non-boilerplate annotation still gets Mark redacted.
-    assert "Mark" not in out[1], (
-        f"non-boilerplate annotation must have 'Mark' redacted, got {out[1]!r}"
-    )
+    for i, cleaned in enumerate(out):
+        assert "Mark" not in cleaned, (
+            f"whitelist bypass leaked subject name in annotation {i}: "
+            f"input={ann_texts[i]!r} cleaned={cleaned!r}")
+
+
+def test_whitelist_bypass_refused_logs_review_event():
+    """When the safety net forces a whitelist-matched annotation
+    through Presidio, a whitelist_bypass_refused_name_present
+    ReviewEvent must land in the events list so operators can audit
+    which whitelist patterns are being penetrated by subject names."""
+    from clean_eeg.anonymize import PersonalName
+    from clean_eeg.annotation_boilerplate import load_whitelist
+    from clean_eeg.paths import ANNOTATION_BOILERPLATE_WHITELIST_PATH
+    from clean_eeg.clean_subject_eeg import deidentify_edf_annotations
+
+    mark_name = PersonalName(first_name="Mark", middle_names=[], last_name="Smith")
+    ann_texts = ["*Mark"]
+    annotations = (np.array([0.0]), np.array([-1.0]),
+                    np.array(ann_texts, dtype=object))
+    wl = load_whitelist(ANNOTATION_BOILERPLATE_WHITELIST_PATH)
+    review_events = []
+
+    deidentify_edf_annotations(annotations,
+                                subject_name=mark_name,
+                                whitelist=wl,
+                                site_code="J",
+                                review_events=review_events)
+    kinds = [e.kind for e in review_events]
+    assert "whitelist_bypass_refused_name_present" in kinds, (
+        f"expected safety-net event; got kinds={kinds}")
+
+
+def test_annotation_contains_subject_name_ignores_short_tokens():
+    """Names shorter than 2 chars are ignored -- a 1-letter first name
+    would false-positive on every annotation containing that letter.
+    Real 2+ chars still match on word boundary."""
+    from clean_eeg.anonymize import PersonalName
+    from clean_eeg.clean_subject_eeg import _annotation_contains_subject_name
+
+    short = PersonalName(first_name="A", middle_names=[], last_name="B")
+    assert _annotation_contains_subject_name("awake", short) is False, (
+        "1-char first name must not false-positive on 'awake'")
+
+    real = PersonalName(first_name="Bo", middle_names=[], last_name="Cat")
+    assert _annotation_contains_subject_name("bo asleep", real) is True
+    # Word boundary: 'Cat' should NOT match 'catch' (substring, not word).
+    real2 = PersonalName(first_name="Cat", middle_names=[], last_name="Zzz")
+    assert _annotation_contains_subject_name("watch the catch", real2) is False
+
+
+def test_annotation_contains_subject_name_matches_middle_names():
+    """Middle names count too -- Presidio uses them, and the safety
+    net must be consistent with what redact_string would eventually
+    do downstream."""
+    from clean_eeg.anonymize import PersonalName
+    from clean_eeg.clean_subject_eeg import _annotation_contains_subject_name
+
+    name = PersonalName(first_name="John",
+                         middle_names=["Robert", "Paul"],
+                         last_name="Smith")
+    assert _annotation_contains_subject_name("mentioned Robert briefly", name) is True
+    assert _annotation_contains_subject_name("mentioned Paul briefly", name) is True
+    assert _annotation_contains_subject_name("mentioned Smith briefly", name) is True
+    assert _annotation_contains_subject_name("nothing here", name) is False
 
 
 def test_deidentify_edf_annotations_no_whitelist_still_redacts():

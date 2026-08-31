@@ -167,6 +167,38 @@ def deidentify_edf_header(header: dict,
     return header
 
 
+def _annotation_contains_subject_name(text: str,
+                                        subject_name: PersonalName) -> bool:
+    """Return True if the annotation text contains any of the
+    subject's name tokens as a whole word (case-insensitive). Safety
+    net: whitelist-matched annotations bypass Presidio for the
+    boilerplate-token-collision reason ('*Mark' shouldn't reveal that
+    the subject IS Mark), but the whitelist's permissive patterns
+    (e.g. shared ".{1,5}" fullmatches any 1-5 char annotation, and
+    "(?i)(?:\\S{1,5} )?(?:artifact|awake|...)" swallows a short
+    leading name-token) can let a subject's actual first / middle /
+    last name slip through unredacted. This check forces such
+    annotations back onto the Presidio path where the name gets
+    redacted normally.
+
+    Names shorter than 2 chars are ignored (would false-positive on
+    every annotation containing that letter). Nickname variants stay
+    in Presidio's domain; we only cross-check the canonical tokens.
+    """
+    tokens = [subject_name.first_name, subject_name.last_name,
+              *subject_name.middle_names]
+    for token in tokens:
+        if not token or len(token) < 2:
+            continue
+        # \b matches at word boundaries; case-insensitive substring
+        # scan is fast and matches Presidio's own name-detection
+        # sensitivity for common cases without pulling in the model.
+        if re.search(rf"\b{re.escape(token)}\b", text,
+                      re.IGNORECASE):
+            return True
+    return False
+
+
 def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: PersonalName,
                                 redactor: Union[SubjectNameRedactor, None] = None,
                                 review_events: Union[list, None] = None,
@@ -182,6 +214,14 @@ def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: Per
     left alone -- a diagnostic divergence a sleuth could use to infer
     the subject's name.
 
+    SAFETY NET: even when the whitelist would match, if the annotation
+    text contains any of the subject's canonical name tokens
+    (word-boundary, case-insensitive), the whitelist bypass is
+    REFUSED and the annotation flows through Presidio. Guards against
+    the whitelist's permissive patterns (".{1,5}" fullmatches any
+    short annotation; leading "\\S{1,5}" swallows short first names
+    prefixed to boilerplate words) leaking the name unredacted.
+
     ``whitelist`` should be a ``BoilerplateWhitelist``; None disables
     the skip (all annotations flow through Presidio). ``site_code``
     picks the correct per-site bucket (last letter of the subject_code
@@ -193,15 +233,33 @@ def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: Per
     for (start_time, duration, text) in zip(*annotations):
         assert isinstance(text, str)
         text_str = str(text)
-        if whitelist is not None and (
-                whitelist.matches(text_str, site_code=site_code)
-                or whitelist.matches_delete(text_str, site_code=site_code)):
+        whitelist_hit = whitelist is not None and (
+            whitelist.matches(text_str, site_code=site_code)
+            or whitelist.matches_delete(text_str, site_code=site_code))
+        name_present = _annotation_contains_subject_name(
+            text_str, subject_name) if whitelist_hit else False
+        if whitelist_hit and not name_present:
             # Boilerplate: preserve as-is. Skipping Presidio here means
             # the on-disk annotation matches what OTHER subjects (whose
             # names don't collide with the boilerplate token) have
             # written for the same marker -- no diagnostic divergence.
             redacted_text = text_str
         else:
+            if whitelist_hit and name_present and review_events is not None:
+                # Log the safety-net trigger separately so operators
+                # can audit which whitelist patterns are letting names
+                # slip through. Presidio's own alert fires in
+                # redact_string; this event captures the FORCED
+                # bypass-refusal specifically.
+                review_events.append(ReviewEvent(
+                    kind="whitelist_bypass_refused_name_present",
+                    file=source_file,
+                    details={"annotation_text": text_str,
+                             "reason": ("annotation matched the "
+                                        "boilerplate whitelist but "
+                                        "contains a subject-name "
+                                        "token; forced through "
+                                        "Presidio redaction")}))
             redacted_text = redact_string(text_str,
                                           field_name='annotation',
                                           subject_name=subject_name,
