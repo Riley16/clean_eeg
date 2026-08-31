@@ -511,6 +511,26 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
             # would leak reviewer workflow state. Exclude both.
             "--exclude=.annotation_review/",
             "--exclude=.annotation_reviewed_tracker",
+            # Audit artifacts are OPERATOR-side review, not delivered
+            # data. They also carry a residue-PHI risk: when de-id fails
+            # for even one file, edf_audit.json's patient_ids_by_file,
+            # unexpected_patient_id_tokens_by_file, and recording_ids_by_file
+            # (see audit/checks.py) dump the raw header field verbatim.
+            # The notebook + HTML render the same content. Excluding is
+            # cheaper than trusting every de-id run to be perfect.
+            # Audit still runs post-transfer: the operator has the local
+            # copy, and the remote can re-run audit against the EDFs it
+            # received.
+            "--exclude=edf_audit.json",
+            "--exclude=edf_audit.ipynb",
+            "--exclude=edf_audit.html",
+            "--exclude=edf_audit.in_progress",
+            # Annotation-review temp files: apply_edits.py writes
+            # <edf>.review_apply.tmp as a rollback copy and deletes it on
+            # success. If a crash leaves it behind, it's a de-identified
+            # EDF copy (SAFE) but not delivered content -- exclude so the
+            # remote never sees mid-write scratch files.
+            "--exclude=*.review_apply.tmp",
             *(f"--exclude={n}" for n in sorted(excluded_names)),
             f"{output_path}/",
             f"{rsync_target_prefix}{remote_dir}/",

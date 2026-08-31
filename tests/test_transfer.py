@@ -294,13 +294,19 @@ def test_transfer_plan_rsync_no_exclusions_when_no_failed_files(tmp_path):
         excluded_names=None,
     )
     # Only the built-in exclusions (quarantine + the PHI-carrying
-    # raw-annotations sibling + annotation-review edit journals);
-    # no per-file failed-file names.
+    # raw-annotations sibling + annotation-review edit journals +
+    # audit artifacts + review-apply temp files); no per-file failed
+    # names.
     _BUILTIN_EXCLUDES = {
         "--exclude=quarantine/",
         "--exclude=*_original_annotations/",
         "--exclude=.annotation_review/",
         "--exclude=.annotation_reviewed_tracker",
+        "--exclude=edf_audit.json",
+        "--exclude=edf_audit.ipynb",
+        "--exclude=edf_audit.html",
+        "--exclude=edf_audit.in_progress",
+        "--exclude=*.review_apply.tmp",
     }
     per_file = [a for a in plan.upload_argv
                 if a.startswith("--exclude=") and a not in _BUILTIN_EXCLUDES]
@@ -804,6 +810,150 @@ def test_scp_argv_naturally_omits_annotation_review_journal(tmp_path):
     argv_str = " ".join(plan.upload_argv)
     assert ".annotation_review" not in argv_str, plan.upload_argv
     assert ".annotation_reviewed_tracker" not in argv_str, plan.upload_argv
+
+
+# ---------- audit artifacts: exclusion ----------
+
+
+def test_rsync_argv_excludes_audit_artifacts(tmp_path):
+    """edf_audit.json's patient_ids_by_file, unexpected_patient_id_tokens_by_file,
+    and recording_ids_by_file dump the raw header field verbatim. If de-id
+    failed for even one file, that raw value is a PHI-shaped string. Same
+    content lands in the executed notebook (edf_audit.ipynb) and its HTML
+    render (edf_audit.html). Excluding all three is safer than trusting
+    every de-id run.
+
+    edf_audit.in_progress is a workflow sentinel — not PHI, but stale
+    artifacts leak reviewer state.
+
+    *.review_apply.tmp is a scratch copy during annotation-review apply --
+    de-identified content, but not delivered."""
+    out = _make_subject_dir(tmp_path)
+    plan = build_transfer_plan(
+        out, ssh_host="test.example.com", subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        ssh_user="testuser", use_rsync=True,
+        remote_dir_override="/tmp/e2e",
+    )
+    assert plan.transport == "rsync"
+    exclude_flags = [a for a in plan.upload_argv if a.startswith("--exclude=")]
+    for pat in ("--exclude=edf_audit.json",
+                "--exclude=edf_audit.ipynb",
+                "--exclude=edf_audit.html",
+                "--exclude=edf_audit.in_progress",
+                "--exclude=*.review_apply.tmp"):
+        assert pat in exclude_flags, (pat, exclude_flags)
+
+
+# ---------- integration: dry-run rsync against a fully-poisoned subject dir ----------
+
+
+def test_rsync_dry_run_omits_every_known_phi_artifact(tmp_path):
+    """End-to-end guard: plant EVERY known PHI/scratch artifact in the
+    output dir, then run the pipeline's own rsync argv with --dry-run
+    --itemize-changes against a local destination. Assert the itemized
+    output ships the SAFE files (*.edf, log.out, deidentify.json,
+    transfer.sh) and OMITS every dangerous one.
+
+    This exercises rsync's actual exclude-pattern matching -- more
+    authoritative than checking the argv contents alone."""
+    import shutil, subprocess
+    rsync = shutil.which("rsync")
+    if rsync is None:
+        pytest.skip("rsync not on PATH")
+
+    src = tmp_path / "src_subject" / "clinical_eeg"
+    src.mkdir(parents=True)
+
+    # SAFE artifacts (should ship)
+    (src / f"clean_R1755A_1985.01.01__00.00.00.edf").write_bytes(b"\0" * 512)
+    (src / f"clean_R1755A_1985.01.01__00.00.00_annotations.edf").write_bytes(b"\0" * 512)
+    (src / "log.out").write_text("[PHI_REDACTED] boot\n")
+    (src / "deidentify.json").write_text('{"subject_code": "R1755A"}')
+    (src / "transfer.sh").write_text("#!/usr/bin/env bash\necho hi\n")
+
+    # DANGEROUS artifacts (must NOT ship)
+    dangerous = {
+        "quarantine": None,  # dir
+        ".annotation_review": None,
+        ".annotation_reviewed_tracker": "some/file.edf\n",
+        "edf_audit.json": '{"patient_ids_by_file": {"a.edf": "1234 M 09-APR-1955 SMITH"}}',
+        "edf_audit.ipynb": '{"cells": []}',
+        "edf_audit.html": "<html>PHI</html>",
+        "edf_audit.in_progress": '{"started_at": "..."}',
+        "clean_R1755A_1985.01.01__00.00.00.edf.review_apply.tmp": b"\0" * 512,
+    }
+    (src / "quarantine").mkdir()
+    (src / "quarantine" / "junk.edf").write_bytes(b"\0" * 32)
+    (src / ".annotation_review").mkdir()
+    (src / ".annotation_review" / "session.jsonl").write_text(
+        '{"orig_text": "PATIENT NAME HERE", "new_text": "X"}\n'
+    )
+    (src / ".annotation_reviewed_tracker").write_text(dangerous[".annotation_reviewed_tracker"])
+    (src / "edf_audit.json").write_text(dangerous["edf_audit.json"])
+    (src / "edf_audit.ipynb").write_text(dangerous["edf_audit.ipynb"])
+    (src / "edf_audit.html").write_text(dangerous["edf_audit.html"])
+    (src / "edf_audit.in_progress").write_text(dangerous["edf_audit.in_progress"])
+    (src / "clean_R1755A_1985.01.01__00.00.00.edf.review_apply.tmp").write_bytes(
+        dangerous["clean_R1755A_1985.01.01__00.00.00.edf.review_apply.tmp"])
+
+    # Belt-and-suspenders sibling (must never ship; excluded pattern is
+    # *_original_annotations/):
+    sib = tmp_path / "src_subject" / "clinical_eeg_original_annotations"
+    sib.mkdir()
+    (sib / "raw.json").write_text('{"text": "PHI here"}')
+    # Note: sibling is OUTSIDE src -- rsync won't even see it. Positive
+    # control that the pattern exists is covered by the argv test above.
+
+    plan = build_transfer_plan(
+        src, ssh_host="test.example.com", subject_code="R1755A",
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        ssh_user="testuser", use_rsync=True,
+        remote_dir_override=str(tmp_path / "dst"),
+    )
+    (tmp_path / "dst").mkdir()
+
+    # Take the actual pipeline argv, strip ssh transport pieces, replace
+    # the target with a local path so rsync --dry-run reports what WOULD
+    # transfer to a same-host destination. Remote-side path args (--rsync-path)
+    # and ssh-only options don't affect the exclude logic being tested.
+    argv = list(plan.upload_argv)
+    # Replace the ssh-style destination with a local path so rsync doesn't
+    # try to reach the network. The destination is always the last arg.
+    argv[-1] = str(tmp_path / "dst") + "/"
+    # Add --dry-run + -i (itemize-changes: prints per-file transfer records
+    # like ">f+++++++++ path/to/file"). Drop --progress (adds noise).
+    argv = [a for a in argv if a != "--progress"]
+    argv.insert(1, "--dry-run")
+    argv.insert(2, "-i")
+
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, (result.returncode, result.stderr)
+    itemized = result.stdout
+
+    # Files that MUST ship: itemize output has one line per transfer,
+    # starting with a `>f` (regular file) or `cd` (directory create) marker.
+    for name in ("clean_R1755A_1985.01.01__00.00.00.edf",
+                 "clean_R1755A_1985.01.01__00.00.00_annotations.edf",
+                 "log.out", "deidentify.json", "transfer.sh"):
+        assert name in itemized, (
+            f"SAFE file {name!r} missing from rsync itemize output:\n{itemized}"
+        )
+
+    # Files that MUST NOT ship: for each, assert its NAME does not appear
+    # in the itemized transfer list.
+    for name in ("quarantine",
+                 ".annotation_review",
+                 ".annotation_reviewed_tracker",
+                 "edf_audit.json",
+                 "edf_audit.ipynb",
+                 "edf_audit.html",
+                 "edf_audit.in_progress",
+                 "review_apply.tmp"):
+        assert name not in itemized, (
+            f"DANGEROUS artifact {name!r} appears in rsync transfer plan:\n"
+            f"{itemized}"
+        )
 
 
 # ---------- ssh-agent hint ----------
