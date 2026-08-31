@@ -36,7 +36,20 @@ from clean_eeg.annotation_review.models import EditRecord
 def _print_approval_gate(pending: list[EditRecord]) -> None:
     """Show every pending edit as ``<orig>`` -> ``<new>``. Nothing
     fancy -- plain stdout so the operator sees the full diff even
-    on a terminal that doesn't support ANSI colors."""
+    on a terminal that doesn't support ANSI colors.
+
+    Terminal hygiene: prompt_toolkit's TUI uses the alternate screen
+    buffer. On exit, the terminal restores the pre-TUI content on
+    screen. If a prior CLI-printed line (e.g. the whitelist banner)
+    is LONGER than our approval-gate lines, the tail of the stale
+    content shows through where our shorter line doesn't fully
+    overwrite it. Emit an ANSI clear-screen + cursor-home sequence
+    first so the approval gate always starts on a genuinely blank
+    canvas. On terminals that don't understand the sequence, it
+    prints as a few unprintable bytes -- harmless.
+    """
+    sys.stdout.write("\x1b[H\x1b[2J")
+    sys.stdout.flush()
     print(f"\n=== Pending edits for approval "
           f"({len(pending)} edit(s)) ===\n")
     for i, e in enumerate(pending, start=1):
