@@ -86,6 +86,20 @@ def apply_pending_edits(pending_edits: list[EditRecord]
     if not pending_edits:
         return []
 
+    # Normalize empty-string 'delete' edits to the anonymization
+    # sentinel 'X'. Rationale: empty-text edits used to leave a blank
+    # TAL that pyedflib preserves but iter_annotations skips -- the
+    # two readers disagreed on the file's annotation count, and the
+    # 'delete' didn't feel deterministic downstream. Substituting 'X'
+    # gives a single, visible-anywhere placeholder consistent with the
+    # header PHI sentinel (REDACT_NAME_REPLACEMENT). Applies to both
+    # manual edits and bulk-regex-swap results.
+    from dataclasses import replace as _replace
+    pending_edits = [
+        _replace(e, new_text="X") if e.new_text == "" else e
+        for e in pending_edits
+    ]
+
     grouped: dict[Path, list[EditRecord]] = {}
     for e in pending_edits:
         grouped.setdefault(Path(e.file_path), []).append(e)

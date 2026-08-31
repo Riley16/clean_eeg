@@ -678,9 +678,9 @@ def test_sidecar_apply_all_edge_cases_composed(tmp_path):
       - duplicate-onset rows both survive with correct texts
       - duplicate-text-at-different-onset rows only the edited one
         changes
-      - empty-text edit is preserved as empty text in the pyedflib
-        readback (apply succeeds; downstream iter_annotations will
-        skip the empty-text row -- that's expected behavior)
+      - empty-string 'delete' edit lands as 'X' (apply normalizes
+        empty new_text to the anonymization sentinel for consistency
+        with the header PHI replacement)
     """
     sidecar = tmp_path / "R1670J_annotations.edf"
     _write_sidecar(sidecar, [
@@ -741,19 +741,43 @@ def test_sidecar_apply_all_edge_cases_composed(tmp_path):
         (15.0, "-1.5"),
         (20.0, "X_dup_20"),           # edited duplicate copy
         (25.0, "X_regex"),
-        (30.0, ""),                   # empty-string delete preserved by pyedflib
+        (30.0, "X"),                  # empty-string delete becomes 'X'
         (35.0, "system boot"),
     ])
     assert pairs == expected, (
         f"multiset mismatch.\n  got:    {pairs}\n  wanted: {expected}")
 
-    # Downstream sanity: our byte-level reader skips empty-text rows.
-    # Not a bug in apply -- documents the current behavior explicitly.
+    # Downstream sanity: our byte-level reader sees the 'X' row too.
     from clean_eeg.annotation_reader import iter_annotations as _iter
     ann_after = _iter(sidecar)
-    assert len(ann_after) == 8, [(a.onset_s, a.text) for a in ann_after]
-    assert all(a.text != "" for a in ann_after)
+    assert len(ann_after) == 9, [(a.onset_s, a.text) for a in ann_after]
     assert all(a.text != "REMOVE_ME" for a in ann_after)
+    assert any(a.text == "X" and a.onset_s == 30.0 for a in ann_after)
+
+
+def test_sidecar_apply_empty_new_text_becomes_X(tmp_path):
+    """Bulk-regex-swap with empty replacement (or an operator typing
+    the empty string in edit mode) SHOULD result in the on-disk
+    annotation being 'X', not empty. Ensures the delete-via-regex
+    workflow is deterministic and matches the header PHI sentinel."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [(0.0, "REMOVE_ME"), (5.0, "keep_me")])
+    ann = iter_annotations(sidecar)
+    target = next(a for a in ann if a.text == "REMOVE_ME")
+    edit = EditRecord.new(
+        file_path=str(sidecar), record_index=target.record_index,
+        byte_offset_in_record=target.byte_offset_in_record,
+        onset_s=target.onset_s, orig_text=target.text,
+        new_text="")   # empty -> normalized to 'X'
+    results = apply_pending_edits([edit])
+    assert results[0].succeeded, results[0].error_message
+
+    with pyedflib.EdfReader(str(sidecar)) as f:
+        _, _, texts = f.readAnnotations()
+    texts = [str(t) for t in texts]
+    assert "REMOVE_ME" not in texts
+    assert "X" in texts
+    assert "keep_me" in texts
 
 
 def test_sidecar_apply_preserves_empty_text_annotations_in_source(tmp_path):

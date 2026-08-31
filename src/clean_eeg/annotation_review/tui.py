@@ -178,6 +178,9 @@ def _render_help(_controller: AnnotationReviewController) -> FormattedText:
         ("", "    e                       edit current annotation\n"),
         ("", "    w                       whitelist current annotation text\n"),
         ("", "    r                       reload whitelist from disk\n"),
+        ("", "    s                       regex swap (bulk edit by pattern)\n"),
+        ("", "    M                       mark ALL remaining files reviewed\n"),
+        ("", "                             (requires typing subject code)\n"),
         ("", "    q                       quit\n"),
         ("", "    ?                       toggle this help\n\n"),
         ("", "  EDIT MODE\n"),
@@ -402,6 +405,28 @@ def build_review_app(controller: AnnotationReviewController,
                               "(Enter=continue, Esc=abort)")
         event.app.layout.focus(swap_control)
 
+    @kb.add("M", filter=in_review)
+    def _(event):
+        # Bulk mark-all-reviewed shortcut for operators who've already
+        # validated (via regex swap or external inspection) that the
+        # remaining files don't need per-annotation review. Requires
+        # typing the subject code so an accidental keystroke can't
+        # silently skip the remaining queue. Does NOT apply pending
+        # edits -- the standard end-of-session gate still fires on quit.
+        subject = controller.subject_dir.name
+        n_remaining = len(controller.unreviewed_reviewable_files())
+        if n_remaining == 0:
+            ui.status_message = ("mark-all: nothing to do -- every "
+                                  "reviewable file already marked reviewed")
+            return
+        swap_buf.text = ""
+        ui.mode = "confirm_mark_all"
+        ui.status_message = (
+            f"mark-all-reviewed: type SUBJECT CODE ({subject}) to "
+            f"confirm marking {n_remaining} file(s) reviewed "
+            f"(Enter=confirm, Esc=abort). Does NOT apply pending edits.")
+        event.app.layout.focus(swap_control)
+
     # --- HELP mode: any key returns to review ---
     in_help = Condition(lambda: ui.mode == "help")
 
@@ -460,6 +485,41 @@ def build_review_app(controller: AnnotationReviewController,
         swap_buf.text = ""
         ui.mode = "review"
         ui.status_message = "regex swap aborted"
+        event.app.layout.focus(scroll_window)
+
+    # --- CONFIRM_MARK_ALL mode: bulk mark-all-reviewed with typed
+    #     subject-code confirmation. Enter applies iff the buffer
+    #     matches the subject code EXACTLY (case-sensitive); anything
+    #     else aborts back to review.
+    in_confirm_mark_all = Condition(
+        lambda: ui.mode == "confirm_mark_all")
+
+    @kb.add("enter", filter=in_confirm_mark_all)
+    def _(event):
+        typed = swap_buf.text
+        subject = controller.subject_dir.name
+        swap_buf.text = ""
+        if typed != subject:
+            ui.mode = "review"
+            ui.status_message = (
+                f"mark-all-reviewed ABORTED: typed {typed!r} != subject "
+                f"code {subject!r}")
+            event.app.layout.focus(scroll_window)
+            return
+        newly = controller.mark_all_reviewable_files_reviewed()
+        # Empty the reviewable queue so subsequent 'n'/quit see no work.
+        controller._file_indices = []
+        ui.mode = "review"
+        ui.status_message = (
+            f"mark-all-reviewed: {len(newly)} file(s) marked. Press 'q' "
+            f"to quit (pending edits still gated by the y/N apply prompt).")
+        event.app.layout.focus(scroll_window)
+
+    @kb.add("escape", filter=in_confirm_mark_all)
+    def _(event):
+        swap_buf.text = ""
+        ui.mode = "review"
+        ui.status_message = "mark-all-reviewed aborted"
         event.app.layout.focus(scroll_window)
 
     # --- EDIT mode key bindings ---
