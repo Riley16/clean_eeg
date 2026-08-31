@@ -405,12 +405,189 @@ def test_sidecar_apply_aborts_when_temp_diverges_from_original(tmp_path,
     results = apply_pending_edits([edit])
     assert not results[0].succeeded
     err = (results[0].error_message or "").lower()
-    assert "unedited" in err, err
+    # New detection is multiset-based; the error names the missing
+    # expected pair and the unexpected present pair.
+    assert "silently_mangled" in err and "keep_zero" in err, err
 
     # Original untouched: the mangled string is NOT in the file.
     texts_after = _annotation_texts(sidecar)
     assert "SILENTLY_MANGLED" not in texts_after
     assert "keep_zero" in texts_after
+
+
+# ---------------------------------------------------------------------------
+# Sidecar edge cases the pre-swap verifier must handle correctly.
+# The verifier uses (onset, text) multiset math so duplicate onsets,
+# duplicate texts, whitelist-shaped annotations, and other real-world
+# quirks don't false-positive-abort the apply.
+# ---------------------------------------------------------------------------
+
+
+def test_sidecar_apply_multi_annotation_same_onset(tmp_path):
+    """Real-world case: sidecar has TWO annotations at onset=0.0 (a
+    whitelist-shaped '+0.000000' marker + a segment header). The
+    operator edits only the segment header. Apply must succeed with
+    the numeric marker preserved verbatim. Regression guard for the
+    onset-keyed lookup that used to abort with 'edited annotation at
+    onset=0.0 has text "+0.000000", expected ...'."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [
+        (0.0, "+0.000000"),
+        (0.0, "Segment: REC START SMITH E"),
+        (15.0, "A1+A2 OFF"),
+        (30.0, "RhythmicBurst RB1-RB"),
+    ])
+    ann = iter_annotations(sidecar)
+    target = next(a for a in ann if "SMITH" in a.text)
+    edit = EditRecord.new(
+        file_path=str(sidecar), record_index=target.record_index,
+        byte_offset_in_record=target.byte_offset_in_record,
+        onset_s=target.onset_s, orig_text=target.text,
+        new_text="Segment: REC START X E")
+    results = apply_pending_edits([edit])
+    assert results[0].succeeded, results[0].error_message
+
+    texts_after = _annotation_texts(sidecar)
+    assert "+0.000000" in texts_after           # whitelist-shaped preserved
+    assert "Segment: REC START X E" in texts_after
+    assert "Segment: REC START SMITH E" not in texts_after
+    assert "A1+A2 OFF" in texts_after
+    assert "RhythmicBurst RB1-RB" in texts_after
+
+
+def test_sidecar_apply_duplicate_orig_text_different_onsets(tmp_path):
+    """Two annotations share the SAME text at different onsets.
+    Operator edits only one. The unedited copy at the other onset
+    must survive verbatim (multiset math on (onset, text) tuples is
+    what makes this correct)."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [
+        (0.0, "SMITH_LEAK"),
+        (10.0, "unrelated"),
+        (20.0, "SMITH_LEAK"),   # duplicate text, different onset
+    ])
+    ann = iter_annotations(sidecar)
+    # Edit the LATER copy (onset=20.0). The onset=0.0 copy must survive.
+    target = next(a for a in ann if a.onset_s == 20.0)
+    edit = EditRecord.new(
+        file_path=str(sidecar), record_index=target.record_index,
+        byte_offset_in_record=target.byte_offset_in_record,
+        onset_s=target.onset_s, orig_text=target.text,
+        new_text="clean_20")
+    results = apply_pending_edits([edit])
+    assert results[0].succeeded, results[0].error_message
+
+    with pyedflib.EdfReader(str(sidecar)) as f:
+        onsets, _, texts = f.readAnnotations()
+    by_onset = [(round(float(o), 6), str(t)) for o, t in zip(onsets, texts)]
+    assert (0.0, "SMITH_LEAK") in by_onset      # unedited copy survives
+    assert (20.0, "clean_20") in by_onset       # edit landed
+    assert (10.0, "unrelated") in by_onset
+
+
+def test_sidecar_apply_multiple_edits_in_one_file(tmp_path):
+    """Sidecar with 5 annotations, 3 edited in one apply pass. All
+    edits land, both unedited annotations survive verbatim."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [
+        (0.0, "SMITH_a"), (5.0, "keep_a"), (10.0, "SMITH_b"),
+        (15.0, "keep_b"), (20.0, "SMITH_c"),
+    ])
+    ann = iter_annotations(sidecar)
+    edits = [
+        EditRecord.new(file_path=str(sidecar),
+                        record_index=a.record_index,
+                        byte_offset_in_record=a.byte_offset_in_record,
+                        onset_s=a.onset_s, orig_text=a.text,
+                        new_text=a.text.replace("SMITH_", "X_"))
+        for a in ann if a.text.startswith("SMITH_")
+    ]
+    assert len(edits) == 3
+    results = apply_pending_edits(edits)
+    assert results[0].succeeded, results[0].error_message
+
+    texts_after = set(_annotation_texts(sidecar))
+    assert texts_after == {"X_a", "keep_a", "X_b", "keep_b", "X_c"}
+
+
+def test_sidecar_apply_edits_a_whitelist_shaped_annotation(tmp_path):
+    """The user's earlier concern was that whitelist behavior interferes
+    with apply. It doesn't -- the boilerplate whitelist only hides
+    annotations from the review VIEW, but the apply path reads every
+    annotation (including whitelisted ones) and treats them all as
+    ordinary. Confirm by directly editing a '+0.000000' annotation
+    (whitelist-shaped)."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [
+        (0.0, "+0.000000"),
+        (5.0, "SMITH_target"),
+    ])
+    ann = iter_annotations(sidecar)
+    target = next(a for a in ann if a.text == "+0.000000")
+    edit = EditRecord.new(
+        file_path=str(sidecar), record_index=target.record_index,
+        byte_offset_in_record=target.byte_offset_in_record,
+        onset_s=target.onset_s, orig_text=target.text,
+        new_text="cleaned_boilerplate")
+    results = apply_pending_edits([edit])
+    assert results[0].succeeded, results[0].error_message
+
+    texts_after = _annotation_texts(sidecar)
+    assert "cleaned_boilerplate" in texts_after
+    assert "+0.000000" not in texts_after
+    assert "SMITH_target" in texts_after         # untouched
+
+
+def test_sidecar_apply_aborts_when_edit_references_missing_pair(tmp_path):
+    """If an EditRecord names an (onset, orig_text) that isn't in the
+    current file (e.g. the file was mutated between review and apply),
+    the pre-swap check must refuse to swap. Better to fail loudly than
+    ship a temp whose annotation multiset doesn't correspond to what
+    the operator authorized."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [(0.0, "hello"), (10.0, "world")])
+    ann = iter_annotations(sidecar)[0]
+
+    bogus = EditRecord.new(
+        file_path=str(sidecar), record_index=ann.record_index,
+        byte_offset_in_record=ann.byte_offset_in_record,
+        onset_s=ann.onset_s,
+        orig_text="STALE_TEXT_NOT_ON_DISK",   # doesn't match anything
+        new_text="new")
+    results = apply_pending_edits([bogus])
+    # _apply_edits_in_memory catches this before write (unique candidate
+    # check fails), so error mentions matching not multiset. Either way:
+    # apply must fail, original must survive.
+    assert not results[0].succeeded
+    texts_after = _annotation_texts(sidecar)
+    assert texts_after == ["hello", "world"]
+
+
+def test_sidecar_apply_preserves_numeric_shaped_texts(tmp_path):
+    """Explicit coverage: annotation texts like '+0.5', '-1.234', or
+    '0.000000' must round-trip verbatim through the write path even
+    though they superficially resemble EDF+ onset/duration byte
+    sequences."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [
+        (0.0, "+0.000000"),
+        (5.0, "-1.234"),
+        (10.0, "0.5"),
+        (15.0, "edit_me"),
+    ])
+    ann = iter_annotations(sidecar)
+    target = next(a for a in ann if a.text == "edit_me")
+    edit = EditRecord.new(
+        file_path=str(sidecar), record_index=target.record_index,
+        byte_offset_in_record=target.byte_offset_in_record,
+        onset_s=target.onset_s, orig_text=target.text,
+        new_text="edited")
+    results = apply_pending_edits([edit])
+    assert results[0].succeeded, results[0].error_message
+
+    texts_after = _annotation_texts(sidecar)
+    for expected in ("+0.000000", "-1.234", "0.5", "edited"):
+        assert expected in texts_after, (expected, texts_after)
 
 
 def test_sidecar_apply_refuses_leftover_temp(tmp_path):

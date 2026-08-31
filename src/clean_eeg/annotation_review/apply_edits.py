@@ -191,12 +191,24 @@ def _verify_sidecar_against_original(*, original_path: Path,
                                        temp_path: Path,
                                        edits: list[EditRecord]) -> None:
     """Read both files via pyedflib and verify the temp is a safe
-    replacement: headers identical, edited slots carry the requested
-    new text, and every UNEDITED slot matches the original verbatim.
+    replacement.
 
-    Raises ApplyEditsError with a specific reason on the first
-    mismatch (halts the swap, leaves the original untouched).
+    Uses multiset (Counter) math on ``(onset, text)`` tuples so
+    duplicate onsets are handled correctly -- files routinely have
+    multiple annotations at onset=0.0 (a whitelist-shaped numeric
+    marker + a segment header, say), and an onset-keyed lookup would
+    incorrectly demand every one of them equal the edit's ``new_text``.
+
+    Expected temp multiset = original multiset - edits' orig entries
+    + edits' new entries. If they don't match, an unedited annotation
+    changed OR an edit didn't land where expected -- either way, abort
+    before overwriting the source.
+
+    Also verifies headers field-by-field and that the total annotation
+    count is preserved.
     """
+    from collections import Counter
+
     with pyedflib.EdfReader(str(original_path)) as f:
         orig_header = f.getHeader()
         o_on, o_dur, o_txt = f.readAnnotations()
@@ -215,33 +227,44 @@ def _verify_sidecar_against_original(*, original_path: Path,
             f"annotation count changed: original had {len(o_txt)}, "
             f"replacement has {len(n_txt)}")
 
-    # pyedflib returns annotations in written order for both files.
-    # The temp was written with the same onset ordering the original
-    # had (because we read the original via iter_annotations, applied
-    # in-memory edits, and wrote the list back in the same order).
-    # Anchor edits by onset for O(1) lookup; use rounded key to survive
-    # float roundtrip noise.
-    edited_by_onset = {round(e.onset_s, 6): e.new_text for e in edits}
+    # Rounded-onset multiset comparison. round(6) survives float noise
+    # from the pyedflib roundtrip.
+    r = lambda x: round(float(x), 6)
 
-    for i, (o_ons, o_du, o_tx, n_ons, n_du, n_tx) in enumerate(
-            zip(o_on, o_dur, o_txt, n_on, n_dur, n_txt)):
-        if not np.isclose(o_ons, n_ons):
-            raise ApplyEditsError(
-                f"annotation {i} onset moved: {o_ons} -> {n_ons}")
-        if not np.isclose(o_du, n_du):
-            raise ApplyEditsError(
-                f"annotation {i} duration moved: {o_du} -> {n_du}")
-        expected = edited_by_onset.get(round(float(o_ons), 6))
-        if expected is not None:
-            if str(n_tx) != expected:
-                raise ApplyEditsError(
-                    f"edited annotation at onset={o_ons} has text "
-                    f"{str(n_tx)!r}, expected {expected!r}")
-        else:
-            if str(n_tx) != str(o_tx):
-                raise ApplyEditsError(
-                    f"UNEDITED annotation at onset={o_ons} changed "
-                    f"during rewrite: {str(o_tx)!r} -> {str(n_tx)!r}")
+    # Onset + duration multisets must survive verbatim (edits only
+    # change text).
+    if Counter(r(o) for o in o_on) != Counter(r(o) for o in n_on):
+        raise ApplyEditsError(
+            "onset multiset drifted between original and rewrite")
+    if Counter(r(d) for d in o_dur) != Counter(r(d) for d in n_dur):
+        raise ApplyEditsError(
+            "duration multiset drifted between original and rewrite")
+
+    # (onset, text) multiset math.
+    orig_pairs = Counter((r(o), str(t)) for o, t in zip(o_on, o_txt))
+    temp_pairs = Counter((r(o), str(t)) for o, t in zip(n_on, n_txt))
+    edits_orig = Counter((r(e.onset_s), e.orig_text) for e in edits)
+    edits_new = Counter((r(e.onset_s), e.new_text) for e in edits)
+
+    # Sanity: every edit must claim to REPLACE a pair actually present
+    # in the original. If not, the operator's edit references a
+    # (onset, orig_text) that doesn't exist -- refuse rather than
+    # silently ship a rewrite that doesn't correspond to the edit.
+    missing_from_orig = edits_orig - orig_pairs
+    if missing_from_orig:
+        example = next(iter(missing_from_orig))
+        raise ApplyEditsError(
+            f"edit references (onset, orig_text) not present in the "
+            f"original file: {example!r}")
+
+    expected_temp = orig_pairs - edits_orig + edits_new
+    if temp_pairs != expected_temp:
+        missing = expected_temp - temp_pairs
+        extra = temp_pairs - expected_temp
+        raise ApplyEditsError(
+            f"(onset, text) multiset drift after apply. Expected but "
+            f"missing: {list(missing.keys())[:3]}. Present but not "
+            f"expected: {list(extra.keys())[:3]}.")
 
 
 def _apply_edits_data_edf(edf_path: Path,
