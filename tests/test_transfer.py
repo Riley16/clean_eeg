@@ -294,10 +294,13 @@ def test_transfer_plan_rsync_no_exclusions_when_no_failed_files(tmp_path):
         excluded_names=None,
     )
     # Only the built-in exclusions (quarantine + the PHI-carrying
-    # raw-annotations sibling); no per-file failed-file names.
+    # raw-annotations sibling + annotation-review edit journals);
+    # no per-file failed-file names.
     _BUILTIN_EXCLUDES = {
         "--exclude=quarantine/",
         "--exclude=*_original_annotations/",
+        "--exclude=.annotation_review/",
+        "--exclude=.annotation_reviewed_tracker",
     }
     per_file = [a for a in plan.upload_argv
                 if a.startswith("--exclude=") and a not in _BUILTIN_EXCLUDES]
@@ -750,6 +753,57 @@ def test_preflight_passes_when_raw_annotations_dump_is_sibling(tmp_path):
         f"preflight must pass when raw-annotations dump is a proper "
         f"sibling; got failures={result.failures}"
     )
+
+
+# ---------- annotation-review edit journals: exclusion ----------
+
+
+def test_rsync_argv_excludes_annotation_review_journal(tmp_path):
+    """.annotation_review/session.jsonl contains EditRecord.orig_text --
+    the raw pre-redaction annotation text, which is PHI. Even though the
+    subject dir contains the reviewed EDFs, this internal edit journal
+    must NOT ship. Same for .annotation_reviewed_tracker (workflow state,
+    not clinically useful downstream)."""
+    out = _make_subject_dir(tmp_path)
+    # Simulate operator having run annotation-review-eeg before transfer.
+    (out / ".annotation_review").mkdir()
+    (out / ".annotation_review" / "session.jsonl").write_text(
+        '{"orig_text": "PATIENT NAME HERE", "new_text": "X"}\n'
+    )
+    (out / ".annotation_reviewed_tracker").write_text("some/file.edf\n")
+
+    plan = build_transfer_plan(
+        out, ssh_host="test.example.com", subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        ssh_user="testuser", use_rsync=True,
+        remote_dir_override="/tmp/e2e",
+    )
+    assert plan.transport == "rsync"
+    exclude_flags = [a for a in plan.upload_argv if a.startswith("--exclude=")]
+    assert "--exclude=.annotation_review/" in exclude_flags, exclude_flags
+    assert "--exclude=.annotation_reviewed_tracker" in exclude_flags, exclude_flags
+
+
+def test_scp_argv_naturally_omits_annotation_review_journal(tmp_path):
+    """scp fallback globs *.edf at the top level -- .annotation_review/
+    (a dir, not .edf) and .annotation_reviewed_tracker (no .edf suffix)
+    are naturally omitted. Regression guard: if someone ever broadens
+    the scp source list, this test flags it."""
+    out = _make_subject_dir(tmp_path)
+    (out / ".annotation_review").mkdir()
+    (out / ".annotation_review" / "session.jsonl").write_text('{"orig_text": "PHI"}\n')
+    (out / ".annotation_reviewed_tracker").write_text("some/file.edf\n")
+
+    plan = build_transfer_plan(
+        out, ssh_host="test.example.com", subject_code=SUBJECT_CODE,
+        site_incoming_folder=SITE_INCOMING_FOLDER,
+        ssh_user="testuser", use_rsync=False,
+        remote_dir_override="/tmp/e2e",
+    )
+    assert plan.transport == "scp"
+    argv_str = " ".join(plan.upload_argv)
+    assert ".annotation_review" not in argv_str, plan.upload_argv
+    assert ".annotation_reviewed_tracker" not in argv_str, plan.upload_argv
 
 
 # ---------- ssh-agent hint ----------

@@ -503,6 +503,14 @@ def _build_transfer_plan(output_path: Path, *, subject_code: str,
             # preflight_deidentified_output catches the same failure mode
             # at a different layer.
             "--exclude=*_original_annotations/",
+            # annotation-review edit journals live under output_path and
+            # contain raw pre-redaction text in EditRecord.orig_text --
+            # that's PHI. The .annotation_reviewed_tracker records which
+            # files an operator has finished reviewing; not PHI itself,
+            # but downstream consumers don't need it and shipping it
+            # would leak reviewer workflow state. Exclude both.
+            "--exclude=.annotation_review/",
+            "--exclude=.annotation_reviewed_tracker",
             *(f"--exclude={n}" for n in sorted(excluded_names)),
             f"{output_path}/",
             f"{rsync_target_prefix}{remote_dir}/",
