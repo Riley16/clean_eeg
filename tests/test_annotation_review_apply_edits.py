@@ -827,6 +827,45 @@ def test_sidecar_apply_preserves_empty_text_annotations_in_source(tmp_path):
     ]), pairs
 
 
+def test_data_edf_apply_skips_signal_load_for_speed(tmp_path, monkeypatch):
+    """R1670J-scale iEEGs have 100+ channels of int16 data; loading
+    them all to verify byte-identity around an annotation-only edit
+    turns apply into a minutes-per-file operation. The apply pass
+    passes verify_signals=False into merge_annotation_stub_edf and
+    signal bytes are safe by construction. Verify no readSignal call
+    fires during apply.
+    """
+    edf = tmp_path / "R1TEST.edf"
+    _write_edf(edf, [(0.5, "orig")], duration_s=10)
+
+    original_read_signal = pyedflib.EdfReader.readSignal
+    calls = {"n": 0}
+
+    def counting_read_signal(self, *a, **kw):
+        calls["n"] += 1
+        return original_read_signal(self, *a, **kw)
+
+    monkeypatch.setattr(pyedflib.EdfReader, "readSignal", counting_read_signal)
+
+    ann = iter_annotations(edf)[0]
+    edit = EditRecord.new(
+        file_path=str(edf), record_index=ann.record_index,
+        byte_offset_in_record=ann.byte_offset_in_record,
+        onset_s=ann.onset_s, orig_text=ann.text, new_text="edited")
+    results = apply_pending_edits([edit])
+    assert results[0].succeeded, results[0].error_message
+
+    assert calls["n"] == 0, (
+        f"apply loaded {calls['n']} signal(s) -- fast path regressed. "
+        f"On real subjects this would hang for minutes per file.")
+
+    # Signals still preserved by construction; verify with a direct hash
+    # comparison against the pre-apply file (already covered by
+    # test_signal_bytes_are_byte_identical_after_apply which uses a
+    # standalone hash check that DOES load signals -- outside the apply
+    # timing loop).
+
+
 def test_sidecar_apply_refuses_leftover_temp(tmp_path):
     """Refuses to apply if a `.review_apply.tmp` leftover from a prior
     crash is still on disk -- matches the data-EDF path's safety."""

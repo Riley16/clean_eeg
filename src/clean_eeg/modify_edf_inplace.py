@@ -398,7 +398,8 @@ def _encode_tal(onset: float, duration: float, text: str) -> bytes:
 
 def merge_annotation_stub_edf(data_edf_path: str,
                                stub_edf_path: str,
-                               validate: bool = True) -> None:
+                               validate: bool = True,
+                               verify_signals: bool | None = None) -> None:
     """Merge annotations from a stub EDF back into a data EDF.
 
     The data EDF is expected to have its annotation texts cleared
@@ -412,7 +413,19 @@ def merge_annotation_stub_edf(data_edf_path: str,
         data_edf_path: Path to the data EDF (with cleared annotations).
         stub_edf_path: Path to the annotations-only stub EDF.
         validate: If True, verify merged annotations match the stub.
+        verify_signals: If True, snapshot every signal channel before
+            the merge and compare byte-for-byte after. Rock-solid but
+            expensive: for multi-GB iEEG files each signal load can
+            take minutes. Defaults to ``validate`` (backwards
+            compatible). Callers doing targeted annotation edits
+            (annotation-review's apply pass) can pass ``False`` --
+            the byte-level surgery only writes into the annotation
+            channel slots so signal bytes are safe by construction,
+            and skipping the load takes apply from minutes-per-file
+            to sub-second.
     """
+    if verify_signals is None:
+        verify_signals = validate
     # Read annotations from stub
     with pyedflib.EdfReader(stub_edf_path) as f:
         ann_onsets, ann_durations, ann_texts = f.readAnnotations()
@@ -444,11 +457,23 @@ def merge_annotation_stub_edf(data_edf_path: str,
 
     # Snapshot original signals and headers before any modification so
     # the post-merge integrity check can verify nothing was corrupted.
-    with pyedflib.EdfReader(data_edf_path) as f:
-        orig_header = f.getHeader()
-        orig_signal_headers = [f.getSignalHeader(i)
-                               for i in range(f.signals_in_file)]
-        orig_signals = [f.readSignal(i) for i in range(f.signals_in_file)]
+    # Skipped when verify_signals=False -- reading multi-GB signals is
+    # the slow step and the byte-surgery below only writes into
+    # annotation-channel slot ranges.
+    if verify_signals:
+        with pyedflib.EdfReader(data_edf_path) as f:
+            orig_header = f.getHeader()
+            orig_signal_headers = [f.getSignalHeader(i)
+                                   for i in range(f.signals_in_file)]
+            orig_signals = [f.readSignal(i) for i in range(f.signals_in_file)]
+    else:
+        # Still need header + signal-header for the annotation-multiset
+        # check below; the SIGNALS array is what's expensive to load.
+        with pyedflib.EdfReader(data_edf_path) as f:
+            orig_header = f.getHeader()
+            orig_signal_headers = [f.getSignalHeader(i)
+                                   for i in range(f.signals_in_file)]
+        orig_signals = None
 
     # Work on a temp copy so the original is never partially written
     temp_path = data_edf_path + ".merge_tmp"
@@ -523,21 +548,30 @@ def _verify_merge_integrity(merged_path: str,
 
     Raises ValueError if any mismatch is detected, preventing the atomic
     replacement from proceeding.
+
+    ``orig_signals=None`` -> skip the per-signal byte-identity check
+    (fast path for targeted annotation edits where the byte-surgery
+    only writes annotation-slot ranges). Signal-count is still verified
+    via the signal-headers list, and annotations + main header + signal
+    headers are still compared -- so a bug in the record-layout math
+    that clobbered a signal header would still fire.
     """
     with pyedflib.EdfReader(merged_path) as f:
         merged_header = f.getHeader()
         n_signals = f.signals_in_file
         merged_signal_headers = [f.getSignalHeader(i) for i in range(n_signals)]
-        merged_signals = [f.readSignal(i) for i in range(n_signals)]
+        if orig_signals is not None:
+            merged_signals = [f.readSignal(i) for i in range(n_signals)]
         m_onsets, m_durations, m_texts = f.readAnnotations()
 
-    # --- Signals: must be bit-identical ---
-    if len(merged_signals) != len(orig_signals):
-        raise ValueError(
-            f"Signal count changed: {len(orig_signals)} -> {len(merged_signals)}")
-    for i, (orig, merged) in enumerate(zip(orig_signals, merged_signals)):
-        if not np.array_equal(orig, merged):
-            raise ValueError(f"Signal {i} data corrupted by merge")
+    # --- Signals: must be bit-identical (only when snapshotted) ---
+    if orig_signals is not None:
+        if len(merged_signals) != len(orig_signals):
+            raise ValueError(
+                f"Signal count changed: {len(orig_signals)} -> {len(merged_signals)}")
+        for i, (orig, merged) in enumerate(zip(orig_signals, merged_signals)):
+            if not np.array_equal(orig, merged):
+                raise ValueError(f"Signal {i} data corrupted by merge")
 
     # --- Main header: every field must be unchanged ---
     for key in orig_header:

@@ -340,8 +340,16 @@ def _apply_edits_data_edf(edf_path: Path,
             str(stub_path), header, annotations, validate=True)
         shutil.copy2(str(edf_path), str(temp_data_path))
         clear_edf_annotations_inplace(str(temp_data_path), validate=True)
+        # verify_signals=False: targeted annotation edits don't touch
+        # signal-channel byte ranges by construction (byte-surgery
+        # writes only into annotation slots). Full signal load + compare
+        # on a multi-GB iEEG file can hang for minutes and the guarantee
+        # matters much less at review time than at initial-cleaning
+        # time. Annotation preservation is still verified by the merge's
+        # own annotation-multiset check + _verify_edits_present below.
         merge_annotation_stub_edf(
-            str(temp_data_path), str(stub_path), validate=True)
+            str(temp_data_path), str(stub_path), validate=True,
+            verify_signals=False)
         _verify_edits_present(temp_data_path, edits)
         os.replace(str(temp_data_path), str(edf_path))
     except Exception as e:
