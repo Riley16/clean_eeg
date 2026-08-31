@@ -315,6 +315,18 @@ class AnnotationReviewController:
         self._whitelist = self._load_whitelist()
 
     def is_whitelisted(self, ann: Annotation) -> bool:
+        # The anonymization sentinel 'X' is written into the file by
+        # both the header PHI replacement and the pipeline's delete
+        # branch. It's ALSO a fullmatch for the shared ".{1,5}"
+        # whitelist pattern, which would hide every deletion from the
+        # review view -- exactly the case the operator is trying to
+        # audit. Special-case: sentinel-X annotations are NEVER
+        # whitelisted, so the operator always sees what the pipeline
+        # replaced. Same principle for auto-queued 'X' edits: even
+        # after apply the resulting rows stay visible for a follow-up
+        # audit pass.
+        if ann.text == "X":
+            return False
         return self._whitelist.matches(ann.text, site_code=self.site_code)
 
     # ---- introspection ----

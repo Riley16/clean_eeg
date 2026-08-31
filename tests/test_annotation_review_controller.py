@@ -982,6 +982,32 @@ def test_auto_queue_delete_matches_skips_already_X_annotations(tmp_path):
     c.close()
 
 
+def test_sentinel_X_annotation_never_hidden_by_whitelist(tmp_path):
+    """The shared '.{1,5}' whitelist pattern fullmatches 'X' (1 char),
+    which would silently hide every annotation the pipeline's delete
+    branch replaced. Regression: is_whitelisted must special-case
+    text=='X' to keep those rows visible so the operator can audit
+    what got deleted."""
+    import json as _json
+    subj = _make_subject(tmp_path, "R1755J", {
+        "cleaned.edf": ["X", "X", "Segment: REC START SMITH E"],
+    })
+    wl_path = tmp_path / "wl.json"
+    wl_path.write_text(_json.dumps({
+        "shared": [".{1,5}"],   # would fullmatch 'X' pre-fix
+        "per_site": {}, "delete_shared": [], "delete_per_site": {},
+    }))
+    c = AnnotationReviewController(subj, whitelist_path=wl_path,
+                                     preload_all=False)
+    anns = c.annotations_in_current_file()
+    for a in anns:
+        if a.text == "X":
+            assert not c.is_whitelisted(a), (
+                "sentinel 'X' must NEVER be treated as whitelisted -- "
+                "the operator needs to see what the delete branch replaced")
+    c.close()
+
+
 def test_num_files_auto_skipped_whitelist_defaults_to_zero(tmp_path):
     """Without preload_all the auto-drop path never runs; the counter
     must stay at 0 so the CLI doesn't misreport."""
