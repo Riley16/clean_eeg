@@ -19,6 +19,7 @@ from clean_eeg.deidentify_manifest import (
     build_manifest,
     manifest_exists,
     read_manifest,
+    refresh_annotation_sidecar_hashes,
     write_manifest,
 )
 from clean_eeg.paths import TEST_CONFIG_FILE, TEST_SUBJECT_DATA_DIR
@@ -117,6 +118,76 @@ def test_manifest_handles_zero_files(tmp_path):
     assert manifest["n_files_deidentified"] == 0
     write_manifest(tmp_path, manifest)
     assert read_manifest(tmp_path) == manifest
+
+
+def test_refresh_annotation_sidecar_hashes_updates_only_annotation_files(tmp_path):
+    """Post-annotation-review manifest refresh: sidecar hashes get
+    recomputed but signal-EDF hashes stay at their pipeline-write
+    values. Guards against the fix accidentally overwriting the
+    signal-integrity guarantee that the transfer preflight relies
+    on."""
+    signal_edf = tmp_path / "clean_R1755A_01.edf"
+    sidecar = tmp_path / "clean_R1755A_01_annotations.edf"
+    signal_edf.write_bytes(b"\x00" * 512)   # placeholder signal EDF
+    sidecar.write_bytes(b"orig-sidecar-bytes")
+
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "subject_code": "R1755A",
+        "file_hashes": {
+            signal_edf.name: "SIGNAL_HASH_FROM_PIPELINE",
+            sidecar.name: "OLD_SIDECAR_HASH",
+        },
+        "hash_mode_by_file": {
+            signal_edf.name: "fast", sidecar.name: "fast"},
+        "hash_details_by_file": {
+            signal_edf.name: {}, sidecar.name: {}},
+    }
+    (tmp_path / MANIFEST_FILENAME).write_text(json.dumps(manifest))
+
+    # Annotation-review mutates the sidecar; simulate.
+    sidecar.write_bytes(b"NEW-sidecar-bytes-after-apply")
+
+    changed = refresh_annotation_sidecar_hashes(
+        tmp_path, [signal_edf, sidecar])
+
+    # The sidecar's hash should have changed; the signal EDF isn't a
+    # sidecar so it's skipped even though it's in modified_paths.
+    assert sidecar.name in changed
+    assert signal_edf.name not in changed
+
+    refreshed = json.loads((tmp_path / MANIFEST_FILENAME).read_text())
+    assert refreshed["file_hashes"][sidecar.name] != "OLD_SIDECAR_HASH"
+    assert refreshed["file_hashes"][signal_edf.name] == \
+        "SIGNAL_HASH_FROM_PIPELINE"
+
+
+def test_refresh_annotation_sidecar_hashes_noop_when_unchanged(tmp_path):
+    """If the sidecar bytes haven't changed since the manifest was
+    written (e.g. annotation-review ran but every edit was a no-op),
+    the refresh reports no changed files and doesn't rewrite the
+    manifest."""
+    sidecar = tmp_path / "clean_R1755A_01_annotations.edf"
+    sidecar.write_bytes(b"stable")
+
+    # Compute the real hash so the manifest is already consistent.
+    from clean_eeg.audit.hashes import sha256_fast_of_file
+    digest, mode, det = sha256_fast_of_file(sidecar)
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "subject_code": "R1755A",
+        "file_hashes": {sidecar.name: digest},
+        "hash_mode_by_file": {sidecar.name: mode},
+        "hash_details_by_file": {sidecar.name: det},
+    }
+    manifest_path = tmp_path / MANIFEST_FILENAME
+    manifest_path.write_text(json.dumps(manifest))
+    mtime_before = manifest_path.stat().st_mtime_ns
+
+    changed = refresh_annotation_sidecar_hashes(tmp_path, [sidecar])
+    assert changed == {}
+    # Manifest not rewritten -> mtime unchanged.
+    assert manifest_path.stat().st_mtime_ns == mtime_before
 
 
 def test_manifest_records_provenance_fields(tmp_path):

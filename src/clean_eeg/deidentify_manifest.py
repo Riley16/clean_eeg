@@ -174,3 +174,50 @@ def read_manifest(output_path: str | Path) -> dict | None:
 def manifest_exists(output_path: str | Path) -> bool:
     """Cheap presence check — does not open or parse the file."""
     return (Path(output_path) / MANIFEST_FILENAME).exists()
+
+
+def refresh_annotation_sidecar_hashes(output_path: str | Path,
+                                       modified_paths: Iterable[Path]
+                                       ) -> dict[str, str]:
+    """Update ``file_hashes`` / ``hash_mode_by_file`` / ``hash_details_by_file``
+    entries for every path in ``modified_paths`` that is an annotation
+    sidecar (name ends with ``_annotations.edf``). Signal EDFs and other
+    files are left untouched -- so the transfer preflight's
+    signal-integrity check still guards against unauthorised mutation
+    of the recording data.
+
+    Returns a dict of ``{filename: new_hash}`` for the sidecars whose
+    hashes actually changed on disk. Empty return means the manifest
+    was already consistent (or no sidecars were modified).
+
+    Raises :class:`FileNotFoundError` if the manifest is missing --
+    callers that want silent no-op should check :func:`manifest_exists`
+    first.
+    """
+    from clean_eeg.audit.hashes import sha256_fast_of_file  # lazy import
+
+    manifest = read_manifest(output_path)
+    if manifest is None:
+        raise FileNotFoundError(
+            f"no manifest at {Path(output_path) / MANIFEST_FILENAME}")
+
+    sidecars = [Path(p) for p in modified_paths
+                if Path(p).name.endswith("_annotations.edf")
+                and Path(p).exists()]
+
+    changed: dict[str, str] = {}
+    for path in sidecars:
+        new_digest, mode_used, det = sha256_fast_of_file(path)
+        name = path.name
+        prev = manifest.get("file_hashes", {}).get(name)
+        if prev != new_digest:
+            changed[name] = new_digest
+        manifest.setdefault("file_hashes", {})[name] = new_digest
+        manifest.setdefault("hash_mode_by_file", {})[name] = mode_used
+        manifest.setdefault("hash_details_by_file", {})[name] = det
+
+    if changed:
+        out = Path(output_path) / MANIFEST_FILENAME
+        out.write_text(json.dumps(manifest, indent=2, ensure_ascii=False,
+                                    default=str))
+    return changed

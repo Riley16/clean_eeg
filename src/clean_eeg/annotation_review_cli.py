@@ -291,6 +291,33 @@ def main(argv: list[str] | None = None) -> int:
         rotated = controller.rotate_applied()
         if rotated:
             print(f"[ok] session journal archived at {rotated}")
+        # Refresh manifest hashes for the annotation sidecars we
+        # modified so the transfer preflight's file-integrity check
+        # stops flagging them. Signal-EDF hashes are left untouched --
+        # apply never mutates signal bytes, so a mismatch there still
+        # means legitimate corruption. Silent no-op if there's no
+        # manifest (e.g. running annotation-review on a directory that
+        # wasn't produced by the clean_subject_eeg pipeline).
+        from clean_eeg.deidentify_manifest import (
+            manifest_exists, refresh_annotation_sidecar_hashes)
+        manifest_dir = args.subject_dir / args.subfolder
+        if manifest_exists(manifest_dir):
+            modified = [r.file_path for r in results if r.succeeded]
+            try:
+                changed = refresh_annotation_sidecar_hashes(
+                    manifest_dir, modified)
+                if changed:
+                    print(f"[ok] refreshed {len(changed)} sidecar hash(es) "
+                          f"in {manifest_dir}/deidentify.json so transfer "
+                          f"preflight sees a consistent manifest.")
+            except Exception as e:
+                # Non-fatal: the edits already landed on disk. Warn the
+                # operator so they can re-run the manifest step manually
+                # rather than silently ship a stale hash to the transfer
+                # step.
+                print(f"[warn] manifest refresh failed ({type(e).__name__}: "
+                      f"{e}). Edits applied; re-generate deidentify.json "
+                      f"before transferring.")
     return exit_code
 
 
