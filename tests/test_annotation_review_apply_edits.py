@@ -309,6 +309,110 @@ def test_sidecar_still_annotation_only_after_apply(tmp_path):
         assert f.signals_in_file == 0
 
 
+def test_sidecar_apply_verifies_unedited_annotations_against_original(tmp_path):
+    """Pre-swap check: every UNEDITED annotation in the replacement
+    must equal the corresponding annotation in the ORIGINAL file
+    (read via pyedflib). Guards against a chain-of-trust break where
+    iter_annotations misreads and the pipeline silently overwrites
+    the source with the misread text."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    ann_list = [(0.0, "orig_zero"), (5.0, "REMOVE_ME"), (10.0, "orig_ten"),
+                (15.0, "orig_fifteen")]
+    _write_sidecar(sidecar, ann_list)
+
+    ann = iter_annotations(sidecar)
+    target = next(a for a in ann if a.text == "REMOVE_ME")
+    edit = EditRecord.new(
+        file_path=str(sidecar), record_index=target.record_index,
+        byte_offset_in_record=target.byte_offset_in_record,
+        onset_s=target.onset_s, orig_text=target.text,
+        new_text="clean_annotation")
+    results = apply_pending_edits([edit])
+    assert results[0].succeeded, results[0].error_message
+
+    # Read back via pyedflib and compare each unedited slot verbatim.
+    with pyedflib.EdfReader(str(sidecar)) as f:
+        onsets, _, texts = f.readAnnotations()
+    by_onset = {round(float(o), 6): str(t) for o, t in zip(onsets, texts)}
+    assert by_onset[0.0] == "orig_zero"
+    assert by_onset[5.0] == "clean_annotation"   # edited
+    assert by_onset[10.0] == "orig_ten"
+    assert by_onset[15.0] == "orig_fifteen"
+
+
+def test_sidecar_apply_verifies_headers_identical(tmp_path):
+    """Pre-swap check: pyedflib.getHeader() must be field-by-field
+    identical between original and replacement. Guards against a
+    silent header drift (e.g., pyedflib normalizing patientname, or
+    a future refactor tacking on admincode)."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [(0.0, "a"), (5.0, "orig"), (10.0, "c")])
+    with pyedflib.EdfReader(str(sidecar)) as f:
+        header_before = f.getHeader()
+
+    ann = iter_annotations(sidecar)[1]
+    edit = EditRecord.new(
+        file_path=str(sidecar), record_index=ann.record_index,
+        byte_offset_in_record=ann.byte_offset_in_record,
+        onset_s=ann.onset_s, orig_text=ann.text, new_text="edited")
+    results = apply_pending_edits([edit])
+    assert results[0].succeeded, results[0].error_message
+
+    with pyedflib.EdfReader(str(sidecar)) as f:
+        header_after = f.getHeader()
+    for key in header_before:
+        assert header_before[key] == header_after.get(key), (
+            f"header field {key!r} drifted: {header_before[key]!r} -> "
+            f"{header_after.get(key)!r}")
+
+
+def test_sidecar_apply_aborts_when_temp_diverges_from_original(tmp_path,
+                                                                monkeypatch):
+    """If the write step somehow produces a temp that mangles an
+    UNEDITED annotation, the pre-swap check MUST catch it and abort
+    before os.replace. Simulate by making pyedflib produce a temp with
+    a mangled non-edited slot (monkeypatch the writer stage to
+    corrupt one text)."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [(0.0, "keep_zero"), (5.0, "REMOVE_ME"),
+                              (10.0, "keep_ten")])
+    ann = iter_annotations(sidecar)
+    target = next(a for a in ann if a.text == "REMOVE_ME")
+
+    # Patch create_annotations_only_edf to silently mangle an unedited
+    # slot in the temp file. Simulates a chain-of-trust failure.
+    from clean_eeg.modify_edf_inplace import create_annotations_only_edf as real_write
+    from clean_eeg.annotation_review import apply_edits as ae
+
+    def corrupt_write(path, header, annotations, validate=True):
+        onsets, durations, texts = annotations
+        texts = list(texts)
+        # Mangle the FIRST unedited annotation ("keep_zero").
+        for i, t in enumerate(texts):
+            if t == "keep_zero":
+                texts[i] = "SILENTLY_MANGLED"
+                break
+        real_write(str(path), header,
+                   (onsets, durations, np.array(texts, dtype=object)),
+                   validate=validate)
+
+    monkeypatch.setattr(ae, "create_annotations_only_edf", corrupt_write)
+
+    edit = EditRecord.new(
+        file_path=str(sidecar), record_index=target.record_index,
+        byte_offset_in_record=target.byte_offset_in_record,
+        onset_s=target.onset_s, orig_text=target.text, new_text="clean")
+    results = apply_pending_edits([edit])
+    assert not results[0].succeeded
+    err = (results[0].error_message or "").lower()
+    assert "unedited" in err, err
+
+    # Original untouched: the mangled string is NOT in the file.
+    texts_after = _annotation_texts(sidecar)
+    assert "SILENTLY_MANGLED" not in texts_after
+    assert "keep_zero" in texts_after
+
+
 def test_sidecar_apply_refuses_leftover_temp(tmp_path):
     """Refuses to apply if a `.review_apply.tmp` leftover from a prior
     crash is still on disk -- matches the data-EDF path's safety."""

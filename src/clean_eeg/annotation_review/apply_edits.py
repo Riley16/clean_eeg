@@ -155,6 +155,16 @@ def _apply_edits_sidecar(edf_path: Path,
     preserve, so the safest thing is to let pyedflib pick its own
     record layout for the modified list and atomic-swap the result
     over the original.
+
+    Before the atomic swap, cross-check the temp against the ORIGINAL
+    file (both read via pyedflib) so a corrupted or misordered
+    replacement cannot overwrite the source. Verifies:
+      * pyedflib can load the temp (loadability guarantee).
+      * Headers match field-by-field.
+      * Every edited-slot text equals the corresponding
+        ``EditRecord.new_text``.
+      * Every UNEDITED-slot text equals the original file's text at
+        the same onset/duration.
     """
     temp_path = Path(str(edf_path) + APPLY_TEMP_SUFFIX)
     if temp_path.exists():
@@ -166,6 +176,8 @@ def _apply_edits_sidecar(edf_path: Path,
         create_annotations_only_edf(
             str(temp_path), header, annotations, validate=True)
         _verify_edits_present(temp_path, edits)
+        _verify_sidecar_against_original(
+            original_path=edf_path, temp_path=temp_path, edits=edits)
         os.replace(str(temp_path), str(edf_path))
     except Exception as e:
         raise ApplyEditsError(
@@ -173,6 +185,63 @@ def _apply_edits_sidecar(edf_path: Path,
             f"{type(e).__name__}: {e}. Original untouched. "
             f"Inspect {temp_path.name}."
         ) from e
+
+
+def _verify_sidecar_against_original(*, original_path: Path,
+                                       temp_path: Path,
+                                       edits: list[EditRecord]) -> None:
+    """Read both files via pyedflib and verify the temp is a safe
+    replacement: headers identical, edited slots carry the requested
+    new text, and every UNEDITED slot matches the original verbatim.
+
+    Raises ApplyEditsError with a specific reason on the first
+    mismatch (halts the swap, leaves the original untouched).
+    """
+    with pyedflib.EdfReader(str(original_path)) as f:
+        orig_header = f.getHeader()
+        o_on, o_dur, o_txt = f.readAnnotations()
+    with pyedflib.EdfReader(str(temp_path)) as f:
+        new_header = f.getHeader()
+        n_on, n_dur, n_txt = f.readAnnotations()
+
+    for key in orig_header:
+        if orig_header[key] != new_header.get(key):
+            raise ApplyEditsError(
+                f"header field {key!r} changed during rewrite: "
+                f"{orig_header[key]!r} -> {new_header.get(key)!r}")
+
+    if len(o_txt) != len(n_txt):
+        raise ApplyEditsError(
+            f"annotation count changed: original had {len(o_txt)}, "
+            f"replacement has {len(n_txt)}")
+
+    # pyedflib returns annotations in written order for both files.
+    # The temp was written with the same onset ordering the original
+    # had (because we read the original via iter_annotations, applied
+    # in-memory edits, and wrote the list back in the same order).
+    # Anchor edits by onset for O(1) lookup; use rounded key to survive
+    # float roundtrip noise.
+    edited_by_onset = {round(e.onset_s, 6): e.new_text for e in edits}
+
+    for i, (o_ons, o_du, o_tx, n_ons, n_du, n_tx) in enumerate(
+            zip(o_on, o_dur, o_txt, n_on, n_dur, n_txt)):
+        if not np.isclose(o_ons, n_ons):
+            raise ApplyEditsError(
+                f"annotation {i} onset moved: {o_ons} -> {n_ons}")
+        if not np.isclose(o_du, n_du):
+            raise ApplyEditsError(
+                f"annotation {i} duration moved: {o_du} -> {n_du}")
+        expected = edited_by_onset.get(round(float(o_ons), 6))
+        if expected is not None:
+            if str(n_tx) != expected:
+                raise ApplyEditsError(
+                    f"edited annotation at onset={o_ons} has text "
+                    f"{str(n_tx)!r}, expected {expected!r}")
+        else:
+            if str(n_tx) != str(o_tx):
+                raise ApplyEditsError(
+                    f"UNEDITED annotation at onset={o_ons} changed "
+                    f"during rewrite: {str(o_tx)!r} -> {str(n_tx)!r}")
 
 
 def _apply_edits_data_edf(edf_path: Path,

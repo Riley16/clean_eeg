@@ -475,9 +475,21 @@ def test_phi_safety_clean_files_never_get_excluded_when_no_failures(
     #  - *_original_annotations/  (raw pre-Presidio annotation dumps that
     #    live at a sibling of the transfer source; belt-and-suspenders
     #    against a refactor that changes the source path)
+    #  - .annotation_review/ + .annotation_reviewed_tracker  (edit-journal
+    #    with raw pre-redaction text; operator workflow state)
+    #  - edf_audit.{json,ipynb,html,in_progress}  (audit artifacts that
+    #    can carry raw header PHI residue; operator-side review only)
+    #  - *.review_apply.tmp  (annotation-review rollback copies)
     _BUILTIN_EXCLUDES = {
         "--exclude=quarantine/",
         "--exclude=*_original_annotations/",
+        "--exclude=.annotation_review/",
+        "--exclude=.annotation_reviewed_tracker",
+        "--exclude=edf_audit.json",
+        "--exclude=edf_audit.ipynb",
+        "--exclude=edf_audit.html",
+        "--exclude=edf_audit.in_progress",
+        "--exclude=*.review_apply.tmp",
     }
     for argv in captured_argvs:
         per_file_excludes = [
