@@ -2,33 +2,30 @@
 
 Takes the list of :class:`EditRecord` accumulated by the controller
 and mutates each affected EDF's annotation channel to reflect them.
-Reuses the existing corruption-safe primitives in
-:mod:`clean_eeg.modify_edf_inplace` rather than reinventing:
 
-    1. Load current annotations via the fast reader
-       (:func:`clean_eeg.annotation_reader.iter_annotations`).
-    2. Apply the operator's edits in-memory: match each EditRecord
-       by ``(record_index, byte_offset_in_record)`` and replace its
-       text.
-    3. Write a fresh annotations-only stub EDF containing the FULL
-       modified annotation list, via
-       :func:`create_annotations_only_edf`.
-    4. Copy the original data EDF to ``<path>.review_apply.tmp``.
-    5. Blank the temp's annotation channel via
-       :func:`clear_edf_annotations_inplace`.
-    6. Merge the stub back into the temp via
-       :func:`merge_annotation_stub_edf` (which atomic-swaps the
-       merge_tmp file it creates internally).
-    7. Verify the temp loads via pyedflib AND every edit's ``new_text``
-       is present.
-    8. ``os.replace`` the temp over the original -- atomic on POSIX.
-    9. On ANY failure between steps 4-7: the original is untouched,
-       the temp is kept for inspection, and the whole apply pass
-       aborts (does NOT continue to other files).
+Two code paths, chosen per file at apply time:
 
-Signal-byte identity is guaranteed by construction: neither
-``clear_edf_annotations_inplace`` nor ``merge_annotation_stub_edf``
-touch any bytes outside the annotation channel slices.
+* **Annotation-only sidecar** (``pyedflib.EdfReader.signals_in_file == 0``):
+  no signal data to preserve, so the whole file is just annotations.
+  Write a fresh sidecar via :func:`create_annotations_only_edf` with
+  the modified annotation list, then atomic-swap. The pipeline emits
+  these as the ``_annotations.edf`` sidecars in in-place mode, and
+  they are what annotation-review normally operates on.
+* **Data EDF** (signals present): copy → clear the annotation channel →
+  merge a fresh stub back into the temp via
+  :func:`merge_annotation_stub_edf`, then atomic-swap. Signal bytes are
+  byte-identical by construction because only annotation-channel byte
+  ranges are ever mutated.
+
+Sidecars must NOT use the merge path. ``merge_annotation_stub_edf``
+redistributes annotations across the target's records using its
+``record_duration`` and ``n_records`` -- for pipeline-written sidecars
+(``record_duration = 1.0``, one annotation per record) that math sends
+all onsets past the last record straight into the tail record's
+114-byte slot, which overflows and aborts the whole pass.
+
+On ANY failure the original is untouched and the temp is kept for
+inspection.
 """
 
 from __future__ import annotations
@@ -126,24 +123,64 @@ def _apply_edits_to_one_file(edf_path: Path,
     current = iter_annotations(edf_path)
     modified_texts = _apply_edits_in_memory(current, edits)
 
-    # Snapshot annotation onsets + durations + modified texts as
-    # arrays for the pyedflib writer.
-    #
     # Duration convention: our byte-level reader returns 0.0 for TALs
     # that carry no duration (no \x15 in the TAL). pyedflib's
-    # readAnnotations returns -1.0 for the same case. The merge's
-    # post-write integrity check compares 'durations we wrote' with
-    # 'durations pyedflib reads back from the merged file', so if we
-    # write 0.0 into the stub, pyedflib rounds-trips it as -1.0 and
-    # the check fires 'durations mismatch'. Convert at the writer
-    # boundary so the stub carries pyedflib's sentinel and the check
-    # passes without confusing our reader's semantics elsewhere.
+    # readAnnotations returns -1.0 for the same case. Convert at the
+    # writer boundary so the on-disk stub carries pyedflib's sentinel
+    # and roundtrip checks pass.
     onsets = np.array([a.onset_s for a in current], dtype=np.float64)
     durations = np.array(
         [(a.duration_s if a.duration_s > 0 else -1.0) for a in current],
         dtype=np.float64)
     texts = np.array(modified_texts, dtype=object)
 
+    with pyedflib.EdfReader(str(edf_path)) as f:
+        n_signals = f.signals_in_file
+        stub_header = f.getHeader()
+
+    if n_signals == 0:
+        _apply_edits_sidecar(edf_path, stub_header,
+                             (onsets, durations, texts), edits)
+    else:
+        _apply_edits_data_edf(edf_path, stub_header,
+                              (onsets, durations, texts), edits)
+
+
+def _apply_edits_sidecar(edf_path: Path,
+                          header: dict,
+                          annotations: tuple,
+                          edits: list[EditRecord]) -> None:
+    """Sidecar path: rewrite the whole file with the modified
+    annotation list. No merge dance -- there are no signal bytes to
+    preserve, so the safest thing is to let pyedflib pick its own
+    record layout for the modified list and atomic-swap the result
+    over the original.
+    """
+    temp_path = Path(str(edf_path) + APPLY_TEMP_SUFFIX)
+    if temp_path.exists():
+        raise ApplyEditsError(
+            f"leftover temp file next to {edf_path.name} -- "
+            f"an earlier apply may have crashed. Inspect and remove "
+            f"{temp_path.name} manually.")
+    try:
+        create_annotations_only_edf(
+            str(temp_path), header, annotations, validate=True)
+        _verify_edits_present(temp_path, edits)
+        os.replace(str(temp_path), str(edf_path))
+    except Exception as e:
+        raise ApplyEditsError(
+            f"apply aborted for {edf_path.name} at "
+            f"{type(e).__name__}: {e}. Original untouched. "
+            f"Inspect {temp_path.name}."
+        ) from e
+
+
+def _apply_edits_data_edf(edf_path: Path,
+                           header: dict,
+                           annotations: tuple,
+                           edits: list[EditRecord]) -> None:
+    """Data-EDF path: preserve every signal byte. Uses the byte-level
+    clear+merge primitives so the signal channels stay untouched."""
     stub_path = Path(str(edf_path) + STUB_TEMP_SUFFIX)
     temp_data_path = Path(str(edf_path) + APPLY_TEMP_SUFFIX)
 
@@ -153,43 +190,22 @@ def _apply_edits_to_one_file(edf_path: Path,
             f"an earlier apply may have crashed. Inspect and remove "
             f"{temp_data_path.name} / {stub_path.name} manually.")
 
-    # Header for the stub: reuse the original's header via pyedflib.
-    # This preserves patient_id, startdate, etc. so the merge doesn't
-    # inject inconsistent metadata.
-    with pyedflib.EdfReader(str(edf_path)) as f:
-        stub_header = f.getHeader()
-
     try:
-        # Write stub with the FULL modified annotation list.
         create_annotations_only_edf(
-            str(stub_path), stub_header,
-            (onsets, durations, texts), validate=True)
-
-        # Copy the original data EDF to a temp; all mutation happens
-        # on the temp so the original is untouched until the final
-        # os.replace.
+            str(stub_path), header, annotations, validate=True)
         shutil.copy2(str(edf_path), str(temp_data_path))
         clear_edf_annotations_inplace(str(temp_data_path), validate=True)
         merge_annotation_stub_edf(
             str(temp_data_path), str(stub_path), validate=True)
-
         _verify_edits_present(temp_data_path, edits)
-
-        # Atomic swap -- last mutation of the original.
         os.replace(str(temp_data_path), str(edf_path))
     except Exception as e:
-        # Ensure the original is untouched on any failure between
-        # here and the os.replace. We NEVER wrote to edf_path
-        # directly; the temp is what we've been mutating. Leave the
-        # temp on disk for post-mortem inspection.
         raise ApplyEditsError(
             f"apply aborted for {edf_path.name} at "
             f"{type(e).__name__}: {e}. Original untouched. "
             f"Inspect {temp_data_path.name} / {stub_path.name}."
         ) from e
     finally:
-        # Cleanup stub in the success path. Keep the temp on failure
-        # (for inspection); on success it's already been renamed.
         if stub_path.exists():
             try:
                 stub_path.unlink()

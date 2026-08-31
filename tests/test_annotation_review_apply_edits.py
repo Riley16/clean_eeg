@@ -31,6 +31,28 @@ from clean_eeg.annotation_review.apply_edits import (
 )
 from clean_eeg.annotation_review.models import EditRecord
 from clean_eeg.annotation_reader import iter_annotations
+from clean_eeg.modify_edf_inplace import create_annotations_only_edf
+
+
+def _write_sidecar(path: Path, annotations: list[tuple[float, str]]) -> None:
+    """Write an annotation-only EDF the same way the pipeline does in
+    in-place mode. `create_annotations_only_edf` calls pyedflib with
+    `n_channels=0`, and pyedflib packs annotations one per record --
+    which is what makes the merge path fail on real sidecars.
+    """
+    header = {
+        "technician": "T", "recording_additional": "",
+        "patientname": "X", "patient_additional": "",
+        "patientcode": "R1TEST", "equipment": "X", "admincode": "",
+        "sex": "X",
+        "startdate": datetime(1985, 1, 1, 10, 0, 0),
+        "birthdate": "01 jan 1985", "gender": "X",
+    }
+    onsets = np.array([o for o, _ in annotations], dtype=np.float64)
+    durations = np.array([-1.0] * len(annotations), dtype=np.float64)
+    texts = np.array([t for _, t in annotations], dtype=object)
+    create_annotations_only_edf(str(path), header,
+                                 (onsets, durations, texts), validate=True)
 
 
 def _write_edf(path: Path, annotations: list[tuple[float, str]],
@@ -206,6 +228,101 @@ def test_signal_bytes_are_byte_identical_after_apply(tmp_path):
     assert hash_after == hash_before, (
         "signal bytes changed after annotation-only edit -- "
         "corruption in the merge path")
+
+
+# ---------------------------------------------------------------------------
+# Annotation-only sidecar (the pipeline's in-place `_annotations.edf` output)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_edits_on_sidecar_across_many_records(tmp_path):
+    """Reproduces the real-world failure the operator hit: a sidecar
+    written by ``create_annotations_only_edf`` (as the pipeline does)
+    with annotations spread across many records. The merge path used
+    to overflow record 14's 114-byte slot because every onset >=
+    record_duration got clamped to the last record; the sidecar branch
+    just rewrites the file.
+    """
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    ann_list = [(0.0, "Segment: REC START SMITH E"),
+                (15.0, "A1+A2 OFF")] + [
+                (30.0 + 15 * i, f"RhythmicBurst RB{i+2}-RB") for i in range(13)]
+    _write_sidecar(sidecar, ann_list)
+    # Sanity: this really is annotation-only.
+    with pyedflib.EdfReader(str(sidecar)) as f:
+        assert f.signals_in_file == 0, (
+            "pipeline sidecar must have 0 signal channels")
+
+    ann = iter_annotations(sidecar)
+    assert len({a.record_index for a in ann}) > 1, (
+        "test fixture is degenerate: annotations must span multiple "
+        "records to exercise the failure mode")
+
+    dirty = next(a for a in ann if "SMITH" in a.text)
+    edit = EditRecord.new(
+        file_path=str(sidecar),
+        record_index=dirty.record_index,
+        byte_offset_in_record=dirty.byte_offset_in_record,
+        onset_s=dirty.onset_s, orig_text=dirty.text,
+        new_text="Segment: REC START X E")
+
+    results = apply_pending_edits([edit])
+    assert len(results) == 1 and results[0].succeeded, (
+        results[0].error_message)
+
+    texts_after = _annotation_texts(sidecar)
+    assert "Segment: REC START X E" in texts_after
+    assert "Segment: REC START SMITH E" not in texts_after
+    # Every other annotation must survive verbatim.
+    for _, orig in ann_list[1:]:
+        assert orig in texts_after, (
+            f"annotation {orig!r} lost during apply -- merge path is "
+            f"corrupting the sidecar")
+
+
+def test_sidecar_apply_no_leftover_temp_on_success(tmp_path):
+    """On success, no `.review_apply.tmp` file remains next to the sidecar."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [(0.0, "a"), (5.0, "b"), (10.0, "c")])
+    ann = iter_annotations(sidecar)[0]
+    edit = EditRecord.new(
+        file_path=str(sidecar), record_index=ann.record_index,
+        byte_offset_in_record=ann.byte_offset_in_record,
+        onset_s=ann.onset_s, orig_text=ann.text, new_text="A_EDITED")
+    apply_pending_edits([edit])
+    leftovers = sorted(p.name for p in tmp_path.iterdir())
+    assert leftovers == ["R1670J_annotations.edf"], leftovers
+
+
+def test_sidecar_still_annotation_only_after_apply(tmp_path):
+    """Invariant: apply must not silently convert a sidecar into a
+    data EDF (would break downstream tools that expect 0 signals)."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [(0.0, "orig"), (5.0, "keep")])
+    ann = iter_annotations(sidecar)[0]
+    edit = EditRecord.new(
+        file_path=str(sidecar), record_index=ann.record_index,
+        byte_offset_in_record=ann.byte_offset_in_record,
+        onset_s=ann.onset_s, orig_text=ann.text, new_text="EDITED")
+    apply_pending_edits([edit])
+    with pyedflib.EdfReader(str(sidecar)) as f:
+        assert f.signals_in_file == 0
+
+
+def test_sidecar_apply_refuses_leftover_temp(tmp_path):
+    """Refuses to apply if a `.review_apply.tmp` leftover from a prior
+    crash is still on disk -- matches the data-EDF path's safety."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [(0.0, "orig")])
+    (Path(str(sidecar) + APPLY_TEMP_SUFFIX)).write_bytes(b"leftover")
+    ann = iter_annotations(sidecar)[0]
+    edit = EditRecord.new(
+        file_path=str(sidecar), record_index=ann.record_index,
+        byte_offset_in_record=ann.byte_offset_in_record,
+        onset_s=ann.onset_s, orig_text=ann.text, new_text="X")
+    results = apply_pending_edits([edit])
+    assert not results[0].succeeded
+    assert "leftover" in (results[0].error_message or "").lower()
 
 
 # ---------------------------------------------------------------------------
