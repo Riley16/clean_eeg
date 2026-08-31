@@ -873,6 +873,41 @@ def test_preload_all_records_auto_skipped_whitelist_count(tmp_path):
     c.close()
 
 
+def test_preload_all_does_not_drop_files_with_delete_matched_annotations(tmp_path):
+    """R1670J regression: files whose only annotations match the
+    delete-whitelist bucket (e.g. Jefferson's
+    'Segment: REC START.*' pattern) were being auto-marked reviewed
+    at preload time even though the apply path preserves those rows
+    verbatim -- so the file stayed on disk with the patient name in
+    the annotation. Delete-matched patterns must NOT be treated as
+    'already handled' by the preload auto-skip.
+    """
+    import json as _json
+    subj = _make_subject(tmp_path, "R1755J", {  # J site
+        "leaks_phi.edf": ["Segment: REC START SMITH E"],
+        "purely_whitelisted.edf": ["A1+A2 OFF"],
+    })
+    wl_path = tmp_path / "wl.json"
+    wl_path.write_text(_json.dumps({
+        "shared": [],
+        "per_site": {"J": [r"A1\+A2 (?:ON|OFF)"]},
+        "delete_shared": [],
+        "delete_per_site": {"J": [r"Segment: REC START.*"]},
+    }))
+
+    c = AnnotationReviewController(subj, whitelist_path=wl_path,
+                                     preload_all=True)
+    reviewable_names = [c._edfs[i].name for i in c._file_indices]
+    # leaks_phi.edf's ONLY annotation matches the delete pattern.
+    # Prior to the fix it would be auto-skipped -- confirm it now
+    # shows up for review.
+    assert "leaks_phi.edf" in reviewable_names, reviewable_names
+    # purely_whitelisted.edf's annotation matches the true whitelist,
+    # so it's still auto-skipped.
+    assert "purely_whitelisted.edf" not in reviewable_names, reviewable_names
+    c.close()
+
+
 def test_num_files_auto_skipped_whitelist_defaults_to_zero(tmp_path):
     """Without preload_all the auto-drop path never runs; the counter
     must stay at 0 so the CLI doesn't misreport."""

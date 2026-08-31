@@ -391,7 +391,14 @@ class AnnotationReviewController:
             self._annotations_cache[fi] = _prefetch_one(self._edfs[fi])
 
         # After all loaded, drop files whose EVERY annotation is
-        # whitelisted or delete-marked. Empty files also drop.
+        # empty-text or matches the true whitelist. Delete-marked
+        # annotations (matches_delete) are NOT treated as auto-safe
+        # here: the pipeline's apply path preserves them verbatim
+        # (never actually deletes), so a file where every annotation
+        # matches only the delete pattern (e.g. the Jefferson
+        # 'Segment: REC START.*' pattern) still contains PHI. Show
+        # such files for review; the operator either edits them
+        # manually or bulk-regex-swaps them.
         keep: list[int] = []
         dropped_paths: list[Path] = []
         for fi in self._file_indices:
@@ -400,8 +407,6 @@ class AnnotationReviewController:
                 a for a in anns
                 if a.text.strip()
                 and not self._whitelist.matches(
-                    a.text, site_code=self.site_code)
-                and not self._whitelist.matches_delete(
                     a.text, site_code=self.site_code)]
             if non_boilerplate:
                 keep.append(fi)
