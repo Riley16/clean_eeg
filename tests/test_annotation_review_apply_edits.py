@@ -590,6 +590,172 @@ def test_sidecar_apply_preserves_numeric_shaped_texts(tmp_path):
         assert expected in texts_after, (expected, texts_after)
 
 
+# ---------------------------------------------------------------------------
+# Composed workflows: multiple categories of annotations coexisting.
+# The apply path is whitelist-agnostic (whitelist only affects the TUI
+# view), but we compose the actual runtime state to prove that.
+# ---------------------------------------------------------------------------
+
+
+def _make_whitelist(patterns: list[str]):
+    """Construct an in-memory BoilerplateWhitelist matching the given
+    patterns as shared entries. Lets us verify controller-level whitelist
+    interactions without touching the on-disk boilerplate JSON."""
+    from clean_eeg.annotation_boilerplate import BoilerplateWhitelist
+    import re as _re
+    return BoilerplateWhitelist(
+        shared=[_re.compile(p) for p in patterns])
+
+
+def test_sidecar_apply_5_annotations_1_whitelisted_1_unedited_3_edited(tmp_path):
+    """The composed case the operator asked about:
+      pos 0: whitelisted (boilerplate) -- unedited
+      pos 1: NOT whitelisted, unedited (operator saw it, chose not to edit)
+      pos 2, 3, 4: edited by the operator
+    After apply, pos 0/1 survive verbatim, pos 2/3/4 carry the edits.
+    Whitelist status doesn't reach the apply path -- this is a
+    positive-control that the operator's mental model of the pipeline
+    (whitelisted rows are preserved, unedited rows are preserved,
+    edited rows land) matches what actually happens on disk."""
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [
+        (0.0, "+0.000000"),          # pos 0: whitelist-shaped, unedited
+        (5.0, "eyes closed"),        # pos 1: reviewed, deliberately not edited
+        (10.0, "SMITH_a"),           # pos 2: edited
+        (15.0, "SMITH_b"),           # pos 3: edited
+        (20.0, "SMITH_c"),           # pos 4: edited
+    ])
+    # Sanity: the whitelist WOULD match pos 0 if the controller were
+    # running. Apply doesn't care, but assert the fixture reflects the
+    # scenario the operator described.
+    wl = _make_whitelist([r"\+\d+\.\d+"])
+    assert wl.matches("+0.000000")
+    assert not wl.matches("eyes closed")
+
+    ann = iter_annotations(sidecar)
+    edits = [
+        EditRecord.new(file_path=str(sidecar),
+                        record_index=a.record_index,
+                        byte_offset_in_record=a.byte_offset_in_record,
+                        onset_s=a.onset_s, orig_text=a.text,
+                        new_text=a.text.replace("SMITH_", "X_"))
+        for a in ann if a.text.startswith("SMITH_")
+    ]
+    assert len(edits) == 3, [a.text for a in ann]
+    results = apply_pending_edits(edits)
+    assert results[0].succeeded, results[0].error_message
+
+    with pyedflib.EdfReader(str(sidecar)) as f:
+        onsets, _, texts = f.readAnnotations()
+    pairs = [(round(float(o), 6), str(t)) for o, t in zip(onsets, texts)]
+    # Position-by-position (pyedflib preserves write order):
+    assert pairs == [
+        (0.0, "+0.000000"),      # whitelisted, unedited
+        (5.0, "eyes closed"),    # not whitelisted, unedited
+        (10.0, "X_a"),           # edited
+        (15.0, "X_b"),           # edited
+        (20.0, "X_c"),           # edited
+    ], pairs
+
+
+def test_sidecar_apply_all_edge_cases_composed(tmp_path):
+    """The kitchen-sink test: one sidecar containing every annotation
+    category that can coexist in the wild, one apply pass:
+
+      A. whitelist-shaped ('+0.000000') at a shared onset with the
+         edited row (duplicate-onset case)
+      B. plain unedited non-whitelisted rows (two of them)
+      C. numeric-shaped text at a distinct onset ('-1.5')
+      D. duplicate ORIG-TEXT at different onsets ('SMITH_dup' twice)
+      E. manual edit on the segment header
+      F. bulk-regex-style edit (SMITH -> X)
+      G. regex-swap-to-empty-string 'delete' edit (new_text='')
+
+    Verifies:
+      - every unedited row lands verbatim
+      - every edit lands verbatim
+      - the multiset check passes on this mixed shape
+      - duplicate-onset rows both survive with correct texts
+      - duplicate-text-at-different-onset rows only the edited one
+        changes
+      - empty-text edit is preserved as empty text in the pyedflib
+        readback (apply succeeds; downstream iter_annotations will
+        skip the empty-text row -- that's expected behavior)
+    """
+    sidecar = tmp_path / "R1670J_annotations.edf"
+    _write_sidecar(sidecar, [
+        (0.0, "+0.000000"),                # A
+        (0.0, "Segment: REC START SMITH E"),  # A (same onset), edited by E
+        (5.0, "eyes closed"),              # B
+        (10.0, "SMITH_dup"),               # D-1 (unedited copy of duplicate)
+        (15.0, "-1.5"),                    # C
+        (20.0, "SMITH_dup"),               # D-2 (edited copy of duplicate)
+        (25.0, "SMITH_regex"),             # F
+        (30.0, "REMOVE_ME"),               # G (delete via empty-string)
+        (35.0, "system boot"),             # B
+    ])
+
+    ann = iter_annotations(sidecar)
+
+    def find(pred):
+        return next(a for a in ann if pred(a))
+
+    edits = [
+        # E: manual edit on the SMITH segment header at onset=0.0 (duplicate onset)
+        EditRecord.new(file_path=str(sidecar),
+                        record_index=(seg := find(lambda a: "REC START" in a.text)).record_index,
+                        byte_offset_in_record=seg.byte_offset_in_record,
+                        onset_s=seg.onset_s, orig_text=seg.text,
+                        new_text="Segment: REC START X E"),
+        # D-2: edit the LATER duplicate (onset=20.0) only
+        EditRecord.new(file_path=str(sidecar),
+                        record_index=(dup2 := find(lambda a: a.onset_s == 20.0 and a.text == "SMITH_dup")).record_index,
+                        byte_offset_in_record=dup2.byte_offset_in_record,
+                        onset_s=dup2.onset_s, orig_text=dup2.text,
+                        new_text="X_dup_20"),
+        # F: bulk-regex-style edit
+        EditRecord.new(file_path=str(sidecar),
+                        record_index=(reg := find(lambda a: a.text == "SMITH_regex")).record_index,
+                        byte_offset_in_record=reg.byte_offset_in_record,
+                        onset_s=reg.onset_s, orig_text=reg.text,
+                        new_text="X_regex"),
+        # G: empty-string 'delete' edit
+        EditRecord.new(file_path=str(sidecar),
+                        record_index=(rm := find(lambda a: a.text == "REMOVE_ME")).record_index,
+                        byte_offset_in_record=rm.byte_offset_in_record,
+                        onset_s=rm.onset_s, orig_text=rm.text,
+                        new_text=""),
+    ]
+    results = apply_pending_edits(edits)
+    assert results[0].succeeded, results[0].error_message
+
+    with pyedflib.EdfReader(str(sidecar)) as f:
+        onsets, _, texts = f.readAnnotations()
+    pairs = sorted(
+        (round(float(o), 6), str(t)) for o, t in zip(onsets, texts))
+    expected = sorted([
+        (0.0, "+0.000000"),
+        (0.0, "Segment: REC START X E"),
+        (5.0, "eyes closed"),
+        (10.0, "SMITH_dup"),          # UNedited duplicate copy
+        (15.0, "-1.5"),
+        (20.0, "X_dup_20"),           # edited duplicate copy
+        (25.0, "X_regex"),
+        (30.0, ""),                   # empty-string delete preserved by pyedflib
+        (35.0, "system boot"),
+    ])
+    assert pairs == expected, (
+        f"multiset mismatch.\n  got:    {pairs}\n  wanted: {expected}")
+
+    # Downstream sanity: our byte-level reader skips empty-text rows.
+    # Not a bug in apply -- documents the current behavior explicitly.
+    from clean_eeg.annotation_reader import iter_annotations as _iter
+    ann_after = _iter(sidecar)
+    assert len(ann_after) == 8, [(a.onset_s, a.text) for a in ann_after]
+    assert all(a.text != "" for a in ann_after)
+    assert all(a.text != "REMOVE_ME" for a in ann_after)
+
+
 def test_sidecar_apply_refuses_leftover_temp(tmp_path):
     """Refuses to apply if a `.review_apply.tmp` leftover from a prior
     crash is still on disk -- matches the data-EDF path's safety."""
