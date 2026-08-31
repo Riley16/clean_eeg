@@ -541,6 +541,9 @@ def test_cli_rerun_annot_review_calls_reset_before_controller(monkeypatch,
             self.num_files = 0
             self.num_files_auto_skipped_whitelist = 0
 
+        def auto_queue_delete_matches(self, replacement="X"):
+            return 0
+
         def close(self):
             pass
 
@@ -573,6 +576,9 @@ def test_cli_rerun_annot_review_noop_message_when_nothing_to_reset(
             self.num_files_to_review = 0
             self.num_files = 0
             self.num_files_auto_skipped_whitelist = 0
+
+        def auto_queue_delete_matches(self, replacement="X"):
+            return 0
 
         def close(self):
             pass
@@ -610,6 +616,9 @@ def test_cli_auto_locates_standard_whitelist_when_not_specified(
             self.num_files = 0
             self.num_files_auto_skipped_whitelist = 0
 
+        def auto_queue_delete_matches(self, replacement="X"):
+            return 0
+
         def close(self):
             pass
 
@@ -644,6 +653,9 @@ def test_cli_no_whitelist_flag_disables_auto_load(tmp_path, monkeypatch):
             self.num_files_to_review = 0
             self.num_files = 0
             self.num_files_auto_skipped_whitelist = 0
+
+        def auto_queue_delete_matches(self, replacement="X"):
+            return 0
 
         def close(self):
             pass

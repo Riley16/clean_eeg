@@ -908,6 +908,80 @@ def test_preload_all_does_not_drop_files_with_delete_matched_annotations(tmp_pat
     c.close()
 
 
+def test_auto_queue_delete_matches_queues_edits_with_X(tmp_path):
+    """auto_queue_delete_matches walks every reviewable file, finds
+    annotations that fullmatch the boilerplate whitelist's delete
+    bucket, and queues an EditRecord with new_text='X'. Sanity-checks
+    that the pipeline's delete-branch behavior is mirrored at review
+    time so the operator sees the replacements before apply."""
+    import json as _json
+    subj = _make_subject(tmp_path, "R1755J", {
+        "leaks.edf": ["Segment: REC START SMITH E", "unrelated"],
+        "cleaner.edf": ["A1+A2 OFF"],   # matches true whitelist, not delete
+    })
+    wl_path = tmp_path / "wl.json"
+    wl_path.write_text(_json.dumps({
+        "shared": [], "per_site": {"J": [r"A1\+A2 (?:ON|OFF)"]},
+        "delete_shared": [],
+        "delete_per_site": {"J": [r"Segment: REC START.*"]},
+    }))
+
+    c = AnnotationReviewController(subj, whitelist_path=wl_path,
+                                     preload_all=True)
+    n = c.auto_queue_delete_matches(replacement="X")
+    assert n == 1, "exactly one annotation should have delete-matched"
+
+    edits = c.pending_edits()
+    assert len(edits) == 1
+    assert edits[0].orig_text == "Segment: REC START SMITH E"
+    assert edits[0].new_text == "X"
+    c.close()
+
+
+def test_auto_queue_delete_matches_idempotent_on_second_call(tmp_path):
+    """Calling twice must not double-queue -- the second call sees
+    the pending edit already carries new_text='X' and short-circuits."""
+    import json as _json
+    subj = _make_subject(tmp_path, "R1755J", {
+        "leaks.edf": ["Segment: REC START SMITH E"],
+    })
+    wl_path = tmp_path / "wl.json"
+    wl_path.write_text(_json.dumps({
+        "shared": [], "per_site": {"J": []},
+        "delete_shared": [], "delete_per_site": {"J": [r"Segment: REC START.*"]},
+    }))
+    c = AnnotationReviewController(subj, whitelist_path=wl_path,
+                                     preload_all=True)
+    n1 = c.auto_queue_delete_matches()
+    n2 = c.auto_queue_delete_matches()
+    assert n1 == 1
+    assert n2 == 0
+    assert len(c.pending_edits()) == 1
+    c.close()
+
+
+def test_auto_queue_delete_matches_skips_already_X_annotations(tmp_path):
+    """Files that have already been cleaned by the pipeline's delete
+    branch will have the annotation as 'X' on disk. matches_delete
+    fires on the ORIGINAL text, so 'X' is not a match and nothing is
+    queued -- the auto-queue at review time is a no-op on
+    already-cleaned data."""
+    import json as _json
+    subj = _make_subject(tmp_path, "R1755J", {
+        "cleaned.edf": ["X", "X"],
+    })
+    wl_path = tmp_path / "wl.json"
+    wl_path.write_text(_json.dumps({
+        "shared": [], "per_site": {"J": []},
+        "delete_shared": [], "delete_per_site": {"J": [r"Segment: REC START.*"]},
+    }))
+    c = AnnotationReviewController(subj, whitelist_path=wl_path,
+                                     preload_all=False)
+    n = c.auto_queue_delete_matches()
+    assert n == 0
+    c.close()
+
+
 def test_num_files_auto_skipped_whitelist_defaults_to_zero(tmp_path):
     """Without preload_all the auto-drop path never runs; the counter
     must stay at 0 so the CLI doesn't misreport."""

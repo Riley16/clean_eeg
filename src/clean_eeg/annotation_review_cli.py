@@ -164,6 +164,18 @@ def main(argv: list[str] | None = None) -> int:
                         "(discarded) in prior sessions. Use when you "
                         "aborted a review partway through and want to "
                         "restart cleanly from the first file.")
+    p.add_argument("--no-auto-queue-delete-matches", action="store_true",
+                   help="By default the TUI auto-queues a pending edit "
+                        "(new_text='X') for every annotation whose text "
+                        "fullmatches a delete pattern in the boilerplate "
+                        "whitelist -- so the operator sees the same "
+                        "replacement the pipeline would apply, but as an "
+                        "explicit pending edit they can inspect or undo "
+                        "before applying. Pass this flag to skip the "
+                        "auto-queue (useful when reviewing files that were "
+                        "already cleaned by the pipeline's delete branch, "
+                        "though in that case matches_delete already fires "
+                        "on 0 rows and the auto-queue is a no-op).")
     args = p.parse_args(argv)
 
     # --rerun-annot-review: reset per-subject review state so the TUI
@@ -214,6 +226,20 @@ def main(argv: list[str] | None = None) -> int:
     except PreflightFailure as e:
         print(f"[error] {e}", file=sys.stderr)
         return 2
+
+    # Auto-queue delete-pattern replacements as pending edits so the
+    # operator can inspect exactly which annotations the delete bucket
+    # will replace, and decide to keep or override any of them via the
+    # normal edit mechanism before the y/N apply gate. Skipped when the
+    # whitelist was disabled with --no-whitelist (no patterns to match).
+    if resolved_wl_path is not None and not args.no_auto_queue_delete_matches:
+        n_queued = controller.auto_queue_delete_matches(replacement="X")
+        if n_queued:
+            print(f"[TUI] auto-queued {n_queued} pending edit(s) from "
+                  f"delete-whitelist patterns (each replaces the "
+                  f"annotation with 'X'). Inspect them in the review view "
+                  f"marked '+'; press 'e' on any row to override.",
+                  file=sys.stderr)
 
     # Import the TUI lazily so unit tests can exercise the CLI's
     # error paths without prompt_toolkit's terminal detection getting

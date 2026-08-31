@@ -677,6 +677,56 @@ class AnnotationReviewController:
                 count += 1
         return count
 
+    def auto_queue_delete_matches(self, replacement: str = "X") -> int:
+        """Queue a pending edit (new_text=``replacement``) for every
+        annotation across every reviewable file whose text
+        ``matches_delete`` the loaded boilerplate whitelist.
+
+        Uses ``BoilerplateWhitelist.matches_delete`` (fullmatch
+        semantics), NOT regex substring substitution, so the semantic
+        matches what the pipeline's delete-branch does at cleaning
+        time. An annotation whose text fullmatches a delete pattern
+        gets its ENTIRE text replaced -- partial regex matches don't
+        qualify.
+
+        Idempotent: if an annotation already has a pending edit whose
+        new_text equals ``replacement``, no new record is added.
+        Otherwise the pending edit is overwritten (last write wins,
+        same as manual edits + bulk regex swap).
+
+        Returns the number of newly-queued edits. Zero on a file
+        already fully cleaned by the pipeline's delete branch (every
+        matching annotation is already 'X' on disk, so
+        matches_delete no longer fires for them).
+        """
+        count = 0
+        for file_idx in list(self._file_indices):
+            anns = self._load_annotations_for_index(file_idx)
+            for ann_idx, ann in enumerate(anns):
+                if not self._whitelist.matches_delete(
+                        ann.text, site_code=self.site_code):
+                    continue
+                # No-op guard: if the annotation is already the
+                # replacement text, don't queue.
+                if ann.text == replacement:
+                    continue
+                key = (file_idx, ann_idx)
+                existing = self._pending.get(key)
+                if existing is not None and existing.new_text == replacement:
+                    continue
+                record = EditRecord.new(
+                    file_path=str(self._edfs[file_idx]),
+                    record_index=ann.record_index,
+                    byte_offset_in_record=ann.byte_offset_in_record,
+                    onset_s=ann.onset_s,
+                    orig_text=ann.text,
+                    new_text=replacement,
+                )
+                self._pending[key] = record
+                self._journal.append(record)
+                count += 1
+        return count
+
     def is_current_edited(self) -> bool:
         return (self.file_cursor, self.annotation_cursor) in self._pending
 
