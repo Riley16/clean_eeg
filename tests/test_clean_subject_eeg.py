@@ -172,6 +172,94 @@ def test_whitelist_bypass_refused_logs_review_event():
         f"expected safety-net event; got kinds={kinds}")
 
 
+def test_delete_pattern_replaces_annotation_with_X():
+    """Pipeline behavior: annotations matching the delete-whitelist
+    bucket (e.g. Jefferson's 'Segment: REC START.*') have their text
+    replaced with 'X' -- same sentinel as REDACT_NAME_REPLACEMENT.
+    Not preserved, not silently deleted, not sent through Presidio.
+    Direct fix for the R1670J leak where the on-disk annotation
+    still contained the patient name after cleaning."""
+    from clean_eeg.anonymize import PersonalName
+    from clean_eeg.annotation_boilerplate import load_whitelist
+    from clean_eeg.paths import ANNOTATION_BOILERPLATE_WHITELIST_PATH
+    from clean_eeg.clean_subject_eeg import deidentify_edf_annotations
+
+    subj = PersonalName(first_name="Alice", middle_names=[], last_name="Smith")
+    # 'Segment: REC START.*' is in the J-site delete bucket.
+    ann_texts = ["Segment: REC START SMITH E",
+                 "SpikeBurst 1.00 1s",         # J-site whitelist (preserved)
+                 "unrelated event"]            # not boilerplate (redacted normally)
+    annotations = (np.array([0.0, 1.0, 2.0]),
+                    np.array([-1.0, -1.0, -1.0]),
+                    np.array(ann_texts, dtype=object))
+    wl = load_whitelist(ANNOTATION_BOILERPLATE_WHITELIST_PATH)
+
+    new = deidentify_edf_annotations(annotations,
+                                      subject_name=subj,
+                                      whitelist=wl,
+                                      site_code="J")
+    out = list(new[2])
+    assert out[0] == "X", (
+        f"delete-matched annotation must become 'X'; got {out[0]!r}")
+    assert out[1] == "SpikeBurst 1.00 1s", (
+        f"true whitelist match must be preserved verbatim; got {out[1]!r}")
+    assert "SMITH" not in out[0]
+
+
+def test_delete_pattern_emits_annotation_deleted_boilerplate_review_event():
+    """The delete-and-replace step must be visible in review_events so
+    operators can audit how many annotations the delete bucket
+    replaced per file. The event carries the sentinel 'X' as
+    redacted_value; never the raw text (that would ship PHI in
+    deidentify.json)."""
+    from clean_eeg.anonymize import PersonalName
+    from clean_eeg.annotation_boilerplate import load_whitelist
+    from clean_eeg.paths import ANNOTATION_BOILERPLATE_WHITELIST_PATH
+    from clean_eeg.clean_subject_eeg import deidentify_edf_annotations
+
+    subj = PersonalName(first_name="Alice", middle_names=[], last_name="Smith")
+    annotations = (np.array([0.0]), np.array([-1.0]),
+                    np.array(["Segment: REC START SMITH E"], dtype=object))
+    wl = load_whitelist(ANNOTATION_BOILERPLATE_WHITELIST_PATH)
+    events = []
+
+    deidentify_edf_annotations(annotations,
+                                subject_name=subj,
+                                whitelist=wl,
+                                site_code="J",
+                                review_events=events,
+                                source_file="fixture.edf")
+    matching = [e for e in events if e.kind == "annotation_deleted_boilerplate"]
+    assert len(matching) == 1, [e.kind for e in events]
+    # PHI guarantee: raw text not stored anywhere in the event details.
+    assert matching[0].details["redacted_value"] == "X"
+    assert "SMITH" not in str(matching[0].details)
+
+
+def test_delete_pattern_replaces_even_when_subject_name_present():
+    """When both conditions hold (delete-pattern match AND subject
+    name present in the annotation), the delete branch still wins --
+    the whole text becomes 'X'. Redaction-via-Presidio would also
+    strip the name, but the delete bucket is a stronger signal
+    ('this whole annotation is unsafe boilerplate, drop it') and
+    replacing with 'X' guarantees nothing else in the text leaks."""
+    from clean_eeg.anonymize import PersonalName
+    from clean_eeg.annotation_boilerplate import load_whitelist
+    from clean_eeg.paths import ANNOTATION_BOILERPLATE_WHITELIST_PATH
+    from clean_eeg.clean_subject_eeg import deidentify_edf_annotations
+
+    subj = PersonalName(first_name="Smith", middle_names=[], last_name="Jones")
+    annotations = (np.array([0.0]), np.array([-1.0]),
+                    np.array(["Segment: REC START SMITH E"], dtype=object))
+    wl = load_whitelist(ANNOTATION_BOILERPLATE_WHITELIST_PATH)
+
+    new = deidentify_edf_annotations(annotations,
+                                      subject_name=subj,
+                                      whitelist=wl,
+                                      site_code="J")
+    assert list(new[2]) == ["X"]
+
+
 def test_annotation_contains_subject_name_ignores_short_tokens():
     """Names shorter than 2 chars are ignored -- a 1-letter first name
     would false-positive on every annotation containing that letter.

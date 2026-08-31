@@ -233,16 +233,37 @@ def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: Per
     for (start_time, duration, text) in zip(*annotations):
         assert isinstance(text, str)
         text_str = str(text)
-        whitelist_hit = whitelist is not None and (
-            whitelist.matches(text_str, site_code=site_code)
-            or whitelist.matches_delete(text_str, site_code=site_code))
-        name_present = _annotation_contains_subject_name(
-            text_str, subject_name) if whitelist_hit else False
-        if whitelist_hit and not name_present:
-            # Boilerplate: preserve as-is. Skipping Presidio here means
-            # the on-disk annotation matches what OTHER subjects (whose
-            # names don't collide with the boilerplate token) have
-            # written for the same marker -- no diagnostic divergence.
+        delete_hit = whitelist is not None and whitelist.matches_delete(
+            text_str, site_code=site_code)
+        whitelist_hit = whitelist is not None and whitelist.matches(
+            text_str, site_code=site_code)
+        name_present = (
+            _annotation_contains_subject_name(text_str, subject_name)
+            if (delete_hit or whitelist_hit) else False)
+
+        if delete_hit:
+            # Delete-bucket patterns (e.g. Jefferson's
+            # 'Segment: REC START.*') are known-unsafe boilerplate --
+            # the annotation format is a container for PHI, so the
+            # pipeline replaces the whole text with the anonymization
+            # sentinel 'X'. Same sentinel as the header PHI
+            # replacement (REDACT_NAME_REPLACEMENT). No Presidio pass
+            # needed -- the entire text is gone.
+            redacted_text = "X"
+            if review_events is not None:
+                review_events.append(ReviewEvent(
+                    kind="annotation_deleted_boilerplate",
+                    file=source_file or "",
+                    details={
+                        "redacted_value": "X",
+                        "reason": "matched delete-whitelist pattern",
+                    }))
+        elif whitelist_hit and not name_present:
+            # True whitelist: preserve as-is. Skipping Presidio here
+            # means the on-disk annotation matches what OTHER subjects
+            # (whose names don't collide with the boilerplate token)
+            # have written for the same marker -- no diagnostic
+            # divergence.
             redacted_text = text_str
         else:
             if whitelist_hit and name_present and review_events is not None:
@@ -250,12 +271,12 @@ def deidentify_edf_annotations(annotations: tuple[np.ndarray], subject_name: Per
                 # can audit which whitelist patterns are letting names
                 # slip through. Presidio's own alert fires in
                 # redact_string; this event captures the FORCED
-                # bypass-refusal specifically.
+                # bypass-refusal specifically. Redacted value is stored
+                # instead of raw text so deidentify.json doesn't ship PHI.
                 review_events.append(ReviewEvent(
                     kind="whitelist_bypass_refused_name_present",
                     file=source_file,
-                    details={"annotation_text": text_str,
-                             "reason": ("annotation matched the "
+                    details={"reason": ("annotation matched the "
                                         "boilerplate whitelist but "
                                         "contains a subject-name "
                                         "token; forced through "
