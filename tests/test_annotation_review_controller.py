@@ -118,6 +118,42 @@ def test_preflight_fails_on_no_edfs(tmp_path):
         preflight_subject_for_review(subj)
 
 
+def test_preflight_aborts_on_leftover_review_apply_tmp(tmp_path):
+    """Fail-fast on leftover apply-time temp files. Otherwise the
+    operator finishes a full review session then hits the leftover
+    check inside apply and can't save their edits.
+    """
+    subj = tmp_path / "R1755A"
+    inner = subj / "clinical_eeg"
+    inner.mkdir(parents=True)
+    (inner / "deidentify.json").write_text("{}")
+    _write_edf(inner / "R1755A.edf", ["real"])
+    # Plant one of each leftover pattern.
+    (inner / "R1755A.edf.review_apply.tmp").write_bytes(b"x")
+    (inner / "R1755A.edf.review_apply.tmp.merge_tmp").write_bytes(b"y")
+    (inner / "R1755A.edf.review_stub.edf").write_bytes(b"z")
+
+    with pytest.raises(PreflightFailure, match="leftover"):
+        preflight_subject_for_review(subj)
+
+
+def test_preflight_finds_leftover_tmp_in_subdirectories(tmp_path):
+    """Leftover check must recurse -- copy-mode output lives in
+    a subdir like 'deidentified_eeg_files/', and a failed apply
+    there would drop the temp INSIDE that subdir."""
+    subj = tmp_path / "R1755A"
+    inner = subj / "clinical_eeg"
+    inner.mkdir(parents=True)
+    (inner / "deidentify.json").write_text("{}")
+    subdir = inner / "deidentified_eeg_files"
+    subdir.mkdir()
+    _write_edf(subdir / "R1755A.edf", ["real"])
+    (subdir / "R1755A.edf.review_apply.tmp").write_bytes(b"x")
+
+    with pytest.raises(PreflightFailure, match="leftover"):
+        preflight_subject_for_review(subj)
+
+
 def test_preflight_prefers_sidecar_when_present(tmp_path):
     """In-place cleaning zeros the main EDF's annotation channel and
     writes annotations into a '<base>_annotations.edf' sidecar. The

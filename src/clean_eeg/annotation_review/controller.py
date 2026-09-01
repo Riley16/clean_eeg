@@ -125,6 +125,30 @@ def preflight_subject_for_review(subject_dir: Path,
         raise PreflightFailure(
             f"{subject_dir}: no .edf files under {inner}. Nothing "
             f"to review.")
+
+    # Fail-fast on leftover apply-time temp files. Otherwise the
+    # operator spends a full review session then hits the "leftover
+    # temp file" check inside apply and can't land their edits. Same
+    # patterns _apply_edits_to_one_file rejects on entry: keep the two
+    # in sync.
+    leftover_globs = ("*.review_apply.tmp",
+                       "*.review_apply.tmp.merge_tmp",
+                       "*.review_stub.edf")
+    leftovers = sorted(p for pat in leftover_globs for p in inner.rglob(pat))
+    if leftovers:
+        rel = [str(p.relative_to(subject_dir)) for p in leftovers[:5]]
+        more = f" (and {len(leftovers) - 5} more)" if len(leftovers) > 5 else ""
+        raise PreflightFailure(
+            f"{subject_dir}: {len(leftovers)} leftover apply-time temp "
+            f"file(s) present from a prior interrupted session. Apply "
+            f"would refuse to run on them at end of review, so aborting "
+            f"early. Delete them before re-launching:\n"
+            f"  " + "\n  ".join(rel) + more + "\n"
+            f"One-shot cleanup: find '{inner}' -type f "
+            f"\\( -name '*.review_apply.tmp' "
+            f"-o -name '*.review_apply.tmp.merge_tmp' "
+            f"-o -name '*.review_stub.edf' \\) -delete")
+
     return [_pick_annotation_carrier(p) for p in main_edfs]
 
 
